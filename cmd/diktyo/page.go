@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,11 +12,38 @@ import (
 )
 
 type Page struct {
-	URL         *url.URL
-	Links       []*url.URL
-	doc         *goquery.Document
+	URL   url.URL
+	Links []*url.URL
+	// doc         *goquery.Document
 	depth       uint
 	contentType string
+}
+
+func (p *Page) Fetch() error {
+	req := &http.Request{
+		Method: "GET",
+		Proto:  "HTTP/1.1",
+		Host:   p.URL.Host,
+		URL:    &p.URL,
+		Body:   http.NoBody,
+		GetBody: func() (io.ReadCloser, error) {
+			return http.NoBody, nil
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	root, err := html.ParseWithOptions(resp.Body)
+	if err != nil {
+		return err
+	}
+	p.URL = *resp.Request.URL
+	doc := goquery.NewDocumentFromNode(root)
+	p.Links, err = getLinks(doc, &p.URL)
+	p.contentType = resp.Header.Get("Content-Type")
+	return err
 }
 
 func pageFromHyperLink(hyperlink string) (*Page, error) {
@@ -48,26 +74,24 @@ func requestPage(req *http.Request) (*Page, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		fmt.Println("\n\r", resp.Status, req.URL)
-		// panic(resp.Status)
-	}
 	defer resp.Body.Close()
-	root, err := html.ParseWithOptions(resp.Body)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not parse request")
-	}
+	return readPage(resp.Body, resp.Request.URL)
+}
 
-	doc := goquery.NewDocumentFromNode(root)
-	links, err := getLinks(doc, req.URL)
+func readPage(r io.Reader, from *url.URL) (*Page, error) {
+	root, err := html.ParseWithOptions(r)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not collect links")
+		return nil, err
+	}
+	doc := goquery.NewDocumentFromNode(root)
+	links, err := getLinks(doc, from)
+	if err != nil {
+		return nil, err
 	}
 	return &Page{
-		URL:         req.URL,
-		Links:       links,
-		doc:         doc,
-		contentType: resp.Header.Get("Content-Type"),
+		URL:   *from,
+		Links: links,
+		// doc:   doc,
 	}, nil
 }
 

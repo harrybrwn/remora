@@ -1,8 +1,16 @@
 # Bin
 /diktyo
 
+# Testing
+*.test
+*.pprof
+*.ps
+*.log
+*.txt
+
 # Config
 /.vscode
+
 
 # Notes
 TODO*
