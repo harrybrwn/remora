@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
+	"github.com/streadway/amqp"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
@@ -29,13 +31,11 @@ var (
 func main() {
 	var (
 		errlog = logrus.New()
+		now    = time.Now()
 		err    error
 		args   []string
-		now    = time.Now()
 		stopAt int
 	)
-	defer func() { fmt.Println("total time:", time.Since(now)) }()
-
 	go http.ListenAndServe(":8080", nil)
 
 	flag := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -60,7 +60,6 @@ func main() {
 	}
 	defer urlsfile.Close()
 
-	t := newTermCtrl()
 	c := NewCollector(*depth, *weight)
 
 	args = flag.Args()
@@ -68,73 +67,108 @@ func main() {
 		errlog.Fatal("no url")
 	}
 
+	interrupts := make(chan os.Signal, 2)
+	signal.Notify(interrupts, os.Interrupt)
+
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ch.Close()
+	q, err := ch.QueueDeclare("diktyo-queue", false, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	c.queue = &q
+	consumer, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer cursorOn()
+
 	page, err := pageFromHyperLink(args[0])
 	if err != nil {
 		errlog.Fatal(err)
 	}
 	fmt.Println("root links:", len(page.Links))
-
-	interrupts := make(chan os.Signal, 2)
-	signal.Notify(interrupts, os.Interrupt)
-
-	defer cursorOn()
-
-	c.sem.Acquire(context.Background(), 1)
 	c.wg.Add(1)
 	go c.WaitAndClose()
-	go c.collect(page)
+	go c.asyncEnqueueLinks(page, ch)
 	cursorOff()
 
 	var stats = stats{
-		// root:     args[0],
 		root:     page.URL.String(),
 		vertices: 1,
 		started:  now,
 	}
 
-	for {
-		select {
-		case pg, ok := <-c.pages:
-			if !ok {
-				goto Done // channel closed
-			}
-			if pg.depth > c.limit {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		for msg := range consumer {
+			if msg.Type != "page" {
 				continue
 			}
 
-			if stopAt > 0 && int(stats.vertices) >= stopAt {
-				time.Sleep(time.Second) // slow down considerably for memory debugging
+			var pmsg *PageMsg
+			err = json.Unmarshal(msg.Body, &pmsg)
+			if err != nil {
+				c.errs <- err
+				continue
 			}
-
-			c.sem.Acquire(context.Background(), 1)
+			if pmsg.Depth > c.limit {
+				continue
+			}
+			l, err := url.Parse(pmsg.URL)
+			if err != nil {
+				c.errs <- err
+				continue
+			}
+			p := NewPage(l, pmsg.Depth)
+			if c.tryMarkVisited(*p.URL) {
+				continue
+			}
 			c.wg.Add(1)
-			go c.collect(pg)
+			c.sem.Acquire(context.Background(), 1)
+			go c.collect(p, ch)
 
-			stats.collect(pg)
-
+			stats.collect(p)
 			c.stats.Lock()
 			stack := c.stack
 			files := c.files
 			c.stats.Unlock()
 
-			u := pg.URL.String()
+			u := p.URL.String()
 			s := fmt.Sprintf(
-				"%d depth(%d) stack(%d) files(%d) errs(%d) time(%v) ",
-				stats.vertices, pg.depth,
+				"%d depth(%d) stack(%d) files(%d) errs(%d) time(%v) q(%d) ",
+				stats.vertices, p.Depth,
 				stack, files, stats.errors,
-				pg.responseTime)
+				p.responseTime, len(c.pages))
+			t := newTermCtrl()
 			if len(u) > t.w {
-				u = u[:t.w-len(s)-10]
+				uu := []byte(u)
+				u = string(uu[:(t.w - len(s) - 10)])
 			}
 			fmt.Fprintf(urlsfile, "%s\n", u)
 			fmt.Printf("\r%s%s\x1b[0K", s, u)
+			// fmt.Printf("%s%s\n", s, u)
+		}
+	}()
+
+	for {
+		select {
 		case err := <-c.errs:
 			if err == nil {
 				continue
 			}
 			stats.errors++
 			e := unwrapAll(err)
-
 			errlog.WithFields(logrus.Fields{
 				"basetype":   fmt.Sprintf("%T", e),
 				"nth_vertex": stats.vertices,
@@ -146,8 +180,8 @@ func main() {
 				stats.deadDomains++
 			}
 		case <-interrupts:
-			close(interrupts)
-			close(c.pages)
+			// close(interrupts)
+			// close(c.pages)
 			goto Done
 		}
 	}

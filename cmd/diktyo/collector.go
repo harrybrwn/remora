@@ -1,24 +1,27 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
 	"sync"
+	"time"
 
+	"github.com/streadway/amqp"
 	"golang.org/x/sync/semaphore"
 )
 
 func NewCollector(crawLimit uint, weight int64) *pageCollector {
-	const size = 5000
+	// const size = 1000
+	size := weight
 	return &pageCollector{
-		limit:  crawLimit,
-		pages:  make(chan *Page, size),
-		errs:   make(chan error, size),
-		sem:    semaphore.NewWeighted(weight),
-		reqsem: semaphore.NewWeighted(weight),
-		set:    make(map[string]struct{}),
+		limit: crawLimit,
+		pages: make(chan *Page, size),
+		errs:  make(chan error, size),
+		sem:   semaphore.NewWeighted(weight),
+		// reqsem: semaphore.NewWeighted(10),
+		set: make(map[string]struct{}),
 	}
 }
 
@@ -41,17 +44,81 @@ type pageCollector struct {
 	stats sync.Mutex
 	stack int
 	files int
+
+	queue *amqp.Queue
 }
 
 func (pc *pageCollector) WaitAndClose() {
 	pc.wg.Wait()
-	close(pc.pages)
+	// close(pc.pages)
 	close(pc.errs)
 }
 
-func (pc *pageCollector) collect(page *Page) error {
+func (pc *pageCollector) asyncEnqueueLinks(page *Page, ch *amqp.Channel) {
+	pc.stats.Lock()
+	pc.stack++
+	pc.stats.Unlock()
+	defer func() {
+		pc.stats.Lock()
+		pc.stack--
+		pc.stats.Unlock()
+	}()
+	defer pc.wg.Done()
+	for _, l := range page.Links {
+		if pc.visited(*l) {
+			continue
+		}
+		if l.Host != page.URL.Host {
+			continue
+		}
+		if !validURLScheme(l.Scheme) {
+			continue
+		}
+
+		// p := NewPage(l, page.Depth+1)
+		p := PageMsg{URL: l.String(), Depth: page.Depth + 1}
+		raw, err := json.Marshal(p)
+		if err != nil {
+			pc.errs <- err
+			continue
+		}
+		err = ch.Publish("", pc.queue.Name, false, false, amqp.Publishing{
+			Type:         "page",
+			Body:         raw,
+			Timestamp:    time.Now(),
+			ContentType:  "application/json",
+			DeliveryMode: 2,
+		})
+		if err != nil {
+			pc.errs <- err
+		}
+		// pc.pages <- p
+	}
+}
+
+func (pc *pageCollector) collect(page *Page, ch *amqp.Channel) (err error) {
 	defer func() {
 		pc.sem.Release(1)
+		pc.wg.Done()
+	}()
+
+	err = page.Fetch()
+	if err != nil {
+		pc.errs <- err
+		return err
+	}
+
+	if page.redirected {
+		pc.markVisited(*page.URL)
+	}
+	pc.wg.Add(1)
+	go pc.asyncEnqueueLinks(page, ch)
+	return nil
+}
+
+func (pc *pageCollector) _collect(page *Page) error {
+	defer func() {
+		// pc.sem.Release(1)
 		pc.wg.Done()
 	}()
 	pc.stats.Lock()
@@ -63,7 +130,7 @@ func (pc *pageCollector) collect(page *Page) error {
 		pc.stats.Unlock()
 	}()
 
-	if page.depth > pc.limit {
+	if page.Depth > pc.limit {
 		return nil
 	}
 	// if this page has been visited we stop,
@@ -94,8 +161,8 @@ func (pc *pageCollector) collect(page *Page) error {
 			continue
 		}
 
-		p := NewPage(l, page.depth+1)
-		if p.depth > pc.limit {
+		p := NewPage(l, page.Depth+1)
+		if p.Depth > pc.limit {
 			continue
 		}
 
@@ -103,14 +170,11 @@ func (pc *pageCollector) collect(page *Page) error {
 		pc.files++
 		n++
 		pc.stats.Unlock()
-		pc.reqsem.Acquire(context.Background(), 1)
 		err := p.Fetch()
 		if err != nil {
-			pc.reqsem.Release(1)
 			pc.errs <- err
 			continue
 		}
-		pc.reqsem.Release(1)
 
 		// If the request was redirected we don't want
 		// to follow the path in any subsequent traversals

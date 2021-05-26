@@ -16,7 +16,7 @@ func NewPage(u *url.URL, depth uint) *Page {
 	var link url.URL = *u
 	return &Page{
 		URL:   &link,
-		depth: depth,
+		Depth: depth,
 	}
 }
 
@@ -24,10 +24,15 @@ func NewPage(u *url.URL, depth uint) *Page {
 type Page struct {
 	URL          *url.URL
 	Links        []*url.URL
-	depth        uint
+	Depth        uint
 	contentType  string
 	redirected   bool
 	responseTime time.Duration
+}
+
+type PageMsg struct {
+	URL   string `json:"url"`
+	Depth uint   `json:"depth"`
 }
 
 // Fetch will take a page and fetch the document to retrieve
