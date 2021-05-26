@@ -3,8 +3,11 @@ package main
 import (
 	"fmt"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
+
+	"github.com/sirupsen/logrus"
 )
 
 func Test(t *testing.T) {
@@ -24,8 +27,12 @@ func TestGetPage(t *testing.T) {
 }
 
 func TestRedirects(t *testing.T) {
+	log.SetFormatter(&logrus.JSONFormatter{})
+	log.SetOutput(os.Stdout)
+	log.SetLevel(logrus.DebugLevel)
 	var wg sync.WaitGroup
 	links := []string{
+		"https://en.wikipedia.org/",
 		"https://loc.gov/help/",
 		"https://creativecommons.org/legalcode",
 		"http://foundation.wikimedia.org/wiki/Terms_of_Use",
@@ -38,8 +45,9 @@ func TestRedirects(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-			// _, err := pageFromHyperLink(l)
-			p, err := newPage(u)
+			p := NewPage(u, 0)
+
+			err = p.Fetch()
 			if err != nil {
 				t.Error(err)
 				return
@@ -48,11 +56,10 @@ func TestRedirects(t *testing.T) {
 				t.Error("nil page")
 				return
 			}
-			// if p.doc == nil {
-			// 	t.Error("nil page document")
-			// }
-
 			fmt.Println(u)
+			fmt.Println(p.URL)
+			fmt.Println("redirected", p.URL.Path != u.Path)
+			println()
 		}(l)
 	}
 	wg.Wait()

@@ -3,6 +3,7 @@
 
 # Testing
 *.test
+*.sh
 *.pprof
 *.ps
 *.log
@@ -10,7 +11,7 @@
 
 # Config
 /.vscode
-
+/*env*
 
 # Notes
 TODO*

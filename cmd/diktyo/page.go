@@ -5,26 +5,40 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/pkg/errors"
 	"golang.org/x/net/html"
 )
 
-type Page struct {
-	URL   url.URL
-	Links []*url.URL
-	// doc         *goquery.Document
-	depth       uint
-	contentType string
+func NewPage(u *url.URL, depth uint) *Page {
+	var link url.URL = *u
+	return &Page{
+		URL:   &link,
+		depth: depth,
+	}
 }
 
+// Page holds metadata for a webpage
+type Page struct {
+	URL          *url.URL
+	Links        []*url.URL
+	depth        uint
+	contentType  string
+	redirected   bool
+	responseTime time.Duration
+}
+
+// Fetch will take a page and fetch the document to retrieve
+// all necessary metadata for creating a complete page struct.
 func (p *Page) Fetch() error {
+	now := time.Now()
 	req := &http.Request{
 		Method: "GET",
 		Proto:  "HTTP/1.1",
 		Host:   p.URL.Host,
-		URL:    &p.URL,
+		URL:    p.URL,
 		Body:   http.NoBody,
 		GetBody: func() (io.ReadCloser, error) {
 			return http.NoBody, nil
@@ -39,10 +53,14 @@ func (p *Page) Fetch() error {
 	if err != nil {
 		return err
 	}
-	p.URL = *resp.Request.URL
+	p.redirected = wasRedirected(resp)
+	if p.redirected {
+		p.URL = resp.Request.URL
+	}
 	doc := goquery.NewDocumentFromNode(root)
-	p.Links, err = getLinks(doc, &p.URL)
-	p.contentType = resp.Header.Get("Content-Type")
+	p.Links, err = getLinks(doc, p.URL)
+	p.contentType = getContentType(resp)
+	p.responseTime = time.Since(now)
 	return err
 }
 
@@ -73,7 +91,6 @@ func requestPage(req *http.Request) (*Page, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-
 	defer resp.Body.Close()
 	return readPage(resp.Body, resp.Request.URL)
 }
@@ -89,9 +106,8 @@ func readPage(r io.Reader, from *url.URL) (*Page, error) {
 		return nil, err
 	}
 	return &Page{
-		URL:   *from,
+		URL:   from,
 		Links: links,
-		// doc:   doc,
 	}, nil
 }
 
@@ -125,4 +141,27 @@ func getLinks(doc *goquery.Document, entry *url.URL) ([]*url.URL, error) {
 		urls = append(urls, u)
 	}
 	return urls, nil
+}
+
+func wasRedirected(resp *http.Response) bool {
+	for resp != nil {
+		switch resp.StatusCode {
+		case 301, 302, 303, 307, 308:
+			return true
+		}
+		if resp.Request == nil {
+			break
+		}
+		resp = resp.Request.Response
+	}
+	return false
+}
+
+func getContentType(resp *http.Response) string {
+	ct := resp.Header.Get("Content-Type")
+	parts := strings.Split(ct, ";")
+	if len(parts) < 1 {
+		return ct
+	}
+	return parts[0]
 }

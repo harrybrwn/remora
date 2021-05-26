@@ -3,72 +3,81 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
-	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
+	"github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
-var client = http.Client{
-	Transport: http.DefaultTransport,
-	Timeout:   time.Second * 20,
-}
+var (
+	client = http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   time.Second * 20,
+	}
+	log = logrus.New()
+)
 
 func main() {
 	var (
-		err  error
-		args []string
-		now  = time.Now()
+		errlog = logrus.New()
+		err    error
+		args   []string
+		now    = time.Now()
+		stopAt int
 	)
 	defer func() { fmt.Println("total time:", time.Since(now)) }()
 
 	go http.ListenAndServe(":8080", nil)
 
 	flag := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-	weight := flag.Int64("weight", 30, "set the internal semaphore weight")
+	weight := flag.Int64("weight", 500, "set the internal semaphore weight")
 	depth := flag.Uint("depth", 2, "crawl depth limit")
+	dumpVisited := flag.String("dump-visited-set", "", "dump the visited vertex set to a file")
 	flag.DurationVarP(&client.Timeout, "timeout", "t", client.Timeout, "http request timeout")
+	flag.IntVar(&stopAt, "stop-at", -1, "halt the program at some number of links for pprof debugging")
 	err = flag.Parse(os.Args[1:])
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	f, err := os.Create("urls.log")
+	errlog.SetFormatter(&logrus.JSONFormatter{})
+	setErrorLogfile(errlog)
+	setLoggerFile(log, "diktyo")
+
+	urlsfile, err := os.Create(fmt.Sprintf("urls-depth-%d.log", *depth))
 	if err != nil {
-		log.Fatal(err)
+		errlog.Fatal(err)
 	}
-	defer f.Close()
-	log.SetOutput(f)
+	defer urlsfile.Close()
 
 	t := newTermCtrl()
 	c := NewCollector(*depth, *weight)
 
 	args = flag.Args()
 	if len(args) < 1 {
-		log.Fatal("no url")
+		errlog.Fatal("no url")
 	}
 
 	page, err := pageFromHyperLink(args[0])
 	if err != nil {
-		log.Fatal(err)
+		errlog.Fatal(err)
 	}
 	fmt.Println("root links:", len(page.Links))
 
 	interrupts := make(chan os.Signal, 2)
 	signal.Notify(interrupts, os.Interrupt)
 
-	defer func() {
-		cursorOn()
-	}()
+	defer cursorOn()
 
 	c.sem.Acquire(context.Background(), 1)
 	c.wg.Add(1)
@@ -76,14 +85,12 @@ func main() {
 	go c.collect(page)
 	cursorOff()
 
-	// Wait for first level, makes it slightly
-	// more like breadth first search.
-	// time.Sleep(time.Second * 10)
-
-	var (
-		n      = 1
-		nlinks int64
-	)
+	var stats = stats{
+		// root:     args[0],
+		root:     page.URL.String(),
+		vertices: 1,
+		started:  now,
+	}
 
 	for {
 		select {
@@ -92,26 +99,51 @@ func main() {
 				goto Done // channel closed
 			}
 			if pg.depth > c.limit {
-				break
+				continue
+			}
+
+			if stopAt > 0 && int(stats.vertices) >= stopAt {
+				time.Sleep(time.Second) // slow down considerably for memory debugging
 			}
 
 			c.sem.Acquire(context.Background(), 1)
 			c.wg.Add(1)
 			go c.collect(pg)
 
+			stats.collect(pg)
+
+			c.stats.Lock()
+			stack := c.stack
+			files := c.files
+			c.stats.Unlock()
+
 			u := pg.URL.String()
-			s := fmt.Sprintf("%d (%d) %d ", n, pg.depth, c.stack)
+			s := fmt.Sprintf(
+				"%d depth(%d) stack(%d) files(%d) errs(%d) time(%v) ",
+				stats.vertices, pg.depth,
+				stack, files, stats.errors,
+				pg.responseTime)
 			if len(u) > t.w {
-				u = u[:t.w-len(s)-2]
+				u = u[:t.w-len(s)-10]
 			}
-			log.Printf("%s%s", s, u)
+			fmt.Fprintf(urlsfile, "%s\n", u)
 			fmt.Printf("\r%s%s\x1b[0K", s, u)
-			n++
-			nlinks += int64(len(pg.Links))
 		case err := <-c.errs:
+			if err == nil {
+				continue
+			}
+			stats.errors++
 			e := unwrapAll(err)
+
+			errlog.WithFields(logrus.Fields{
+				"basetype":   fmt.Sprintf("%T", e),
+				"nth_vertex": stats.vertices,
+			}).Error(err)
+
 			if !isNoSuchHost(e) {
 				fmt.Printf("\rError: %[1]v\x1b[0K\n", err)
+			} else {
+				stats.deadDomains++
 			}
 		case <-interrupts:
 			close(interrupts)
@@ -119,9 +151,33 @@ func main() {
 			goto Done
 		}
 	}
+
 Done:
-	fmt.Printf("\n%d links visited\n\x1b[0K", n)
-	fmt.Printf("%f average links per page\n", float64(nlinks)/float64(n))
+	name, err := findNthFile("diktyo_out_%d.txt")
+	if err != nil {
+		errlog.Fatal(err)
+	}
+	out, err := os.Create(name)
+	if err != nil {
+		errlog.Fatal(err)
+	}
+	defer out.Close()
+	fmt.Fprintf(out, "root url: %s\ndepth limit: %d\n", args[0], *depth)
+	fmt.Printf("\n\x1b[0K") // add new line and clear terminal line
+	stats.writeto(io.MultiWriter(out, os.Stdout))
+
+	if *dumpVisited != "" {
+		dumpfile, err := os.OpenFile(*dumpVisited, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			errlog.Warn("cannot dump visited set to file:", err)
+			return
+		}
+		defer dumpfile.Close()
+		err = c.writeVisitedSet(dumpfile)
+		if err != nil {
+			errlog.Warn("cannot dump visited set to file:", err)
+		}
+	}
 }
 
 func isNoSuchHost(err error) bool {
@@ -142,26 +198,51 @@ func isNoSuchHost(err error) bool {
 	return false
 }
 
-func isTooManyOpenFiles(err error) bool {
-	e := unwrapAll(err)
-	errno, ok := e.(syscall.Errno)
-	if !ok {
-		return false
-	}
-	return errno == syscall.EMFILE || errno == syscall.ENFILE
+type stats struct {
+	root string // Root URL of the web crawl
+
+	// Number of vertices and edges seen respectively
+	vertices, edges int64
+
+	maxDegree         int    // Maximum number of links for one page
+	pageWithMaxDegree string // URL of the page with the max number of links
+	maxUrlLen         int    // Maximum length of all URLs visited
+
+	errors      int // Number of errors accumulated
+	deadDomains int // Number of dead domains found
+
+	started time.Time // Time of crawl start
 }
 
-func unwrapAll(err error) error {
-	var e error = err
-	type unwrappable interface {
-		Unwrap() error
+func (s *stats) writeto(w io.Writer) error {
+	fmt.Fprintf(w, "%d links visited\n", s.vertices)
+	fmt.Fprintf(w, "%f average links per page\n", s.averageDegree())
+	fmt.Fprintf(w, "%d maximum page links %s\n", s.maxDegree, s.pageWithMaxDegree)
+	fmt.Fprintf(w, "%d maximum url length\n", s.maxUrlLen)
+	fmt.Fprintf(w, "%d errors collected\n", s.errors)
+	fmt.Fprintf(w, "%d dead domains found\n", s.deadDomains)
+	fmt.Fprintf(w, "total time: %v\n", time.Since(s.started))
+	return nil
+}
+
+func (s *stats) collect(p *Page) {
+	degree := len(p.Links)
+	ulen := len(p.URL.String())
+
+	if ulen > s.maxUrlLen {
+		s.maxUrlLen = ulen
 	}
-	unwrapper, ok := e.(unwrappable)
-	for ok {
-		e = unwrapper.Unwrap()
-		unwrapper, ok = e.(unwrappable)
+	if degree > s.maxDegree {
+		s.maxDegree = degree
+		s.pageWithMaxDegree = p.URL.String()
 	}
-	return e
+
+	s.vertices++
+	s.edges += int64(degree)
+}
+
+func (s *stats) averageDegree() float64 {
+	return float64(s.edges) / float64(s.vertices)
 }
 
 func validURLScheme(scheme string) bool {
@@ -178,8 +259,10 @@ func validURLScheme(scheme string) bool {
 		"javascript",
 		"":
 		return false
+	case "http", "https": // TODO add support for other protocols later
+		return true
 	}
-	return true
+	return false
 }
 
 type termCtrl struct {
