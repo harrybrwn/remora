@@ -19,6 +19,13 @@ func NewPage(u *url.URL, depth uint) *Page {
 		Depth: depth,
 	}
 }
+func NewPageFromString(link string, depth uint) *Page {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil
+	}
+	return &Page{URL: u, Depth: depth}
+}
 
 // Page holds metadata for a webpage
 type Page struct {
@@ -31,8 +38,9 @@ type Page struct {
 }
 
 type PageMsg struct {
-	URL   string `json:"url"`
-	Depth uint   `json:"depth"`
+	URL   string   `json:"url"`
+	Depth uint     `json:"depth"`
+	Links []string `json:"links"`
 }
 
 // Fetch will take a page and fetch the document to retrieve

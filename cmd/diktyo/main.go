@@ -16,7 +16,6 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
-	"github.com/streadway/amqp"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
@@ -52,7 +51,8 @@ func main() {
 
 	errlog.SetFormatter(&logrus.JSONFormatter{})
 	setErrorLogfile(errlog)
-	setLoggerFile(log, "diktyo")
+	// setLoggerFile(log, "diktyo")
+	log.SetOutput(io.MultiWriter(os.Stdout, loggerFile("diktyo")))
 
 	urlsfile, err := os.Create(fmt.Sprintf("urls-depth-%d.log", *depth))
 	if err != nil {
@@ -67,46 +67,52 @@ func main() {
 		errlog.Fatal("no url")
 	}
 
-	interrupts := make(chan os.Signal, 2)
-	signal.Notify(interrupts, os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// interrupts := make(chan os.Signal, 2)
+	// signal.Notify(interrupts, os.Interrupt)
 
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	queue, err := NewQueue("diktyo-queue", "amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ch.Close()
-	q, err := ch.QueueDeclare("diktyo-queue", false, false, false, false, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	c.queue = &q
-	consumer, err := ch.Consume(q.Name, "", false, false, false, false, nil)
-	if err != nil {
+	if err = queue.Init(); err != nil {
 		log.Fatal(err)
 	}
 
+	// conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// defer conn.Close()
+	// ch, err := conn.Channel()
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// q, err := ch.QueueDeclare("diktyo-queue", false, false, false, false, nil)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	// consumer, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	consumer, err := queue.Channel().Consume("diktyo-queue", "", false, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cursorOff()
 	defer cursorOn()
 
-	page, err := pageFromHyperLink(args[0])
-	if err != nil {
-		errlog.Fatal(err)
-	}
-	fmt.Println("root links:", len(page.Links))
+	var (
+		page  = NewPageFromString(args[0], 0)
+		stats = stats{
+			root:     page.URL.String(),
+			vertices: 1,
+			started:  now,
+		}
+	)
 	c.wg.Add(1)
-	go c.WaitAndClose()
-	go c.asyncEnqueueLinks(page, ch)
-	cursorOff()
-
-	var stats = stats{
-		root:     page.URL.String(),
-		vertices: 1,
-		started:  now,
-	}
+	c.sem.Acquire(ctx, 1)
+	go c.collect(ctx, page, queue.Channel())
 
 	c.wg.Add(1)
 	go func() {
@@ -135,8 +141,8 @@ func main() {
 				continue
 			}
 			c.wg.Add(1)
-			c.sem.Acquire(context.Background(), 1)
-			go c.collect(p, ch)
+			c.sem.Acquire(ctx, 1)
+			go c.collect(ctx, p, queue.Channel())
 
 			stats.collect(p)
 			c.stats.Lock()
@@ -179,9 +185,14 @@ func main() {
 			} else {
 				stats.deadDomains++
 			}
-		case <-interrupts:
-			// close(interrupts)
-			// close(c.pages)
+		// case <-interrupts:
+		// 	queue.Close()
+		// 	close(interrupts)
+		// 	// close(c.pages)
+		// 	goto Done
+		case <-ctx.Done():
+			queue.Close()
+			stop()
 			goto Done
 		}
 	}

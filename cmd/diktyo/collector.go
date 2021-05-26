@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,15 +14,14 @@ import (
 )
 
 func NewCollector(crawLimit uint, weight int64) *pageCollector {
-	// const size = 1000
-	size := weight
+	const size = 1000
+	// size := weight
 	return &pageCollector{
 		limit: crawLimit,
 		pages: make(chan *Page, size),
 		errs:  make(chan error, size),
 		sem:   semaphore.NewWeighted(weight),
-		// reqsem: semaphore.NewWeighted(10),
-		set: make(map[string]struct{}),
+		set:   make(map[string]struct{}),
 	}
 }
 
@@ -33,10 +33,6 @@ type pageCollector struct {
 	limit uint
 	sem   *semaphore.Weighted
 
-	// http request semaphore for limiting the
-	// number of open sockets
-	reqsem *semaphore.Weighted
-
 	mu  sync.Mutex
 	set map[string]struct{}
 
@@ -44,8 +40,6 @@ type pageCollector struct {
 	stats sync.Mutex
 	stack int
 	files int
-
-	queue *amqp.Queue
 }
 
 func (pc *pageCollector) WaitAndClose() {
@@ -54,7 +48,27 @@ func (pc *pageCollector) WaitAndClose() {
 	close(pc.errs)
 }
 
-func (pc *pageCollector) asyncEnqueueLinks(page *Page, ch *amqp.Channel) {
+func (pc *pageCollector) collect(ctx context.Context, page *Page, ch *amqp.Channel) (err error) {
+	defer func() {
+		pc.sem.Release(1)
+		pc.wg.Done()
+	}()
+
+	err = page.Fetch()
+	if err != nil {
+		pc.errs <- err
+		return err
+	}
+
+	if page.redirected {
+		pc.markVisited(*page.URL)
+	}
+	pc.wg.Add(1)
+	go pc.asyncEnqueueLinks(ctx, page, ch)
+	return nil
+}
+
+func (pc *pageCollector) asyncEnqueueLinks(ctx context.Context, page *Page, ch *amqp.Channel) {
 	pc.stats.Lock()
 	pc.stack++
 	pc.stats.Unlock()
@@ -75,14 +89,13 @@ func (pc *pageCollector) asyncEnqueueLinks(page *Page, ch *amqp.Channel) {
 			continue
 		}
 
-		// p := NewPage(l, page.Depth+1)
 		p := PageMsg{URL: l.String(), Depth: page.Depth + 1}
 		raw, err := json.Marshal(p)
 		if err != nil {
 			pc.errs <- err
 			continue
 		}
-		err = ch.Publish("", pc.queue.Name, false, false, amqp.Publishing{
+		err = ch.Publish("", "diktyo-queue", false, false, amqp.Publishing{
 			Type:         "page",
 			Body:         raw,
 			Timestamp:    time.Now(),
@@ -92,33 +105,12 @@ func (pc *pageCollector) asyncEnqueueLinks(page *Page, ch *amqp.Channel) {
 		if err != nil {
 			pc.errs <- err
 		}
-		// pc.pages <- p
 	}
-}
-
-func (pc *pageCollector) collect(page *Page, ch *amqp.Channel) (err error) {
-	defer func() {
-		pc.sem.Release(1)
-		pc.wg.Done()
-	}()
-
-	err = page.Fetch()
-	if err != nil {
-		pc.errs <- err
-		return err
-	}
-
-	if page.redirected {
-		pc.markVisited(*page.URL)
-	}
-	pc.wg.Add(1)
-	go pc.asyncEnqueueLinks(page, ch)
-	return nil
 }
 
 func (pc *pageCollector) _collect(page *Page) error {
 	defer func() {
-		// pc.sem.Release(1)
+		pc.sem.Release(1)
 		pc.wg.Done()
 	}()
 	pc.stats.Lock()

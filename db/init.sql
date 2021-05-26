@@ -11,12 +11,12 @@ CREATE TABLE page (
     --
     -- (8000 + 255 + 8) * 2 = 16526
     url varchar(16526),
-
     links text[],
 
     -- RFC 6838 section 4.2 states max length
     -- of mime types as 127.
     content_type varchar(127),
 
+    crawl_date TIMESTAMP,
     redirected boolean
 );

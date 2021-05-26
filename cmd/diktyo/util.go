@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"syscall"
 
@@ -64,6 +65,18 @@ func setLoggerFile(l *logrus.Logger, name string) error {
 	// they can use an type assertion for `interface { Close() error }`
 	l.SetOutput(logfile)
 	return nil
+}
+
+func loggerFile(name string) io.Writer {
+	name, err := findNthFile(name + "_%d.log")
+	if err != nil {
+		return nil
+	}
+	logfile, err := os.Create(name)
+	if err != nil {
+		return nil
+	}
+	return logfile
 }
 
 func setErrorLogfile(l *logrus.Logger) error {
