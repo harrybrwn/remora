@@ -4,27 +4,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
+	"runtime"
 	"syscall"
+	"time"
 
+	"github.com/harrybrwn/diktyo/internal"
 	"github.com/sirupsen/logrus"
 )
 
-func unwrapAll(err error) error {
-	var e error = err
-	type unwrappable interface {
-		Unwrap() error
-	}
-	unwrapper, ok := e.(unwrappable)
-	for ok {
-		e = unwrapper.Unwrap()
-		unwrapper, ok = e.(unwrappable)
-	}
-	return e
-}
-
 func isTooManyOpenFiles(err error) bool {
-	e := unwrapAll(err)
+	e := internal.UnwrapAll(err)
 	errno, ok := e.(syscall.Errno)
 	if !ok {
 		return false
@@ -81,4 +73,75 @@ func loggerFile(name string) io.Writer {
 
 func setErrorLogfile(l *logrus.Logger) error {
 	return setLoggerFile(l, "diktyo_errors")
+}
+
+func ipAddrs(host string) (v4, v6 interface{}, err error) {
+	var addrs []net.IP
+	addrs, err = net.LookupIP(host)
+	if err != nil {
+		return
+	}
+	for _, addr := range addrs {
+		if addr.To4() != nil {
+			v4 = addr.String()
+		} else if addr.To16() != nil {
+			v6 = addr.String()
+		}
+	}
+	if v4 == "" {
+		v4 = nil
+	}
+	if v6 == "" {
+		v6 = nil
+	}
+	return
+}
+
+func memoryLogs(mem *runtime.MemStats) logrus.Fields {
+	lastGC := time.Since(time.Unix(0, int64(mem.LastGC)))
+	return logrus.Fields{
+		"heap":   fmt.Sprintf("%03.02fmb", toMB(mem.HeapAlloc)),
+		"sys":    fmt.Sprintf("%03.02fmb", toMB(mem.Sys)),
+		"frees":  mem.Frees,
+		"GCs":    mem.NumGC,
+		"lastGC": lastGC.Truncate(time.Millisecond),
+	}
+}
+
+func isNoSuchHost(err error) bool {
+	switch v := err.(type) {
+	case *url.Error:
+		urlerr, ok := err.(*url.Error)
+		if !ok {
+			return false
+		}
+		operr, ok := urlerr.Err.(*net.OpError)
+		if !ok {
+			return false
+		}
+		return isNoSuchHost(operr)
+	case *net.DNSError:
+		return v.IsNotFound
+	}
+	return false
+}
+
+func validURLScheme(scheme string) bool {
+	switch scheme {
+	case
+		"ftp",          // file transfer protocol
+		"irc",          // IRC chat
+		"mailto",       // email
+		"tel",          // telephone
+		"sms",          // text messaging
+		"fb-messenger", // facebook messenger
+		"waze",         // waze maps app
+		"whatsapp",     // whatsapp messenger app
+		"javascript",
+		"":
+		return false
+	case "http", "https": // TODO add support for other protocols later
+		return true
+	}
+	return false
 }

@@ -1,29 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net/url"
 	"os"
 	"sync"
 	"testing"
 
+	"github.com/harrybrwn/diktyo/web"
 	"github.com/sirupsen/logrus"
 )
 
 func Test(t *testing.T) {
-}
-
-func TestGetPage(t *testing.T) {
-	page, err := pageFromHyperLink("https://en.wikipedia.org/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if page == nil {
-		t.Fatal("nil page")
-	}
-	if len(page.Links) == 0 {
-		t.Error("wikipedia front page has no links, wtf")
-	}
+	fmt.Println("http://quotes.toscrape.com/")
 }
 
 func TestRedirects(t *testing.T) {
@@ -36,6 +26,7 @@ func TestRedirects(t *testing.T) {
 		"https://loc.gov/help/",
 		"https://creativecommons.org/legalcode",
 		"http://foundation.wikimedia.org/wiki/Terms_of_Use",
+		"http://quotes.toscrape.com/",
 	}
 	wg.Add(len(links))
 	for _, l := range links {
@@ -45,7 +36,7 @@ func TestRedirects(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-			p := NewPage(u, 0)
+			p := web.NewPage(u, 0)
 
 			err = p.Fetch()
 			if err != nil {
@@ -63,4 +54,32 @@ func TestRedirects(t *testing.T) {
 		}(l)
 	}
 	wg.Wait()
+}
+
+func TestRuntimeCommands(t *testing.T) {
+	var (
+		crawler = web.NewCrawler()
+		cmd     = NewRuntimeCmd(crawler)
+		buf     bytes.Buffer
+	)
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"count"})
+	err := cmd.Execute()
+	if err != nil {
+		t.Error()
+	}
+	if buf.String() != "count: 0\n" {
+		t.Error("wrong output")
+	}
+	buf.Reset()
+
+	cmd.SetArgs([]string{"help"})
+	err = cmd.Execute()
+	if err != nil {
+		t.Error(err)
+	}
+	if buf.Len() == 0 {
+		t.Error("should output help message, got zero length output")
+	}
+	buf.Reset()
 }

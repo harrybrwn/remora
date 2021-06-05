@@ -15,21 +15,21 @@ services:
         protocol: tcp
         mode: bridge
     volumes:
-      - ./db:/docker-entrypoint-initdb.d:ro
+      - ./db/postgres:/docker-entrypoint-initdb.d:ro
+      - ./db/data:/var/lib/postgresql/data/
 
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: diktyo-msgq
-    ports:
-      - 5672:5672
-      - 15672:15672
-    volumes:
-      - ~/.docker-conf/rabbitmq/data/:/var/lib/rabbitmq/
-      - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
-    networks:
-      - rabbitmq_go_net
+    # rabbitmq:
+    #   image: rabbitmq:3-management-alpine
+    #   container_name: diktyo-msgq
+    #   ports:
+    #     - 5672:5672
+    #     - 15672:15672
+    #   volumes:
+    #     - ~/.docker-conf/rabbitmq/data/:/var/lib/rabbitmq/
+    #     - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
+    #   networks:
+    #     - rabbitmq_go_net
 
-networks:
-  rabbitmq_go_net:
-    driver: bridge
-
+# networks:
+#   rabbitmq_go_net:
+#     driver: bridge

@@ -2,7 +2,7 @@ package main
 
 import "github.com/streadway/amqp"
 
-func NewQueue(name, uri string) (*Queue, error) {
+func NewMessageQueue(name, uri string) (*MessageQueue, error) {
 	conn, err := amqp.Dial(uri)
 	if err != nil {
 		return nil, err
@@ -12,14 +12,14 @@ func NewQueue(name, uri string) (*Queue, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &Queue{
+	return &MessageQueue{
 		conn:  conn,
 		ch:    ch,
 		queue: name,
 	}, nil
 }
 
-type Queue struct {
+type MessageQueue struct {
 	conn  *amqp.Connection
 	ch    *amqp.Channel
 	queue string
@@ -30,7 +30,7 @@ type Queue struct {
 	NoWait     bool
 }
 
-func (q *Queue) Init() error {
+func (q *MessageQueue) Init() error {
 	_, err := q.ch.QueueDeclare(q.queue, false, false, false, false, nil)
 	if err != nil {
 		return err
@@ -39,7 +39,7 @@ func (q *Queue) Init() error {
 	return nil
 }
 
-func (q *Queue) Close() (err error) {
+func (q *MessageQueue) Close() (err error) {
 	err = q.ch.Close()
 	if err != nil {
 		return err
@@ -47,4 +47,4 @@ func (q *Queue) Close() (err error) {
 	return q.conn.Close()
 }
 
-func (q *Queue) Channel() *amqp.Channel { return q.ch }
+func (q *MessageQueue) Channel() *amqp.Channel { return q.ch }

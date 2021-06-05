@@ -2,6 +2,7 @@
 /diktyo
 
 # Testing
+/test
 *.test
 *.sh
 *.pprof
@@ -12,6 +13,18 @@
 # Config
 /.vscode
 /*env*
+/diktyo.yml
 
 # Notes
 TODO*
+notes.*
+
+# Scripts
+/psql
+/test
+/db/*.sql
+
+# Database
+/db/data
+/_queue
+*.dump

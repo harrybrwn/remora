@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -13,10 +10,17 @@ import (
 	"os/signal"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/harrybrwn/config"
+	"github.com/harrybrwn/diktyo/db"
+	"github.com/harrybrwn/diktyo/internal/logging"
+	"github.com/harrybrwn/diktyo/web"
+	"github.com/joho/godotenv"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
-	"golang.org/x/crypto/ssh/terminal"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
@@ -24,305 +28,195 @@ var (
 		Transport: http.DefaultTransport,
 		Timeout:   time.Second * 20,
 	}
-	log = logrus.New()
+	log     = logrus.New()
+	logfile = lumberjack.Logger{
+		Filename:   "crawler.log",
+		MaxSize:    500,
+		MaxBackups: 25,
+		MaxAge:     355,
+		Compress:   false,
+	}
 )
 
-func main() {
-	var (
-		errlog = logrus.New()
-		now    = time.Now()
-		err    error
-		args   []string
-		stopAt int
-	)
-	go http.ListenAndServe(":8080", nil)
+type Config struct {
+	DB           db.Config     `yaml:"db" config:"db"`
+	QueueSize    int64         `yaml:"queue_size" default:"500"`
+	Seeds        []string      `yaml:"seeds"`
+	Depth        uint          `yaml:"depth" config:"depth" default:"2"`
+	AllowedHosts []string      `yaml:"allowed_hosts" config:"allowed_hosts"`
+	Sleep        time.Duration `yaml:"sleep" default:"250ms"`
+}
 
-	flag := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-	weight := flag.Int64("weight", 500, "set the internal semaphore weight")
-	depth := flag.Uint("depth", 2, "crawl depth limit")
-	dumpVisited := flag.String("dump-visited-set", "", "dump the visited vertex set to a file")
-	flag.DurationVarP(&client.Timeout, "timeout", "t", client.Timeout, "http request timeout")
-	flag.IntVar(&stopAt, "stop-at", -1, "halt the program at some number of links for pprof debugging")
-	err = flag.Parse(os.Args[1:])
+func (c *Config) bind(flag *flag.FlagSet) {
+	flag.Int64Var(&c.QueueSize, "queue", c.QueueSize, "Size of the main queue")
+	flag.StringArrayVarP(&c.AllowedHosts, "allowed-hosts", "a", c.AllowedHosts,
+		"A list of hosts that the crawler is allowed to "+
+			"visit. The host of seed urls are added implicitly")
+	flag.DurationVar(&c.Sleep, "sleep", c.Sleep, "Sleep time for each spider request")
+	flag.UintVar(&c.Depth, "depth", c.Depth, "Crawler depth limit")
+}
+
+func main() {
+	var conf Config
+	godotenv.Load()
+	initLogger()
+	initConfig(&conf)
+
+	cmd := NewCLIRoot(&conf)
+	err := cmd.Execute()
 	if err != nil {
 		fmt.Println(err)
-		return
 	}
+}
 
-	errlog.SetFormatter(&logrus.JSONFormatter{})
-	setErrorLogfile(errlog)
-	// setLoggerFile(log, "diktyo")
-	log.SetOutput(io.MultiWriter(os.Stdout, loggerFile("diktyo")))
+func NewCLIRoot(conf *Config) *cobra.Command {
+	c := &cobra.Command{
+		Use:   "diktyo",
+		Short: "Web crawler",
+	}
+	crawlCmd := &cobra.Command{
+		Use:   "crawl",
+		Short: "Start a full web crawl",
+		Long:  "Start a full web crawl.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				conf.Seeds = args
+			}
+			return crawl(cmd.Context(), conf)
+		},
+	}
+	conf.bind(crawlCmd.Flags())
 
-	urlsfile, err := os.Create(fmt.Sprintf("urls-depth-%d.log", *depth))
+	c.AddCommand(
+		crawlCmd,
+		config.NewConfigCommand(),
+		&cobra.Command{
+			Use:   "list <url>",
+			Short: "List the urls on a page",
+			Args:  cobra.MinimumNArgs(1),
+			RunE:  runListCmd,
+		},
+		&cobra.Command{
+			Use:  "keywords",
+			Args: cobra.MinimumNArgs(1),
+			RunE: runKeywordsCmd,
+		},
+		&cobra.Command{
+			Use: "test", Hidden: true,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return nil
+			},
+		},
+	)
+	c.SetUsageTemplate(config.IndentedCobraHelpTemplate)
+	return c
+}
+
+func crawl(ctx context.Context, conf *Config) error {
+	var (
+		err   error
+		start = time.Now()
+		sigs  = make(chan os.Signal, 1)
+	)
+	signal.Notify(sigs, os.Interrupt)
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	db, err := db.New(&conf.DB)
 	if err != nil {
-		errlog.Fatal(err)
+		return errors.Wrap(err, "could not connect to database")
 	}
-	defer urlsfile.Close()
-
-	c := NewCollector(*depth, *weight)
-
-	args = flag.Args()
-	if len(args) < 1 {
-		errlog.Fatal("no url")
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	// interrupts := make(chan os.Signal, 2)
-	// signal.Notify(interrupts, os.Interrupt)
-
-	queue, err := NewQueue("diktyo-queue", "amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err = queue.Init(); err != nil {
-		log.Fatal(err)
-	}
-
-	// conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// defer conn.Close()
-	// ch, err := conn.Channel()
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// q, err := ch.QueueDeclare("diktyo-queue", false, false, false, false, nil)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// consumer, err := ch.Consume(q.Name, "", false, false, false, false, nil)
-	consumer, err := queue.Channel().Consume("diktyo-queue", "", false, false, false, false, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	cursorOff()
-	defer cursorOn()
+	defer db.Close()
 
 	var (
-		page  = NewPageFromString(args[0], 0)
-		stats = stats{
-			root:     page.URL.String(),
-			vertices: 1,
-			started:  now,
-		}
+		visitor = visitor{db: db, hosts: make(map[string]struct{})}
+		ch      = make(chan *web.Page, conf.QueueSize)
+		crawler = web.NewCrawler(
+			web.WithVisitor(&visitor),
+			web.WithLimit(config.GetUint("depth")),
+			web.WithQueue(ch),
+		)
 	)
-	c.wg.Add(1)
-	c.sem.Acquire(ctx, 1)
-	go c.collect(ctx, page, queue.Channel())
+	crawler.Sleep = conf.Sleep
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		for msg := range consumer {
-			if msg.Type != "page" {
-				continue
-			}
-
-			var pmsg *PageMsg
-			err = json.Unmarshal(msg.Body, &pmsg)
-			if err != nil {
-				c.errs <- err
-				continue
-			}
-			if pmsg.Depth > c.limit {
-				continue
-			}
-			l, err := url.Parse(pmsg.URL)
-			if err != nil {
-				c.errs <- err
-				continue
-			}
-			p := NewPage(l, pmsg.Depth)
-			if c.tryMarkVisited(*p.URL) {
-				continue
-			}
-			c.wg.Add(1)
-			c.sem.Acquire(ctx, 1)
-			go c.collect(ctx, p, queue.Channel())
-
-			stats.collect(p)
-			c.stats.Lock()
-			stack := c.stack
-			files := c.files
-			c.stats.Unlock()
-
-			u := p.URL.String()
-			s := fmt.Sprintf(
-				"%d depth(%d) stack(%d) files(%d) errs(%d) time(%v) q(%d) ",
-				stats.vertices, p.Depth,
-				stack, files, stats.errors,
-				p.responseTime, len(c.pages))
-			t := newTermCtrl()
-			if len(u) > t.w {
-				uu := []byte(u)
-				u = string(uu[:(t.w - len(s) - 10)])
-			}
-			fmt.Fprintf(urlsfile, "%s\n", u)
-			fmt.Printf("\r%s%s\x1b[0K", s, u)
-			// fmt.Printf("%s%s\n", s, u)
-		}
+	crawler.DB, err = badger.Open(badger.DefaultOptions("./_queue"))
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		crawler.DB.Close()
+		os.RemoveAll("./_queue")
 	}()
 
-	for {
-		select {
-		case err := <-c.errs:
-			if err == nil {
-				continue
-			}
-			stats.errors++
-			e := unwrapAll(err)
-			errlog.WithFields(logrus.Fields{
-				"basetype":   fmt.Sprintf("%T", e),
-				"nth_vertex": stats.vertices,
-			}).Error(err)
-
-			if !isNoSuchHost(e) {
-				fmt.Printf("\rError: %[1]v\x1b[0K\n", err)
-			} else {
-				stats.deadDomains++
-			}
-		// case <-interrupts:
-		// 	queue.Close()
-		// 	close(interrupts)
-		// 	// close(c.pages)
-		// 	goto Done
-		case <-ctx.Done():
-			queue.Close()
-			stop()
-			goto Done
-		}
+	if len(conf.Seeds) < 1 {
+		return errors.New("no seed URLs")
 	}
+	visitor.addHosts(conf.AllowedHosts)
 
-Done:
-	name, err := findNthFile("diktyo_out_%d.txt")
-	if err != nil {
-		errlog.Fatal(err)
-	}
-	out, err := os.Create(name)
-	if err != nil {
-		errlog.Fatal(err)
-	}
-	defer out.Close()
-	fmt.Fprintf(out, "root url: %s\ndepth limit: %d\n", args[0], *depth)
-	fmt.Printf("\n\x1b[0K") // add new line and clear terminal line
-	stats.writeto(io.MultiWriter(out, os.Stdout))
+	go runtimeCommandHandler(ctx, stop, crawler)
 
-	if *dumpVisited != "" {
-		dumpfile, err := os.OpenFile(*dumpVisited, os.O_CREATE|os.O_WRONLY, 0644)
+	for _, seed := range conf.Seeds {
+		u, err := url.Parse(seed)
 		if err != nil {
-			errlog.Warn("cannot dump visited set to file:", err)
-			return
+			log.Error(err)
+			continue
 		}
-		defer dumpfile.Close()
-		err = c.writeVisitedSet(dumpfile)
-		if err != nil {
-			errlog.Warn("cannot dump visited set to file:", err)
-		}
+		visitor.hosts[u.Host] = struct{}{}
+		crawler.Enqueue(web.NewPage(u, 0))
 	}
-}
 
-func isNoSuchHost(err error) bool {
-	switch v := err.(type) {
-	case *url.Error:
-		urlerr, ok := err.(*url.Error)
-		if !ok {
-			return false
-		}
-		operr, ok := urlerr.Err.(*net.OpError)
-		if !ok {
-			return false
-		}
-		return isNoSuchHost(operr)
-	case *net.DNSError:
-		return v.IsNotFound
+	log.WithFields(logrus.Fields{
+		"seeds": conf.Seeds, "max_depth": config.GetUint("depth"),
+	}).Info("Starting Crawl")
+
+	crawler.Add(1)
+	go crawler.Crawl(ctx)
+	go http.ListenAndServe(":8080", nil)
+
+	select {
+	case <-sigs:
+		stop()
+		close(ch)
+		fmt.Println()
+	case <-ctx.Done():
 	}
-	return false
-}
-
-type stats struct {
-	root string // Root URL of the web crawl
-
-	// Number of vertices and edges seen respectively
-	vertices, edges int64
-
-	maxDegree         int    // Maximum number of links for one page
-	pageWithMaxDegree string // URL of the page with the max number of links
-	maxUrlLen         int    // Maximum length of all URLs visited
-
-	errors      int // Number of errors accumulated
-	deadDomains int // Number of dead domains found
-
-	started time.Time // Time of crawl start
-}
-
-func (s *stats) writeto(w io.Writer) error {
-	fmt.Fprintf(w, "%d links visited\n", s.vertices)
-	fmt.Fprintf(w, "%f average links per page\n", s.averageDegree())
-	fmt.Fprintf(w, "%d maximum page links %s\n", s.maxDegree, s.pageWithMaxDegree)
-	fmt.Fprintf(w, "%d maximum url length\n", s.maxUrlLen)
-	fmt.Fprintf(w, "%d errors collected\n", s.errors)
-	fmt.Fprintf(w, "%d dead domains found\n", s.deadDomains)
-	fmt.Fprintf(w, "total time: %v\n", time.Since(s.started))
+	log.WithFields(logrus.Fields{
+		"duration": time.Since(start),
+		"total":    crawler.N(),
+	}).Info("Stopping Crawler")
 	return nil
 }
 
-func (s *stats) collect(p *Page) {
-	degree := len(p.Links)
-	ulen := len(p.URL.String())
-
-	if ulen > s.maxUrlLen {
-		s.maxUrlLen = ulen
-	}
-	if degree > s.maxDegree {
-		s.maxDegree = degree
-		s.pageWithMaxDegree = p.URL.String()
-	}
-
-	s.vertices++
-	s.edges += int64(degree)
-}
-
-func (s *stats) averageDegree() float64 {
-	return float64(s.edges) / float64(s.vertices)
-}
-
-func validURLScheme(scheme string) bool {
-	switch scheme {
-	case
-		"ftp",          // file transfer protocol
-		"irc",          // IRC chat
-		"mailto",       // email
-		"tel",          // telephone
-		"sms",          // text messaging
-		"fb-messenger", // facebook messenger
-		"waze",         // waze maps app
-		"whatsapp",     // whatsapp messenger app
-		"javascript",
-		"":
-		return false
-	case "http", "https": // TODO add support for other protocols later
-		return true
-	}
-	return false
-}
-
-type termCtrl struct {
-	w, h int
-}
-
-func newTermCtrl() *termCtrl {
-	w, h, err := terminal.GetSize(1)
+func initConfig(c *Config) {
+	config.SetFilename("diktyo.yml")
+	config.AddPath(".")
+	config.SetType("yaml")
+	config.SetConfig(c)
+	err := config.InitDefaults()
 	if err != nil {
-		panic(err) // TODO
+		log.Fatal(errors.Wrap(err, "could not set config defaults"))
 	}
-	return &termCtrl{
-		w: w, h: h,
+	if err := config.ReadConfigFile(); err != nil {
+		log.Fatal(errors.Wrap(err, "could not read config"))
 	}
 }
 
-func cursorOn()  { fmt.Printf("\x1b[?25h") }
-func cursorOff() { fmt.Printf("\x1b[?25l") }
+func initLogger() {
+	// log.AddHook(logging.NewLogFileHook(&logfile, &logrus.JSONFormatter{
+	// 	TimestampFormat:   time.RFC3339,
+	// 	DisableHTMLEscape: true,
+	// }))
+	log.AddHook(logging.NewLogFileHook(&logfile, &logrus.TextFormatter{
+		DisableColors:   true,
+		PadLevelText:    true,
+		TimestampFormat: time.RFC3339,
+	}))
+	log.SetOutput(os.Stdout)
+	log.SetLevel(logrus.TraceLevel)
+	log.SetFormatter(&logging.PrefixedFormatter{
+		Prefix:           "",
+		TimeFormat:       time.RFC3339,
+		MaxMessageLength: 135,
+	})
+	web.SetLogger(log)
+}
