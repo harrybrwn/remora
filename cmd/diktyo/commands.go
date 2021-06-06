@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/dgraph-io/ristretto"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -93,24 +95,72 @@ func runtimeCommandHandler(ctx context.Context, stop context.CancelFunc, c *web.
 	}
 }
 
+const spiderStatFmt = `  - spider %d:
+	host:      %s
+	fetched:   %d
+	waittime:  %v
+	queuesize: %d
+`
+
 func statsCmdRunFunc(c *web.Crawler) func(*cobra.Command, []string) {
 	return func(cmd *cobra.Command, _ []string) {
+		out := cmd.OutOrStdout()
 		mem := getMemStats()
 		sstats := c.SpiderStats()
-		cmd.Printf(
+		fmt.Fprintf(out,
 			"statistics:\n  visited: %d\n  queue size: %d\n  spiders count: %d\n",
 			c.N(), c.QueueSize(), c.SpiderCount(),
 		)
-		cmd.Printf("  heap: %02fMB\n  sys-mem: %02fMB\n", float64(mem.HeapAlloc)/1024.0/1024.0, float64(mem.Sys)/1024.0/1024.0)
-		tot := 0
+		fmt.Fprintf(out, "  heap: %02fMB\n  sys-mem: %02fMB\n", toMB(mem.HeapAlloc), toMB(mem.Sys))
+		var tot, queued int64
 		for i, s := range sstats {
-			tot += int(s.PagesFetched)
-			cmd.Printf(
-				"  - spider %d:\n      host: %s\n      fetched: %d\n      waittime: %v\n",
-				i, s.Host, s.PagesFetched, s.WaitTime)
+			tot += s.PagesFetched
+			queued += s.QueueSize
+			fmt.Fprintf(out, spiderStatFmt, i, s.Host, s.PagesFetched, s.WaitTime, s.QueueSize)
 		}
-		cmd.Printf("  total fetched: %d\n", tot)
+		fmt.Fprintf(out, "  total fetched: %d\n  total queued: %d\n", tot, queued)
+		lsm, vlog := c.DB.Size()
+		// m := c.DB.IndexCacheMetrics()
+		opts := c.DB.Opts()
+		fmt.Fprintf(out, `  badger db:
+  dir: %s
+  size:
+    lsm: %02fMB
+    vlog: %02fMB
+  max-batch-count: %d
+  max-batch-size:  %d
+`,
+			opts.Dir,
+			toMB(uint64(lsm)), toMB(uint64(vlog)),
+			c.DB.MaxBatchCount(), c.DB.MaxBatchSize(),
+		)
+		fmt.Fprintf(out, "  block cache:\n")
+		printMetrics(out, c.DB.BlockCacheMetrics())
+		fmt.Fprintf(out, "  index cache:\n")
+		printMetrics(out, c.DB.IndexCacheMetrics())
 	}
+}
+
+func printMetrics(out io.Writer, m *ristretto.Metrics) {
+	fmt.Fprintf(out, `
+    hits:   %d
+    misses: %d
+    gets: dropped %d, kept     %d
+    sets: dropped %d, rejected %d
+    cost:
+      added:   %d
+      evicted: %d
+    keys:
+      added:   %d
+      updated: %d
+      evicted: %d
+`,
+		m.Hits(), m.Misses(),
+		m.GetsKept(), m.GetsDropped(),
+		m.CostAdded(), m.CostEvicted(),
+		m.KeysAdded(), m.KeysUpdated(), m.KeysEvicted(),
+		m.SetsDropped(), m.SetsRejected(),
+	)
 }
 
 func newSetCmd() *cobra.Command {
@@ -123,6 +173,11 @@ func newSetCmd() *cobra.Command {
 			Use:     "loglevel",
 			Aliases: []string{"loglvl", "log-level", "log-lvl"},
 			RunE:    setLogLevelRunFunc},
+		&cobra.Command{
+			Use:  "sleep",
+			Args: cobra.ExactArgs(1),
+			Run:  func(cmd *cobra.Command, args []string) {},
+		},
 	)
 	return c
 }

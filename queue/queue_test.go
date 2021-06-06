@@ -30,6 +30,9 @@ func q(t *testing.T) *queue {
 }
 
 func rm(q *queue) error {
+	if err := q.Close(); err != nil {
+		fmt.Println(err)
+	}
 	return os.RemoveAll(q.db.Opts().Dir)
 }
 
@@ -167,7 +170,7 @@ func TestLargeRW(t *testing.T) {
 		n  = index_t(0xffff)
 	)
 	q := q(t)
-	fmt.Println(q.db.Opts().Dir)
+	defer q.Close()
 	defer rm(q)
 
 	key := func(x index_t) []byte {
@@ -210,4 +213,52 @@ func TestLargeRW(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestCloseQueue(t *testing.T) {
+	var (
+		wg sync.WaitGroup
+		q  = q(t)
+	)
+	defer rm(q)
+	for _, e := range []error{
+		q.Put([]byte{1}),
+		q.Put([]byte{5}),
+		eatb(q.Pop()),
+	} {
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+
+	err := q.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(e error) {
+		if e != ErrQueueClosed {
+			t.Error("queue should be closed")
+		}
+	}
+	wg.Add(2)
+	n := 100
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			check(q.Put([]byte{byte(i)}))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			_, err := q.Pop()
+			check(err)
+		}
+	}()
+	wg.Wait()
+}
+
+func eatb(_ []byte, e error) error {
+	return e
 }

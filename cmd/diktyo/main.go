@@ -45,6 +45,9 @@ type Config struct {
 	Depth        uint          `yaml:"depth" config:"depth" default:"2"`
 	AllowedHosts []string      `yaml:"allowed_hosts" config:"allowed_hosts"`
 	Sleep        time.Duration `yaml:"sleep" default:"250ms"`
+	// A limit on the number of concurrent requests being
+	/// waited for at any moment
+	RequestLimit int `yaml:"request_limit"`
 }
 
 func (c *Config) bind(flag *flag.FlagSet) {
@@ -128,6 +131,15 @@ func crawl(ctx context.Context, conf *Config) error {
 	}
 	defer db.Close()
 
+	qdb, err := badger.Open(badger.DefaultOptions("./_queue"))
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		qdb.Close()
+		os.RemoveAll("./_queue")
+	}()
+
 	var (
 		visitor = visitor{db: db, hosts: make(map[string]struct{})}
 		ch      = make(chan *web.Page, conf.QueueSize)
@@ -135,18 +147,10 @@ func crawl(ctx context.Context, conf *Config) error {
 			web.WithVisitor(&visitor),
 			web.WithLimit(config.GetUint("depth")),
 			web.WithQueue(ch),
+			web.WithSleep(conf.Sleep),
+			web.WithDB(qdb),
 		)
 	)
-	crawler.Sleep = conf.Sleep
-
-	crawler.DB, err = badger.Open(badger.DefaultOptions("./_queue"))
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		crawler.DB.Close()
-		os.RemoveAll("./_queue")
-	}()
 
 	if len(conf.Seeds) < 1 {
 		return errors.New("no seed URLs")
@@ -154,7 +158,6 @@ func crawl(ctx context.Context, conf *Config) error {
 	visitor.addHosts(conf.AllowedHosts)
 
 	go runtimeCommandHandler(ctx, stop, crawler)
-
 	for _, seed := range conf.Seeds {
 		u, err := url.Parse(seed)
 		if err != nil {
@@ -166,11 +169,10 @@ func crawl(ctx context.Context, conf *Config) error {
 	}
 
 	log.WithFields(logrus.Fields{
-		"seeds": conf.Seeds, "max_depth": config.GetUint("depth"),
-	}).Info("Starting Crawl")
+		"seeds": conf.Seeds, "max_depth": config.GetUint("depth")}).Info("Starting Crawl")
 
 	crawler.Add(1)
-	go crawler.Crawl(ctx)
+	go crawler.Crawl(ctx, conf.RequestLimit)
 	go http.ListenAndServe(":8080", nil)
 
 	select {
@@ -180,6 +182,11 @@ func crawl(ctx context.Context, conf *Config) error {
 		fmt.Println()
 	case <-ctx.Done():
 	}
+	err = crawler.Close()
+	if err != nil {
+		log.WithError(err).Error("could not close web crawler")
+	}
+
 	log.WithFields(logrus.Fields{
 		"duration": time.Since(start),
 		"total":    crawler.N(),

@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v3"
 )
+
+var ErrQueueClosed = errors.New("queue closed")
 
 type Queue interface {
 	Put([]byte) error
@@ -17,7 +21,8 @@ type Queue interface {
 	// is used for the backend storage.
 	PutKey(key, val []byte) error
 
-	Size() int
+	Size() int64
+	Close() error
 }
 
 func Open(opts badger.Options) (Queue, error) {
@@ -29,35 +34,50 @@ func Open(opts badger.Options) (Queue, error) {
 }
 
 func New(db *badger.DB) Queue {
-	q := &queue{db: db}
-	q.empty = sync.NewCond(&q.mu)
-	// q.sig = make(chan struct{})
+	var mu sync.Mutex
+	q := &queue{
+		db:     db,
+		mu:     &mu,
+		empty:  sync.NewCond(&mu),
+		closed: 0,
+	}
 	return q
 }
 
 type queue struct {
 	db *badger.DB
 
-	mu    sync.Mutex
-	empty *sync.Cond
-	// sig   chan struct{}
+	mu     *sync.Mutex
+	empty  *sync.Cond
+	closed uint32
 
 	head, tail []byte
-	size       int
+	size       int64
 }
 
-type node struct{ Key, Val, Next []byte }
+type node struct {
+	Key, Val, Next []byte
+	Count          int64
+}
+
+func (q *queue) Close() error {
+	atomic.AddUint32(&q.closed, 1) // mark closed
+	q.empty.Broadcast()            // wake everyone up
+	return nil
+}
 
 func (q *queue) waitSig() {
-	for q.size == 0 {
+	for q.size == 0 && q.closed == 0 {
 		q.empty.Wait()
 	}
-	// <-q.sig
 }
 
 func (q *queue) signal() {
 	q.empty.Signal()
-	// go func() { q.sig <- struct{}{} }()
+}
+
+func (q *queue) isClosed() bool {
+	return q.closed > 0
 }
 
 func (q *queue) Put(data []byte) error {
@@ -69,24 +89,35 @@ func (q *queue) Put(data []byte) error {
 func (q *queue) PutKey(key, value []byte) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.size++
-	if q.head == nil {
+	if q.isClosed() {
+		return ErrQueueClosed
+	}
+	var (
+		err  error
+		next []byte
+		n    node
+	)
+
+	if q.head == nil || q.size == 0 {
 		q.head = key
 		q.tail = key
-		q.signal()
-		return q.db.Update(func(txn *badger.Txn) error {
+		err = q.db.Update(func(txn *badger.Txn) error {
 			return putNode(&node{Key: key, Val: value}, txn)
 		})
+		if err != nil {
+			return err
+		}
+		goto Success
 	}
 
-	next := q.tail
+	next = q.tail
 	q.tail = key
-	n := node{
+	n = node{
 		Key:  key,
 		Val:  value,
 		Next: nil,
 	}
-	err := q.db.Update(func(txn *badger.Txn) error {
+	err = q.db.Update(func(txn *badger.Txn) error {
 		tail := &node{Key: next}
 		err := getNode(tail, txn)
 		if err != nil {
@@ -100,17 +131,21 @@ func (q *queue) PutKey(key, value []byte) error {
 		return putNode(&n, txn)
 	})
 	if err != nil {
-		// put failed, don't signal
 		return err
 	}
+Success:
+	q.size++
 	q.signal()
 	return nil
 }
 
 func (q *queue) Pop() ([]byte, error) {
 	q.mu.Lock()
-	q.waitSig() // halt if the stack is empty, continue on put event
 	defer q.mu.Unlock()
+	q.waitSig() // halt if the stack is empty, continue on put event
+	if q.isClosed() {
+		return nil, ErrQueueClosed
+	}
 	node := &node{Key: q.head}
 	err := q.db.Update(func(txn *badger.Txn) error {
 		err := getNode(node, txn)
@@ -130,7 +165,11 @@ func (q *queue) Pop() ([]byte, error) {
 	return node.Val, nil
 }
 
-func (q *queue) Size() int { return q.size }
+func (q *queue) Size() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.size
+}
 
 func getNode(n *node, txn *badger.Txn) error {
 	item, err := txn.Get(n.Key)

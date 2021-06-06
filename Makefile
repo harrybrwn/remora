@@ -1,4 +1,4 @@
-GOFLAGS=-race
+GOFLAGS=
 
 build:
 	go build $(GOFLAGS) ./cmd/diktyo

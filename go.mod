@@ -5,6 +5,7 @@ go 1.16
 require (
 	github.com/PuerkitoBio/goquery v1.6.1
 	github.com/dgraph-io/badger/v3 v3.2011.1
+	github.com/dgraph-io/ristretto v0.0.4-0.20210122082011-bb5d392ed82d
 	github.com/fatih/color v1.7.0
 	github.com/harrybrwn/config v0.1.2
 	github.com/joho/godotenv v1.3.0

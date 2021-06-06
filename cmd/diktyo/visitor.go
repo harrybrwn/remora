@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -24,7 +25,16 @@ func (v *visitor) String() string {
 	return fmt.Sprintf("visitor{hosts: %#v, db: %v}", v.hosts, v.db)
 }
 
-const insertPage = `
+const insertEdgeSQL = `
+INSERT INTO edge (
+	parent, child
+) VALUES (
+	$1, $2
+)
+ON CONFLICT (parent, child)
+	DO NOTHING`
+
+const insertPageSQL = `
 INSERT INTO page (
 	url,
 	links,
@@ -40,18 +50,8 @@ INSERT INTO page (
 	keywords
 )
 VALUES (
-	$1,
-	$2,
-	$3,
-	$4,
-	$5,
-	$6,
-	$7,
-	$8,
-	$9,
-	$10,
-	$11,
-	to_tsvector($12)
+	$1, $2, $3, $4, $5, $6, $7, $8,
+	$9, $10, $11, to_tsvector($12)
 )
 ON CONFLICT (url)
 	DO UPDATE SET
@@ -68,6 +68,9 @@ ON CONFLICT (url)
 		keywords        = to_tsvector($12)`
 
 func (v *visitor) Visit(page *web.Page) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	logVisit(page) // only handles logging
 	var redirectedFrom string
 	if page.Redirected {
@@ -76,14 +79,38 @@ func (v *visitor) Visit(page *web.Page) {
 	ipv4, ipv6, err := ipAddrs(page.URL.Host)
 	if err != nil {
 		log.Warn("could not resolve ip for ", page.URL.Host)
-	}
-	keywords, err := page.Keywords()
-	if err != nil {
-		log.Error(errors.Wrap(err, "could not get page keywords"))
+		err = nil
 	}
 
-	_, err = v.db.Exec(insertPage,
-		page.URL.String(),
+	var keywords [][]byte
+	switch page.ContentType {
+	case "image/png", "image/jpeg":
+	default:
+		keywords, err = page.Keywords()
+		if err != nil {
+			log.Error(errors.Wrap(err, "could not get page keywords"))
+			err = nil
+		}
+	}
+
+	pageurl := page.URL.String()
+	tx, err := v.db.Begin()
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	defer func() {
+		cancel()
+		if err != nil {
+			log.WithError(err).Error("rolling back database transaction")
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+
+	_, err = tx.Exec(insertPageSQL,
+		pageurl,
 		pq.Array(urlStrings(page.Links)),
 		page.ContentType,
 		time.Now(),
@@ -98,13 +125,42 @@ func (v *visitor) Visit(page *web.Page) {
 	)
 	if err != nil {
 		log.WithFields(logrus.Fields{
-			"url":             page.URL.String(),
+			"error":           err,
+			"status":          page.Status,
+			"url":             pageurl,
 			"redirected_from": page.RedirectedFrom,
 			"links":           page.Links,
 			"depth":           page.Depth,
 			"content-type":    page.ContentType,
-		}).Error(err)
+		}).Error("could not insert new page")
 		return
+	}
+
+	if len(page.Links) == 0 {
+		return
+	}
+
+	stmt, err := tx.PrepareContext(ctx, insertEdgeSQL)
+	// stmt, err := tx.PrepareContext(ctx, "INSERT INTO edge (parent, child) VALUES ($1, $2)")
+	// stmt, err := tx.PrepareContext(ctx, pq.CopyIn("edge", "parent", "child"))
+	if err != nil {
+		return
+	}
+	defer stmt.Close()
+	for _, l := range page.Links {
+		childurl := l.String()
+		if childurl == pageurl {
+			continue
+		}
+		// _, err = tx.Exec(insertEdgeSQL, pageurl, childurl)
+		_, err = stmt.Exec(pageurl, childurl)
+		if err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				"parent": pageurl,
+				"child":  childurl,
+			}).Error(err)
+			return
+		}
 	}
 }
 

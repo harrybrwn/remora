@@ -36,9 +36,33 @@ CREATE TABLE page (
     UNIQUE(url, ipv4, ipv6)
 );
 
+CREATE TABLE edge (
+  parent url NOT NULL,
+  child  url NOT NULL,
+
+  UNIQUE(parent, child),
+  CONSTRAINT no_loops CHECK (parent != child)
+);
+
+CREATE UNIQUE INDEX idx_edge_parent_child
+  ON edge (parent, child);
+
 CREATE VIEW page_count AS
   SELECT count(DISTINCT url)
   FROM page;
+
+CREATE VIEW page_h AS
+  SELECT ipv4,
+         status,
+         left(url, 135) as URL,
+         array_length(links, 1) as links,
+         to_char(crawled_at, 'MM:DD:YYYY HH12:MI:SS AM') as crawled_at,
+         depth,
+         left(content_type, 16),
+         redirected,
+         response_time
+    FROM page;
+
 
 CREATE MATERIALIZED VIEW hosts AS
   SELECT
@@ -50,3 +74,9 @@ CREATE MATERIALIZED VIEW hosts AS
   GROUP BY host, ipv4;
 
 REFRESH MATERIALIZED VIEW hosts;
+
+INSERT INTO edge (parent, child)
+VALUES (
+  'https://en.wikipedia.org/wiki/Gall',
+  'https://en.wikipedia.org/wiki/Indigenous_Australians'
+);

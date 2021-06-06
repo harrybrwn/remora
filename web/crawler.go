@@ -13,27 +13,6 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-var (
-	ErrSkipURL = errors.New("skip url")
-
-	log = logrus.StandardLogger()
-)
-
-type Visitor interface {
-	// Filter is called after checking page depth
-	// and after checking for a repeated URL.
-	Filter(*Page) error
-
-	// Visit is called after a page is fetched.
-	Visit(*Page)
-
-	// LinkFound is called when a new link is
-	// found and popped off of the main queue
-	// and before any depth checking or repeat
-	// checking.
-	LinkFound(*url.URL)
-}
-
 type Crawler struct {
 	Visitor Visitor
 	Sleep   time.Duration
@@ -44,9 +23,10 @@ type Crawler struct {
 	queue chan *Page
 	skip  chan *url.URL
 
-	mu      sync.Mutex
-	seen    map[string]struct{}
-	spiders map[string]*spider
+	mu       sync.Mutex
+	seen     map[string]struct{}
+	spiders  map[string]*spider
+	finished chan string // channel of finished spider names
 
 	metrics struct {
 		sync.Mutex
@@ -67,11 +47,12 @@ func WithQueueSize(n int) Option           { return func(c *Crawler) { c.queue =
 
 func NewCrawler(opts ...Option) *Crawler {
 	c := &Crawler{
-		Limit:   1,
-		Visitor: &NoOpVisitor{},
-		wg:      new(sync.WaitGroup),
-		seen:    make(map[string]struct{}),
-		spiders: make(map[string]*spider),
+		Limit:    1,
+		Visitor:  &NoOpVisitor{},
+		wg:       new(sync.WaitGroup),
+		seen:     make(map[string]struct{}),
+		spiders:  make(map[string]*spider),
+		finished: make(chan string),
 	}
 	for _, o := range opts {
 		o(c)
@@ -88,30 +69,43 @@ func NewCrawler(opts ...Option) *Crawler {
 func (c *Crawler) Add(a int) { c.wg.Add(a) }
 func (c *Crawler) Wait()     { c.wg.Wait() }
 
-func (c *Crawler) Crawl(ctx context.Context) {
+func (c *Crawler) Crawl(ctx context.Context, reqLimit int) {
 	var (
 		err  error
 		done context.CancelFunc
+		sem  = semaphore.NewWeighted(int64(reqLimit))
 	)
 	defer c.wg.Done()
 	ctx, done = context.WithCancel(ctx)
 	defer done()
-	if c.Visitor == nil {
-		c.Visitor = &NoOpVisitor{}
-	}
 
 Loop:
 	for {
 		select {
 		case u := <-c.skip:
 			c.MarkVisited(*u)
+		case hostname := <-c.finished:
+			log.WithField("hostname", hostname).Debug("got finished signal")
+			c.mu.Lock()
+			err := deleteAndCloseSpider(c.spiders, hostname)
+			n := len(c.spiders)
+			c.mu.Unlock()
+			if err != nil {
+				log.WithFields(logrus.Fields{
+					"error": err, "hostname": hostname,
+				}).Error("could not close spider")
+			}
+			// all spiders have finished
+			if n == 0 {
+				return
+			}
+			log.Tracef("spider %s closed, %d spiders remaining", hostname, n)
 		case page, ok := <-c.queue:
 			if !ok {
 				break Loop
 			}
 
 			c.Visitor.LinkFound(page.URL)
-
 			// check crawl depth and visited set, insert new URLs if needed
 			if page.Depth > c.Limit || c.wasVisited(page) {
 				continue
@@ -119,26 +113,23 @@ Loop:
 
 			err = c.Visitor.Filter(page)
 			switch err {
-			case nil:
-				break
 			case ErrSkipURL:
 				continue
+			case nil:
+				fallthrough
+			default:
 			}
 
 			go func(p *Page) {
-				spider := c.getOrLaunchSpider(ctx, p.URL.Host)
+				spider := c.getOrLaunchSpider(ctx, p.URL.Host, sem)
 				spider.add(p)
 			}(page)
-
 			atomic.AddInt64(&c.metrics.vertices, 1)
 		case <-ctx.Done():
 			break Loop
 		}
 	}
 }
-
-func SetLogger(l *logrus.Logger) { log = l }
-func GetLogger() *logrus.Logger  { return log }
 
 func (c *Crawler) Enqueue(page *Page) { go func() { c.queue <- page }() }
 func (c *Crawler) QueueSize() int     { return len(c.queue) }
@@ -153,8 +144,9 @@ func (c *Crawler) SpiderStats() []*SpiderStats {
 	for host, spider := range c.spiders {
 		spider.mu.Lock()
 		stat := &SpiderStats{
-			Host:     host,
-			WaitTime: spider.sleep,
+			Host:      host,
+			WaitTime:  spider.sleep,
+			QueueSize: spider.q.Size(),
 		}
 		stat.PagesFetched = atomic.LoadInt64(&spider.fetched)
 		spider.mu.Unlock()
@@ -188,6 +180,19 @@ func (c *Crawler) SetSleep(d time.Duration) {
 	}
 }
 
+func (c *Crawler) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var e, err error
+	for _, spider := range c.spiders {
+		e = spider.Close()
+		if e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
 func (c *Crawler) CloseSpider(host string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -195,6 +200,15 @@ func (c *Crawler) CloseSpider(host string) error {
 	if !ok {
 		return errors.New("no spider for host")
 	}
+	return spider.Close()
+}
+
+func deleteAndCloseSpider(spiders map[string]*spider, hostname string) error {
+	spider, ok := spiders[hostname]
+	if !ok {
+		log.Warning("got finished signal from a non-existant spider")
+	}
+	delete(spiders, hostname)
 	return spider.Close()
 }
 
@@ -211,14 +225,18 @@ func (c *Crawler) wasVisited(p *Page) bool {
 	return false
 }
 
-func (c *Crawler) getOrLaunchSpider(ctx context.Context, host string) *spider {
+func (c *Crawler) getOrLaunchSpider(ctx context.Context, host string, sem *semaphore.Weighted) *spider {
 	c.mu.Lock()
 	spider, ok := c.spiders[host]
 	c.mu.Unlock()
 
 	if !ok {
 		log.Tracef("launching new spider for %s", host)
-		spider = c.newSpider(host, 100)
+		spider = c.newSpider(host, sem)
+		go func() {
+			<-spider.finished
+			c.finished <- spider.host
+		}()
 		c.mu.Lock()
 		c.spiders[host] = spider
 		c.mu.Unlock()
@@ -241,17 +259,18 @@ func (c *Crawler) markvisited(u url.URL) {
 	c.seen[key] = struct{}{}
 }
 
-func (c *Crawler) newSpider(host string, fetchLimit int64) *spider {
+func (c *Crawler) newSpider(host string, sem *semaphore.Weighted) *spider {
 	return &spider{
-		visitor: c.Visitor,
-		queue:   c.queue,
-		sem:     semaphore.NewWeighted(fetchLimit),
-		sleep:   c.Sleep,
-		wg:      c.wg,
-		host:    host,
-		ctx:     context.Background(),
-		close:   func() {},
-		q:       NewPageQueue(c.DB),
+		visitor:  c.Visitor,
+		queue:    c.queue,
+		finished: make(chan struct{}),
+		sem:      sem,
+		sleep:    c.Sleep,
+		wg:       c.wg,
+		host:     host,
+		ctx:      context.Background(),
+		close:    func() {},
+		q:        NewPageQueue(c.DB),
 	}
 }
 
