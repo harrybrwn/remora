@@ -123,37 +123,32 @@ func statsCmdRunFunc(c *web.Crawler) func(*cobra.Command, []string) {
 		// m := c.DB.IndexCacheMetrics()
 		opts := c.DB.Opts()
 		fmt.Fprintf(out, `  badger db:
-  dir: %s
-  size:
-    lsm: %02fMB
-    vlog: %02fMB
-  max-batch-count: %d
-  max-batch-size:  %d
+    dir: %s
+    size:
+      lsm: %02fMB
+      vlog: %02fMB
+    max-batch-count: %d
+    max-batch-size:  %d
 `,
 			opts.Dir,
 			toMB(uint64(lsm)), toMB(uint64(vlog)),
 			c.DB.MaxBatchCount(), c.DB.MaxBatchSize(),
 		)
-		fmt.Fprintf(out, "  block cache:\n")
-		printMetrics(out, c.DB.BlockCacheMetrics())
-		fmt.Fprintf(out, "  index cache:\n")
-		printMetrics(out, c.DB.IndexCacheMetrics())
 	}
 }
 
 func printMetrics(out io.Writer, m *ristretto.Metrics) {
-	fmt.Fprintf(out, `
-    hits:   %d
-    misses: %d
-    gets: dropped %d, kept     %d
-    sets: dropped %d, rejected %d
-    cost:
-      added:   %d
-      evicted: %d
-    keys:
-      added:   %d
-      updated: %d
-      evicted: %d
+	fmt.Fprintf(out, `      hits:   %d
+      misses: %d
+      gets: dropped %d, kept     %d
+      sets: dropped %d, rejected %d
+      cost:
+        added:   %d
+        evicted: %d
+      keys:
+        added:   %d
+        updated: %d
+        evicted: %d
 `,
 		m.Hits(), m.Misses(),
 		m.GetsKept(), m.GetsDropped(),

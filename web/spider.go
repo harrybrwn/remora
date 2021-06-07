@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,8 +17,8 @@ import (
 )
 
 type spider struct {
-	queue chan<- *Page
-	q     PageQueue
+	queue chan<- *PageRequest
+	q     RequestQueue
 	sleep time.Duration
 
 	// Semaphore that limits the number of
@@ -27,6 +28,7 @@ type spider struct {
 	wg    *sync.WaitGroup
 	ctx   context.Context
 	close context.CancelFunc
+	wait  chan time.Duration
 
 	finished chan struct{}
 
@@ -50,12 +52,18 @@ func (s *spider) start(ctx context.Context) {
 	defer close(s.finished)
 	s.withContext(ctx)
 	ctx = s.ctx
+	tick := time.NewTicker(s.sleep)
+	defer tick.Stop()
 
 	for {
+		// now := time.Now()
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
+		case wait := <-s.wait:
+			time.Sleep(wait)
+		case <-tick.C:
+			// fmt.Println(time.Since(now))
 		}
 		page, err := s.q.Dequeue()
 		if err == queue.ErrQueueClosed {
@@ -68,14 +76,24 @@ func (s *spider) start(ctx context.Context) {
 		}
 		s.sem.Acquire(ctx, 1)
 		go s.fetch(s.ctx, page)
-		time.Sleep(s.sleep)
+		// time.Sleep(s.sleep)
+		tick.Reset(s.sleep)
 	}
 }
 
-func (s *spider) fetch(ctx context.Context, p *Page) {
-	err := p.FetchCtx(ctx)
-	s.visitor.Visit(p)
+func (s *spider) fetch(ctx context.Context, p *PageRequest) {
+	page := &Page{URL: p.URL, Depth: p.Depth}
+	err := page.FetchCtx(ctx)
+	if page.Status == http.StatusTooManyRequests {
+		go func() { s.wait <- page.RetryAfter }()
+		err = s.q.Enqueue(p)
+		if err != nil {
+			log.WithError(err).Error("could not enqueue retry")
+		}
+	}
+	s.visitor.Visit(page)
 	atomic.AddInt64(&s.fetched, 1)
+
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"type": fmt.Sprintf("%T", err),
@@ -93,11 +111,11 @@ func (s *spider) fetch(ctx context.Context, p *Page) {
 		return
 	}
 
-	pushlinks(ctx, &s.mu, s.queue, p)
+	pushlinks(ctx, &s.mu, s.queue, page)
 	s.sem.Release(1)
 }
 
-func (s *spider) add(p *Page) {
+func (s *spider) add(p *PageRequest) {
 	err := s.q.Enqueue(p)
 	if err != nil {
 		log.WithFields(logrus.Fields{
@@ -115,18 +133,20 @@ func (s *spider) withContext(ctx context.Context) {
 }
 
 // PageQueue is a queue for pages
-type PageQueue interface {
-	Enqueue(*Page) error
-	Dequeue() (*Page, error)
+type RequestQueue interface {
+	Enqueue(*PageRequest) error
+	Dequeue() (*PageRequest, error)
 	Close() error
 	Size() int64
 }
 
-func NewPageQueue(db *badger.DB) PageQueue { return &pageQueue{queue.New(db)} }
+func NewPageQueue(db *badger.DB, prefix []byte) RequestQueue {
+	return &pageQueue{queue.New(db, prefix)}
+}
 
 type pageQueue struct{ queue.Queue }
 
-func (q *pageQueue) Enqueue(p *Page) error {
+func (q *pageQueue) Enqueue(p *PageRequest) error {
 	raw, err := json.Marshal(p)
 	if err != nil {
 		return err
@@ -135,8 +155,8 @@ func (q *pageQueue) Enqueue(p *Page) error {
 	return q.PutKey(key, raw)
 }
 
-func (q *pageQueue) Dequeue() (*Page, error) {
-	p := &Page{}
+func (q *pageQueue) Dequeue() (*PageRequest, error) {
+	p := &PageRequest{}
 	raw, err := q.Pop()
 	if err != nil {
 		return nil, err
@@ -157,14 +177,14 @@ type SpiderStats struct {
 func pushlinks(
 	ctx context.Context,
 	lock sync.Locker,
-	queue chan<- *Page,
+	queue chan<- *PageRequest,
 	parent *Page,
 ) {
 	lock.Lock()
 	d := parent.Depth
 	lock.Unlock()
 	for _, l := range parent.Links {
-		p := NewPage(l, d+1)
+		p := NewPageRequest(l, d+1)
 		select {
 		case queue <- p:
 		case <-ctx.Done():

@@ -25,18 +25,19 @@ type Queue interface {
 	Close() error
 }
 
-func Open(opts badger.Options) (Queue, error) {
+func Open(opts badger.Options, prefix []byte) (Queue, error) {
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
 	}
-	return New(db), nil
+	return New(db, prefix), nil
 }
 
-func New(db *badger.DB) Queue {
+func New(db *badger.DB, prefix []byte) Queue {
 	var mu sync.Mutex
 	q := &queue{
 		db:     db,
+		prefix: []byte{'q', 'u', 'e', 'u', 'e', '_'},
 		mu:     &mu,
 		empty:  sync.NewCond(&mu),
 		closed: 0,
@@ -45,7 +46,8 @@ func New(db *badger.DB) Queue {
 }
 
 type queue struct {
-	db *badger.DB
+	db     *badger.DB
+	prefix []byte
 
 	mu     *sync.Mutex
 	empty  *sync.Cond

@@ -26,7 +26,7 @@ func q(t *testing.T) *queue {
 		t.Fatal(err)
 		return nil
 	}
-	return New(db).(*queue)
+	return New(db, []byte("testqueue_")).(*queue)
 }
 
 func rm(q *queue) error {
@@ -205,7 +205,7 @@ func TestLargeRW(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := index_t(0); i < n; i++ {
-			err := q.Put(key(i))
+			err := q.PutKey(key(i), key(i))
 			if err != nil {
 				t.Error(err)
 			}

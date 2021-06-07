@@ -4,7 +4,6 @@
 # Testing
 /test
 *.test
-*.sh
 *.pprof
 *.ps
 *.log
@@ -16,6 +15,8 @@
 /diktyo.yml
 
 # Notes
+/papers/
+*.pdf
 TODO*
 notes.*
 
@@ -23,6 +24,7 @@ notes.*
 /psql
 /test
 /db/*.sql
+*.sh
 
 # Database
 /db/data

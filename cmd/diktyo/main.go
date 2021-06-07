@@ -48,6 +48,8 @@ type Config struct {
 	// A limit on the number of concurrent requests being
 	/// waited for at any moment
 	RequestLimit int `yaml:"request_limit"`
+
+	db *badger.DB
 }
 
 func (c *Config) bind(flag *flag.FlagSet) {
@@ -60,13 +62,16 @@ func (c *Config) bind(flag *flag.FlagSet) {
 }
 
 func main() {
-	var conf Config
+	var (
+		err  error
+		conf Config
+	)
 	godotenv.Load()
 	initLogger()
 	initConfig(&conf)
 
 	cmd := NewCLIRoot(&conf)
-	err := cmd.Execute()
+	err = cmd.Execute()
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -125,30 +130,27 @@ func crawl(ctx context.Context, conf *Config) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 
+	conf.db, err = badger.Open(badger.DefaultOptions("/var/local/diktyo/queue"))
+	if err != nil {
+		panic(err)
+	}
+	defer closedb(conf.db)
+
 	db, err := db.New(&conf.DB)
 	if err != nil {
 		return errors.Wrap(err, "could not connect to database")
 	}
 	defer db.Close()
 
-	qdb, err := badger.Open(badger.DefaultOptions("./_queue"))
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		qdb.Close()
-		os.RemoveAll("./_queue")
-	}()
-
 	var (
 		visitor = visitor{db: db, hosts: make(map[string]struct{})}
-		ch      = make(chan *web.Page, conf.QueueSize)
+		ch      = make(chan *web.PageRequest, conf.QueueSize)
 		crawler = web.NewCrawler(
 			web.WithVisitor(&visitor),
 			web.WithLimit(config.GetUint("depth")),
 			web.WithQueue(ch),
 			web.WithSleep(conf.Sleep),
-			web.WithDB(qdb),
+			web.WithDB(conf.db),
 		)
 	)
 
@@ -165,7 +167,7 @@ func crawl(ctx context.Context, conf *Config) error {
 			continue
 		}
 		visitor.hosts[u.Host] = struct{}{}
-		crawler.Enqueue(web.NewPage(u, 0))
+		crawler.Enqueue(web.NewPageRequest(u, 0))
 	}
 
 	log.WithFields(logrus.Fields{
@@ -203,8 +205,14 @@ func initConfig(c *Config) {
 	if err != nil {
 		log.Fatal(errors.Wrap(err, "could not set config defaults"))
 	}
-	if err := config.ReadConfigFile(); err != nil {
+	if err = config.ReadConfigFile(); err != nil {
 		log.Fatal(errors.Wrap(err, "could not read config"))
+	}
+	if _, err = os.Stat("/var/local/diktyo"); os.IsNotExist(err) {
+		err = os.MkdirAll("/var/local/diktyo", 1777)
+		if err != nil {
+			log.WithError(err).Error("could not create runtime directory")
+		}
 	}
 }
 
@@ -226,4 +234,15 @@ func initLogger() {
 		MaxMessageLength: 135,
 	})
 	web.SetLogger(log)
+}
+
+func closedb(db *badger.DB) {
+	err := db.Close()
+	if err != nil {
+		log.WithError(err).Error("could not close persistant queue")
+	}
+	err = os.RemoveAll(db.Opts().Dir)
+	if err != nil {
+		log.WithError(err).Error("could not remove persistant queue")
+	}
 }

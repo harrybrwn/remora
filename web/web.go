@@ -16,7 +16,7 @@ var (
 type Visitor interface {
 	// Filter is called after checking page depth
 	// and after checking for a repeated URL.
-	Filter(*Page) error
+	Filter(*PageRequest) error
 
 	// Visit is called after a page is fetched.
 	Visit(*Page)

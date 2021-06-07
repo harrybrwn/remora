@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,18 +37,36 @@ func NewPageFromString(link string, depth uint) *Page {
 	return NewPage(u, depth)
 }
 
+func NewPageRequest(u *url.URL, depth uint) *PageRequest {
+	return &PageRequest{
+		URL:   u,
+		Depth: depth,
+	}
+}
+
+func ParsePageRequest(link string, depth uint) *PageRequest {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil
+	}
+	return NewPageRequest(u, depth)
+}
+
 // Page holds metadata for a webpage
 type Page struct {
 	URL   *url.URL
 	Links []*url.URL
 
-	Depth          uint
-	ResponseTime   time.Duration
+	Depth        uint
+	ResponseTime time.Duration
+
 	Redirected     bool
 	RedirectedFrom *url.URL
 	Status         int
 	ContentType    string
-	Doc            *goquery.Document
+	RetryAfter     time.Duration
+
+	Doc *goquery.Document
 }
 
 // Fetch will take a page and fetch the document to retrieve
@@ -81,7 +100,13 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 	p.ResponseTime = time.Since(now)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		log.WithFields(logHeader(resp.Header)).Warn(resp.Status)
+		fields := logHeader(resp.Header)
+		log.WithFields(fields).Warn(resp.Status + " " + u.String())
+		s := resp.Header.Get("Retry-After")
+		t, err := strconv.ParseInt(s, 10, 64)
+		if err == nil {
+			p.RetryAfter = time.Second * time.Duration(t)
+		}
 	}
 	p.Status = resp.StatusCode
 	p.ContentType = getContentType(resp)
@@ -93,7 +118,8 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 
 	root, err := html.ParseWithOptions(resp.Body)
 	if err != nil {
-		return err
+		// Could be an image or non-html page
+		return nil
 	}
 	doc := goquery.NewDocumentFromNode(root)
 	p.Doc = doc
@@ -124,17 +150,16 @@ var cleanWordsRegex = regexp.MustCompile(`[\(\)/.,!?;:'"\[\]]`)
 func Keywords(doc *goquery.Document) ([][]byte, error) {
 	var (
 		buf   bytes.Buffer
+		b     []byte
+		l     int
 		words = make([][]byte, 0, 100)
 		pos   = 0
 	)
 	for _, n := range doc.Nodes {
 		getText(&buf, n)
 	}
-
-	var (
-		b = cleanWordsRegex.ReplaceAll(buf.Bytes(), []byte{' '})
-		l = buf.Len()
-	)
+	l = buf.Len()
+	b = cleanWordsRegex.ReplaceAll(buf.Bytes(), []byte{' '})
 	for {
 		adv, tok, err := bufio.ScanWords(b, false)
 		if err != nil {
@@ -155,6 +180,11 @@ func (p *Page) Keywords() ([][]byte, error) {
 		return nil, errors.New("page has no document")
 	}
 	return Keywords(p.Doc)
+}
+
+type PageRequest struct {
+	URL   *url.URL
+	Depth uint
 }
 
 func getLinks(doc *goquery.Document, entry *url.URL) ([]*url.URL, error) {

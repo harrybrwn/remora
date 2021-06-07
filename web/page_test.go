@@ -55,7 +55,7 @@ func Test(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	page := NewPageFromString(base+"/1", 0)
+	page := ParsePageRequest(base+"/1", 0)
 	c.Enqueue(page)
 	ctx, stop := context.WithCancel(context.Background())
 	c.wg.Add(1)

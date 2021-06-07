@@ -25,6 +25,13 @@ func (v *visitor) String() string {
 	return fmt.Sprintf("visitor{hosts: %#v, db: %v}", v.hosts, v.db)
 }
 
+func (v *visitor) Visit(page *web.Page) {
+	logVisit(page) // only handles logging
+	// ctx, cancel := context.WithCancel(context.Background())
+	// defer cancel()
+	// v.record(ctx, page)
+}
+
 const insertEdgeSQL = `
 INSERT INTO edge (
 	parent, child
@@ -67,11 +74,20 @@ ON CONFLICT (url)
 		ipv6            = $11,
 		keywords        = to_tsvector($12)`
 
-func (v *visitor) Visit(page *web.Page) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func logVisit(page *web.Page) {
+	mem := getMemStats()
+	l := log.WithFields(logrus.Fields{
+		"depth":  page.Depth,
+		"status": page.Status,
+	}).WithFields(memoryLogs(mem))
+	var info = l.Infof
+	if page.Status >= 300 {
+		info = l.Warnf
+	}
+	info("page{%d, %v, %s}", page.Depth, page.ResponseTime, page.URL)
+}
 
-	logVisit(page) // only handles logging
+func (v *visitor) record(ctx context.Context, page *web.Page) {
 	var redirectedFrom string
 	if page.Redirected {
 		redirectedFrom = page.RedirectedFrom.String()
@@ -84,7 +100,7 @@ func (v *visitor) Visit(page *web.Page) {
 
 	var keywords [][]byte
 	switch page.ContentType {
-	case "image/png", "image/jpeg":
+	case "image/png", "image/jpeg", "image/gif":
 	default:
 		keywords, err = page.Keywords()
 		if err != nil {
@@ -100,7 +116,6 @@ func (v *visitor) Visit(page *web.Page) {
 		return
 	}
 	defer func() {
-		cancel()
 		if err != nil {
 			log.WithError(err).Error("rolling back database transaction")
 			tx.Rollback()
@@ -152,7 +167,6 @@ func (v *visitor) Visit(page *web.Page) {
 		if childurl == pageurl {
 			continue
 		}
-		// _, err = tx.Exec(insertEdgeSQL, pageurl, childurl)
 		_, err = stmt.Exec(pageurl, childurl)
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
@@ -162,19 +176,7 @@ func (v *visitor) Visit(page *web.Page) {
 			return
 		}
 	}
-}
 
-func logVisit(page *web.Page) {
-	mem := getMemStats()
-	l := log.WithFields(logrus.Fields{
-		"depth":  page.Depth,
-		"status": page.Status,
-	}).WithFields(memoryLogs(mem))
-	var info = l.Infof
-	if page.Status >= 300 {
-		info = l.Warnf
-	}
-	info("page{%d, %v, %s}", page.Depth, page.ResponseTime, page.URL)
 }
 
 func urlStrings(urls []*url.URL) []string {
@@ -185,7 +187,7 @@ func urlStrings(urls []*url.URL) []string {
 	return s
 }
 
-func (v *visitor) Filter(p *web.Page) error {
+func (v *visitor) Filter(p *web.PageRequest) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	_, ok := v.hosts[p.URL.Host]
