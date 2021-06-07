@@ -37,7 +37,7 @@ func New(db *badger.DB, prefix []byte) Queue {
 	var mu sync.Mutex
 	q := &queue{
 		db:     db,
-		prefix: []byte{'q', 'u', 'e', 'u', 'e', '_'},
+		prefix: prefix,
 		mu:     &mu,
 		empty:  sync.NewCond(&mu),
 		closed: 0,
@@ -99,6 +99,7 @@ func (q *queue) PutKey(key, value []byte) error {
 		next []byte
 		n    node
 	)
+	key = bytes.Join([][]byte{q.prefix, key}, nil)
 
 	if q.head == nil || q.size == 0 {
 		q.head = key
@@ -162,7 +163,7 @@ func (q *queue) Pop() ([]byte, error) {
 	q.head = node.Next
 	q.size--
 	if node.Val == nil {
-		return node.Key, nil
+		return bytes.TrimPrefix(node.Key, q.prefix), nil
 	}
 	return node.Val, nil
 }

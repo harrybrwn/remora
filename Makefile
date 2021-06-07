@@ -1,10 +1,11 @@
 GOFLAGS=
+MAIN=./cmd/remora
 
 build:
-	go build $(GOFLAGS) ./cmd/diktyo
+	go build $(GOFLAGS) $(MAIN)
 
 install:
-	go install $(GOFLAGS) ./cmd/diktyo
+	go install $(GOFLAGS) $(MAIN)
 
 clean:
 	$(RM) ./diktyo

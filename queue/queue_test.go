@@ -26,7 +26,7 @@ func q(t *testing.T) *queue {
 		t.Fatal(err)
 		return nil
 	}
-	return New(db, []byte("testqueue_")).(*queue)
+	return New(db, []byte{}).(*queue)
 }
 
 func rm(q *queue) error {
@@ -38,17 +38,22 @@ func rm(q *queue) error {
 
 func TestOnePushPop(t *testing.T) {
 	q := q(t)
+	q.prefix = []byte("test_")
 	defer rm(q)
-	err := q.Put([]byte("one"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := q.Pop()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != "one" {
-		t.Errorf("got %s, wanted %s", b, "one")
+	for _, s := range []string{
+		"one", "two", "three", "four",
+	} {
+		err := q.Put([]byte(s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := q.Pop()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != s {
+			t.Errorf("got %q, wanted %q", b, s)
+		}
 	}
 }
 
@@ -131,6 +136,7 @@ func TestConncurentReaders(t *testing.T) {
 
 func TestConncurentRW(t *testing.T) {
 	q := q(t)
+	q.prefix = nil
 	defer rm(q)
 	d := time.Millisecond * 10
 	ok := make(chan bool)

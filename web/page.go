@@ -75,6 +75,10 @@ func (p *Page) Fetch() error {
 	return p.FetchCtx(context.Background())
 }
 
+var UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) " +
+	"Chrome/90.0.0.0 Safari/537.36"
+
 // FetchCtx will take a page and fetch the document to retrieve
 // all necessary metadata for creating a complete page struct.
 func (p *Page) FetchCtx(ctx context.Context) error {
@@ -87,9 +91,7 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		URL:     u,
 		Body:    http.NoBody,
 		GetBody: defaultGetBody,
-		Header: http.Header{
-			"User-Agent": {time.Now().String()},
-		},
+		Header:  http.Header{"User-Agent": {UserAgent}},
 	}
 	req = req.WithContext(ctx)
 	resp, err := http.DefaultClient.Do(req)
@@ -100,13 +102,9 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 	p.ResponseTime = time.Since(now)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
+		p.RetryAfter = getRetryTime(resp.Header)
 		fields := logHeader(resp.Header)
 		log.WithFields(fields).Warn(resp.Status + " " + u.String())
-		s := resp.Header.Get("Retry-After")
-		t, err := strconv.ParseInt(s, 10, 64)
-		if err == nil {
-			p.RetryAfter = time.Second * time.Duration(t)
-		}
 	}
 	p.Status = resp.StatusCode
 	p.ContentType = getContentType(resp)
@@ -118,7 +116,8 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 
 	root, err := html.ParseWithOptions(resp.Body)
 	if err != nil {
-		// Could be an image or non-html page
+		// Could be an image or non-html page,
+		// don't return an error
 		return nil
 	}
 	doc := goquery.NewDocumentFromNode(root)
@@ -185,6 +184,7 @@ func (p *Page) Keywords() ([][]byte, error) {
 type PageRequest struct {
 	URL   *url.URL
 	Depth uint
+	Retry int
 }
 
 func getLinks(doc *goquery.Document, entry *url.URL) ([]*url.URL, error) {
@@ -231,6 +231,15 @@ func wasRedirected(resp *http.Response) bool {
 		resp = resp.Request.Response
 	}
 	return false
+}
+
+func getRetryTime(header http.Header) time.Duration {
+	s := header.Get("Retry-After")
+	t, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return time.Second * time.Duration(t)
 }
 
 func getContentType(resp *http.Response) string {

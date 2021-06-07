@@ -61,6 +61,9 @@ func (s *spider) start(ctx context.Context) {
 		case <-s.ctx.Done():
 			return
 		case wait := <-s.wait:
+			log.WithFields(logrus.Fields{
+				"time": wait,
+			}).Infof("rate limited, waiting %s", wait)
 			time.Sleep(wait)
 		case <-tick.C:
 			// fmt.Println(time.Since(now))
@@ -81,11 +84,14 @@ func (s *spider) start(ctx context.Context) {
 	}
 }
 
+var RetryLimit = 5
+
 func (s *spider) fetch(ctx context.Context, p *PageRequest) {
 	page := &Page{URL: p.URL, Depth: p.Depth}
 	err := page.FetchCtx(ctx)
-	if page.Status == http.StatusTooManyRequests {
+	if page.Status == http.StatusTooManyRequests && p.Retry < RetryLimit {
 		go func() { s.wait <- page.RetryAfter }()
+		p.Retry++
 		err = s.q.Enqueue(p)
 		if err != nil {
 			log.WithError(err).Error("could not enqueue retry")
