@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package pb;
+
+import "protobuf/page.proto";
+
+option go_package = "github.com/harrybrwb/diktyo/web/pb";
+
+message SpiderConfig {
+	string host = 1;
+}
+
+service Spider {
+	rpc configure(SpiderConfig) returns (Response) {}
+}

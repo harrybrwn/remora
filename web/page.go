@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -14,14 +13,21 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/harrybrwn/diktyo/web/pb"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
 
-var HttpClient = http.DefaultClient
+//go:generate protoc -I../protobuf --go_out=paths=source_relative:./pb --go-grpc_out=paths=source_relative:./pb ../protobuf/page.proto
 
-func NewPage(u *url.URL, depth uint) *Page {
+var (
+	HttpClient = http.DefaultClient
+)
+
+type PageRequest = pb.PageRequest
+
+func NewPage(u *url.URL, depth uint32) *Page {
 	return &Page{
 		URL:   u,
 		Depth: depth,
@@ -29,7 +35,7 @@ func NewPage(u *url.URL, depth uint) *Page {
 	}
 }
 
-func NewPageFromString(link string, depth uint) *Page {
+func NewPageFromString(link string, depth uint32) *Page {
 	u, err := url.Parse(link)
 	if err != nil {
 		return nil
@@ -37,14 +43,14 @@ func NewPageFromString(link string, depth uint) *Page {
 	return NewPage(u, depth)
 }
 
-func NewPageRequest(u *url.URL, depth uint) *PageRequest {
+func NewPageRequest(u *url.URL, depth uint32) *PageRequest {
 	return &PageRequest{
-		URL:   u,
+		URL:   u.String(),
 		Depth: depth,
 	}
 }
 
-func ParsePageRequest(link string, depth uint) *PageRequest {
+func ParsePageRequest(link string, depth uint32) *PageRequest {
 	u, err := url.Parse(link)
 	if err != nil {
 		return nil
@@ -57,7 +63,7 @@ type Page struct {
 	URL   *url.URL
 	Links []*url.URL
 
-	Depth        uint
+	Depth        uint32
 	ResponseTime time.Duration
 
 	Redirected     bool
@@ -66,7 +72,10 @@ type Page struct {
 	ContentType    string
 	RetryAfter     time.Duration
 
-	Doc *goquery.Document
+	Doc      *goquery.Document
+	Title    string
+	Encoding string
+	Words    []string
 }
 
 // Fetch will take a page and fetch the document to retrieve
@@ -94,7 +103,7 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		Header:  http.Header{"User-Agent": {UserAgent}},
 	}
 	req = req.WithContext(ctx)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := HttpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -121,8 +130,27 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		return nil
 	}
 	doc := goquery.NewDocumentFromNode(root)
-	p.Doc = doc
-	p.Links, err = getLinks(doc, p.URL)
+	// p.Doc = doc
+	p.Title = getTitle(doc)
+	p.Encoding = getCharset(doc)
+	var e error
+	p.Links, e = getLinks(doc, p.URL)
+	if e != nil && err == nil {
+		err = e
+	}
+	switch p.ContentType {
+	case
+		"application/zip",
+		"application/x-mobipocket-ebook",
+		"application/pdf",
+		"application/epub+zip":
+		break
+	case "text/html", "text/plain":
+		p.Words, e = Keywords(doc)
+		if e != nil && err == nil {
+			err = e
+		}
+	}
 	return err
 }
 
@@ -146,45 +174,51 @@ func (p *Page) Head(ctx context.Context) error {
 
 var cleanWordsRegex = regexp.MustCompile(`[\(\)/.,!?;:'"\[\]]`)
 
-func Keywords(doc *goquery.Document) ([][]byte, error) {
-	var (
-		buf   bytes.Buffer
-		b     []byte
-		l     int
-		words = make([][]byte, 0, 100)
-		pos   = 0
-	)
+func Keywords(doc *goquery.Document) ([]string, error) {
+	var buf bytes.Buffer
 	for _, n := range doc.Nodes {
 		getText(&buf, n)
 	}
-	l = buf.Len()
-	b = cleanWordsRegex.ReplaceAll(buf.Bytes(), []byte{' '})
-	for {
-		adv, tok, err := bufio.ScanWords(b, false)
-		if err != nil {
-			return nil, err
-		}
-		if pos > l || tok == nil {
-			break
-		}
-		words = append(words, tok)
-		b = b[adv:]
-		pos += adv
-	}
-	return words, nil
+	s := cleanWordsRegex.ReplaceAllString(buf.String(), " ")
+	return strings.Fields(s), nil
 }
 
-func (p *Page) Keywords() ([][]byte, error) {
+func (p *Page) Keywords() ([]string, error) {
 	if p.Doc == nil {
 		return nil, errors.New("page has no document")
 	}
 	return Keywords(p.Doc)
 }
 
-type PageRequest struct {
-	URL   *url.URL
-	Depth uint
-	Retry int
+func getTitle(doc *goquery.Document) string {
+	if doc == nil {
+		return ""
+	}
+	ss := doc.Find("title")
+	for _, n := range ss.Nodes {
+		if n.DataAtom == atom.Title && n.FirstChild != nil {
+			return n.FirstChild.Data
+		}
+	}
+	return ""
+}
+
+func getCharset(doc *goquery.Document) string {
+	if doc == nil {
+		return ""
+	}
+	metas := doc.Find("meta[charset]")
+	if len(metas.Nodes) == 0 {
+		return ""
+	}
+	for _, n := range metas.Nodes {
+		for _, attr := range n.Attr {
+			if attr.Key == "charset" {
+				return attr.Val
+			}
+		}
+	}
+	return ""
 }
 
 func getLinks(doc *goquery.Document, entry *url.URL) ([]*url.URL, error) {
@@ -234,12 +268,26 @@ func wasRedirected(resp *http.Response) bool {
 }
 
 func getRetryTime(header http.Header) time.Duration {
-	s := header.Get("Retry-After")
-	t, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0
+	var (
+		retry = header.Get("Retry-After")
+		reset = header.Get("X-Ratelimit-Rest")
+	)
+	if reset != "" {
+		t, err := strconv.ParseInt(reset, 10, 64)
+		if err != nil {
+			goto Retry
+		}
+		return time.Until(time.Unix(t, 0))
 	}
-	return time.Second * time.Duration(t)
+Retry:
+	if retry != "" {
+		t, err := strconv.ParseInt(retry, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return time.Second * time.Duration(t)
+	}
+	return 0
 }
 
 func getContentType(resp *http.Response) string {

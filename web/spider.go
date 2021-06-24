@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
@@ -13,8 +12,12 @@ import (
 	"github.com/harrybrwn/diktyo/internal"
 	"github.com/harrybrwn/diktyo/queue"
 	"github.com/sirupsen/logrus"
+	"github.com/temoto/robotstxt"
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/protobuf/proto"
 )
+
+var RetryLimit int32 = 5
 
 type spider struct {
 	queue chan<- *PageRequest
@@ -23,13 +26,16 @@ type spider struct {
 
 	// Semaphore that limits the number of
 	// concurrent page fetches.
-	sem   *semaphore.Weighted
-	mu    sync.Mutex
-	wg    *sync.WaitGroup
-	ctx   context.Context
-	close context.CancelFunc
-	wait  chan time.Duration
+	sem *semaphore.Weighted
 
+	mu sync.Mutex
+	wg *sync.WaitGroup
+
+	robots *robotstxt.RobotsData
+
+	ctx      context.Context
+	close    context.CancelFunc
+	wait     chan time.Duration
 	finished chan struct{}
 
 	visitor Visitor
@@ -47,78 +53,105 @@ func (s *spider) Finished() <-chan struct{} {
 }
 
 func (s *spider) start(ctx context.Context) {
-	defer s.wg.Done()
-	defer log.Infof("stopping spider %s", s.host)
-	defer close(s.finished)
 	s.withContext(ctx)
 	ctx = s.ctx
-	tick := time.NewTicker(s.sleep)
-	defer tick.Stop()
+	if s.sleep == 0 {
+		s.sleep = time.Microsecond
+	}
+	var (
+		err  error
+		tick = time.NewTicker(s.sleep)
+	)
+	s.robots, err = GetRobotsTxT(s.host)
+	if err != nil {
+		s.robots = &robotstxt.RobotsData{}
+		log.WithError(err).Error("could not get robots.txt")
+	}
+	for _, sitemap := range s.robots.Sitemaps {
+		log.Infof("sitemap %s", sitemap)
+	}
+
+	defer func() {
+		s.wg.Done()
+		log.Infof("stopping spider %s", s.host)
+		close(s.finished)
+		tick.Stop()
+	}()
 
 	for {
-		// now := time.Now()
-		select {
-		case <-s.ctx.Done():
-			return
-		case wait := <-s.wait:
-			log.WithFields(logrus.Fields{
-				"time": wait,
-			}).Infof("rate limited, waiting %s", wait)
-			time.Sleep(wait)
-		case <-tick.C:
-			// fmt.Println(time.Since(now))
-		}
-		page, err := s.q.Dequeue()
+		req, err := s.q.Dequeue()
 		if err == queue.ErrQueueClosed {
 			return
 		}
 		if err != nil {
 			log.WithFields(logrus.Fields{
-				"error": err, "spider": s.host,
+				"error": err, "host": s.host, "q-size": s.q.Size(),
 			}).Error("could not pop from queue")
+			continue
+		}
+		page := NewPageFromString(req.URL, req.Depth)
+		if !s.robots.TestAgent(page.URL.Path, "*") {
+			log.WithFields(logrus.Fields{
+				"url": req.URL,
+			}).Info("skipping path in robots.txt")
+			continue
 		}
 		s.sem.Acquire(ctx, 1)
-		go s.fetch(s.ctx, page)
-		// time.Sleep(s.sleep)
-		tick.Reset(s.sleep)
+		go s.fetch(s.ctx, req, page)
+
+		// wait for either a cancellation or ticker
+		select {
+		case <-tick.C:
+			tick.Reset(s.sleep)
+		case <-ctx.Done():
+			return
+		case wait := <-s.wait:
+			time.Sleep(wait)
+		}
 	}
 }
 
-var RetryLimit = 5
-
-func (s *spider) fetch(ctx context.Context, p *PageRequest) {
-	page := &Page{URL: p.URL, Depth: p.Depth}
+func (s *spider) fetch(ctx context.Context, req *PageRequest, page *Page) {
 	err := page.FetchCtx(ctx)
-	if page.Status == http.StatusTooManyRequests && p.Retry < RetryLimit {
-		go func() { s.wait <- page.RetryAfter }()
-		p.Retry++
-		err = s.q.Enqueue(p)
-		if err != nil {
-			log.WithError(err).Error("could not enqueue retry")
-		}
-	}
-	s.visitor.Visit(page)
-	atomic.AddInt64(&s.fetched, 1)
-
 	if err != nil {
-		log.WithFields(logrus.Fields{
-			"type": fmt.Sprintf("%T", err),
-			"url":  p.URL.String(),
-		}).Error(err)
-
 		// Don't release the semaphore if the context was cancelled
 		// it should handle that itself.
 		switch internal.UnwrapAll(err) {
 		case context.DeadlineExceeded, context.Canceled:
-			break
+			return
 		default:
 			s.sem.Release(1)
 		}
+		log.WithFields(logrus.Fields{
+			"type": fmt.Sprintf("%T", err),
+			"url":  req.URL,
+		}).Error(err)
 		return
 	}
 
-	pushlinks(ctx, &s.mu, s.queue, page)
-	s.sem.Release(1)
+	if page.Status == http.StatusTooManyRequests && req.Retry < RetryLimit {
+		go func() { s.wait <- page.RetryAfter }()
+		req.Retry++
+		err = s.q.Enqueue(req)
+		if err != nil {
+			log.WithError(err).Error("could not enqueue retry")
+		}
+		s.sem.Release(1)
+		return
+	}
+
+	defer s.sem.Release(1)
+	atomic.AddInt64(&s.fetched, 1)
+	d := page.Depth
+	for _, l := range page.Links {
+		p := NewPageRequest(l, d+1)
+		select {
+		case s.queue <- p:
+		case <-ctx.Done():
+			return
+		}
+	}
+	s.visitor.Visit(ctx, page)
 }
 
 func (s *spider) add(p *PageRequest) {
@@ -127,7 +160,7 @@ func (s *spider) add(p *PageRequest) {
 		log.WithFields(logrus.Fields{
 			"error":  err,
 			"spider": s.host,
-			"url":    p.URL.String(),
+			"url":    p.URL,
 		}).Error("could not enqueue page")
 	}
 }
@@ -153,11 +186,11 @@ func NewPageQueue(db *badger.DB, prefix []byte) RequestQueue {
 type pageQueue struct{ queue.Queue }
 
 func (q *pageQueue) Enqueue(p *PageRequest) error {
-	raw, err := json.Marshal(p)
+	raw, err := proto.Marshal(p)
 	if err != nil {
 		return err
 	}
-	key := []byte(p.URL.String())
+	key := []byte(p.URL)
 	return q.PutKey(key, raw)
 }
 
@@ -167,7 +200,7 @@ func (q *pageQueue) Dequeue() (*PageRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = json.Unmarshal(raw, p); err != nil {
+	if err = proto.Unmarshal(raw, p); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -178,24 +211,4 @@ type SpiderStats struct {
 	QueueSize    int64
 	Host         string
 	WaitTime     time.Duration
-}
-
-func pushlinks(
-	ctx context.Context,
-	lock sync.Locker,
-	queue chan<- *PageRequest,
-	parent *Page,
-) {
-	lock.Lock()
-	d := parent.Depth
-	lock.Unlock()
-	for _, l := range parent.Links {
-		p := NewPageRequest(l, d+1)
-		select {
-		case queue <- p:
-		case <-ctx.Done():
-			return
-		default:
-		}
-	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,21 +17,20 @@ import (
 type Crawler struct {
 	Visitor Visitor
 	Sleep   time.Duration
-	Limit   uint
+	Limit   uint32
 	DB      *badger.DB
+	DataDir string
 
 	wg    *sync.WaitGroup
 	queue chan *PageRequest
 	skip  chan *url.URL
 
 	mu       sync.Mutex
-	seen     map[string]struct{}
 	spiders  map[string]*spider
 	finished chan string // channel of finished spider names
 
 	metrics struct {
 		sync.Mutex
-		stack           int
 		vertices, edges int64
 	}
 }
@@ -39,18 +39,18 @@ type Option func(*Crawler)
 
 func WithVisitor(v Visitor) Option          { return func(c *Crawler) { c.Visitor = v } }
 func WithSleep(t time.Duration) Option      { return func(c *Crawler) { c.Sleep = t } }
-func WithLimit(l uint) Option               { return func(c *Crawler) { c.Limit = l } }
+func WithLimit(l uint32) Option             { return func(c *Crawler) { c.Limit = l } }
 func WithDB(db *badger.DB) Option           { return func(c *Crawler) { c.DB = db } }
 func WithQueue(ch chan *PageRequest) Option { return func(c *Crawler) { c.queue = ch } }
 func WithSkipChan(ch chan *url.URL) Option  { return func(c *Crawler) { c.skip = ch } }
 func WithQueueSize(n int) Option            { return func(c *Crawler) { c.queue = make(chan *PageRequest, n) } }
+func WithDataDir(d string) Option           { return func(c *Crawler) { c.DataDir = d } }
 
 func NewCrawler(opts ...Option) *Crawler {
 	c := &Crawler{
 		Limit:    1,
 		Visitor:  &NoOpVisitor{},
 		wg:       new(sync.WaitGroup),
-		seen:     make(map[string]struct{}),
 		spiders:  make(map[string]*spider),
 		finished: make(chan string),
 	}
@@ -63,12 +63,18 @@ func NewCrawler(opts ...Option) *Crawler {
 	if c.queue == nil {
 		c.queue = make(chan *PageRequest)
 	}
+	if c.DataDir == "" {
+		c.DataDir = "./crawler"
+	}
 	if c.DB == nil {
 		// Try not to do this, keeping this in memory will be a nightmare
 		opts := badger.DefaultOptions("")
 		opts.InMemory = true
 		opts.Logger = nil
 		c.DB, _ = badger.Open(opts)
+	}
+	if _, err := os.Stat(c.DataDir); os.IsNotExist(err) {
+		os.Mkdir(c.DataDir, 0744)
 	}
 	return c
 }
@@ -78,7 +84,6 @@ func (c *Crawler) Wait()     { c.wg.Wait() }
 
 func (c *Crawler) Crawl(ctx context.Context, reqLimit int) {
 	var (
-		err  error
 		done context.CancelFunc
 		sem  = semaphore.NewWeighted(int64(reqLimit))
 	)
@@ -90,7 +95,7 @@ Loop:
 	for {
 		select {
 		case u := <-c.skip:
-			c.MarkVisited(*u)
+			c.markvisited(*u)
 		case hostname := <-c.finished:
 			log.WithField("hostname", hostname).Debug("got finished signal")
 			c.mu.Lock()
@@ -112,13 +117,18 @@ Loop:
 				break Loop
 			}
 
-			c.Visitor.LinkFound(page.URL)
+			pageurl, err := url.Parse(page.URL)
+			if err != nil {
+				log.WithError(err).Error("could not parse request url")
+				continue
+			}
+			c.Visitor.LinkFound(pageurl)
 			// check crawl depth and visited set, insert new URLs if needed
-			if page.Depth > c.Limit || c.wasVisited(page) {
+			if page.Depth > c.Limit || c.wasVisited(pageurl) {
 				continue
 			}
 
-			err = c.Visitor.Filter(page)
+			err = c.Visitor.Filter(page, pageurl)
 			switch err {
 			case ErrSkipURL:
 				continue
@@ -127,10 +137,8 @@ Loop:
 			default:
 			}
 
-			go func(p *PageRequest) {
-				spider := c.getOrLaunchSpider(ctx, p.URL.Host, sem)
-				spider.add(p)
-			}(page)
+			spider := c.getOrLaunchSpider(ctx, pageurl.Host, sem)
+			go spider.add(page)
 			atomic.AddInt64(&c.metrics.vertices, 1)
 		case <-ctx.Done():
 			break Loop
@@ -141,7 +149,6 @@ Loop:
 func (c *Crawler) Enqueue(req *PageRequest) { go func() { c.queue <- req }() }
 func (c *Crawler) QueueSize() int           { return len(c.queue) }
 func (c *Crawler) SpiderCount() int         { return len(c.spiders) }
-func (c *Crawler) VisitedCount() int        { return len(c.seen) }
 func (c *Crawler) N() int64                 { return atomic.LoadInt64(&c.metrics.vertices) }
 
 func (c *Crawler) SpiderStats() []*SpiderStats {
@@ -160,21 +167,6 @@ func (c *Crawler) SpiderStats() []*SpiderStats {
 		stats = append(stats, stat)
 	}
 	return stats
-}
-
-func (c *Crawler) Visited(u url.URL) bool {
-	u.Fragment = ""
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.seen[u.String()]
-	return ok
-}
-
-func (c *Crawler) MarkVisited(u url.URL) {
-	u.Fragment = ""
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.seen[u.String()] = struct{}{}
 }
 
 func (c *Crawler) SetSleep(d time.Duration) {
@@ -219,17 +211,17 @@ func deleteAndCloseSpider(spiders map[string]*spider, hostname string) error {
 	return spider.Close()
 }
 
-func (c *Crawler) wasVisited(p *PageRequest) bool {
+func (c *Crawler) wasVisited(u *url.URL) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	seen, err := c.urlSeen(*p.URL)
+	seen, err := c.urlSeen(*u)
 	if err != nil {
 		log.WithError(err).Error("could not access visited url set")
 	}
 	if seen {
 		return true
 	}
-	if err = c.markvisited(*p.URL); err != nil {
+	if err = c.markvisited(*u); err != nil {
 		log.WithError(err).Error("could not access visited url set")
 	}
 	return false
@@ -259,12 +251,8 @@ func (c *Crawler) getOrLaunchSpider(ctx context.Context, host string, sem *semap
 func (c *Crawler) urlSeen(u url.URL) (bool, error) {
 	ok := false
 	u.Fragment = ""
-	// key := u.String()
-	// _, ok = c.seen[key]
-	// return ok, nil
 
 	key := urlKey(&u)
-
 	err := c.DB.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
 		if err == badger.ErrKeyNotFound {
@@ -287,8 +275,6 @@ func (c *Crawler) urlSeen(u url.URL) (bool, error) {
 
 func (c *Crawler) markvisited(u url.URL) error {
 	u.Fragment = ""
-	// key := u.String()
-	// c.seen[key] = struct{}{}
 
 	key := urlKey(&u)
 	return c.DB.Update(func(txn *badger.Txn) error {
@@ -304,6 +290,7 @@ func urlKey(u *url.URL) []byte {
 }
 
 func (c *Crawler) newSpider(host string, sem *semaphore.Weighted) *spider {
+	db := c.DB
 	return &spider{
 		visitor:  c.Visitor,
 		queue:    c.queue,
@@ -315,12 +302,52 @@ func (c *Crawler) newSpider(host string, sem *semaphore.Weighted) *spider {
 		host:     host,
 		ctx:      context.Background(),
 		close:    func() {},
-		q:        NewPageQueue(c.DB, []byte(host)),
+		q:        NewPageQueue(db, []byte(host)),
 	}
+}
+
+type visitedSet struct {
+	db *badger.DB
+}
+
+func (vs *visitedSet) Has(u *url.URL) bool {
+	var l = *u
+	ok := false
+	l.Fragment = ""
+
+	key := urlKey(&l)
+	err := vs.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if item.IsDeletedOrExpired() {
+			return nil
+		}
+		ok = true
+		return nil
+	})
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+func (vs *visitedSet) Put(u *url.URL) error {
+	var l = *u
+	l.Fragment = ""
+
+	key := urlKey(&l)
+	return vs.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, []byte{1})
+	})
 }
 
 type NoOpVisitor struct{}
 
-func (v *NoOpVisitor) Filter(*PageRequest) error { return nil }
-func (v *NoOpVisitor) Visit(*Page)               {}
-func (v *NoOpVisitor) LinkFound(*url.URL)        {}
+func (v *NoOpVisitor) Filter(*PageRequest, *url.URL) error { return nil }
+func (v *NoOpVisitor) Visit(context.Context, *Page)        {}
+func (v *NoOpVisitor) LinkFound(*url.URL)                  {}

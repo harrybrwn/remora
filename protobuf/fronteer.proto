@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+package fronteer;
+
+option go_package = "github.com/harrybrwb/diktyo/fronteer/pb";

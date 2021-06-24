@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "github.com/harrybrwb/diktyo/web/pb";
+
+enum Status {
+    Ok = 0;
+    Stopped = 1;
+    Failed  = 2;
+}
+
+message Response {
+    Status status  = 1;
+    string message = 2;
+}
+
+message PageRequest {
+    string URL   = 1;
+    bytes  key   = 2;
+    uint32 depth = 3;
+    int32  retry = 4;
+}
+
+message PageResponse {
+    Response        resp  = 1;
+    string          URL   = 2;
+    uint32          depth = 3;
+    repeated string links = 4;
+    int64           responseTime = 5;
+}
+
+message Page {
+    string          URL   = 1;
+    repeated string links = 2;
+
+    uint64 depth          = 3;
+    int64  responseTime   = 4;
+    bool   redirected     = 5;
+    string redirectedFrom = 6;
+    int32  status         = 7;
+    string contentType    = 8;
+    int64  retryAfter     = 9;
+    bytes  document       = 10;
+}
+
+message None { }
+
+service PageFetcher {
+    rpc links(PageRequest) returns (PageResponse) {}
+    rpc enqueue(PageRequest) returns (Response) {}
+}
