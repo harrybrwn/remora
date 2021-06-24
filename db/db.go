@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	_ "github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
 type Config struct {
@@ -27,9 +28,13 @@ func New(cfg *Config) (*sql.DB, error) {
 
 	db, err := sql.Open("postgres", cfg.dsn())
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "could not open postgres db")
 	}
-	return db, db.Ping()
+	err = db.Ping()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not ping postgres")
+	}
+	return db, nil
 }
 
 func ServiceFileExists() {

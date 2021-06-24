@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -12,14 +14,15 @@ import (
 
 	"github.com/dgraph-io/badger/v3"
 	"github.com/harrybrwn/config"
+	"github.com/harrybrwn/diktyo/cmd"
 	"github.com/harrybrwn/diktyo/db"
 	"github.com/harrybrwn/diktyo/internal/logging"
+	"github.com/harrybrwn/diktyo/internal/visitor"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	flag "github.com/spf13/pflag"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -38,39 +41,20 @@ var (
 	}
 )
 
-type Config struct {
-	DB           db.Config     `yaml:"db" config:"db"`
-	QueueSize    int64         `yaml:"queue_size" default:"500"`
-	Seeds        []string      `yaml:"seeds"`
-	Depth        uint          `yaml:"depth" config:"depth" default:"2"`
-	AllowedHosts []string      `yaml:"allowed_hosts" config:"allowed_hosts"`
-	Sleep        time.Duration `yaml:"sleep" default:"250ms"`
-	// A limit on the number of concurrent requests being
-	/// waited for at any moment
-	RequestLimit int `yaml:"request_limit"`
-
-	db *badger.DB
-}
-
-func (c *Config) bind(flag *flag.FlagSet) {
-	flag.Int64Var(&c.QueueSize, "queue", c.QueueSize, "Size of the main queue")
-	flag.StringArrayVarP(&c.AllowedHosts, "allowed-hosts", "a", c.AllowedHosts,
-		"A list of hosts that the crawler is allowed to "+
-			"visit. The host of seed urls are added implicitly")
-	flag.DurationVar(&c.Sleep, "sleep", c.Sleep, "Sleep time for each spider request")
-	flag.UintVar(&c.Depth, "depth", c.Depth, "Crawler depth limit")
-}
-
 func main() {
 	var (
 		err  error
-		conf Config
+		conf cmd.Config
 	)
 	godotenv.Load()
-	initLogger()
 	initConfig(&conf)
+	lvl, err := logrus.ParseLevel(conf.LogLevel)
+	if err != nil {
+		log.Warn("could not parse log level")
+		lvl = logrus.DebugLevel
+	}
+	initLogger(lvl)
 	web.RetryLimit = 0
-
 	cmd := NewCLIRoot(&conf)
 	err = cmd.Execute()
 	if err != nil {
@@ -78,10 +62,10 @@ func main() {
 	}
 }
 
-func NewCLIRoot(conf *Config) *cobra.Command {
+func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "remora",
-		Short: "Symbiotic web crawler",
+		Short: "The internet's symbiotic web crawler",
 	}
 	crawlCmd := &cobra.Command{
 		Use:   "crawl",
@@ -91,13 +75,16 @@ func NewCLIRoot(conf *Config) *cobra.Command {
 			if len(args) > 0 {
 				conf.Seeds = args
 			}
-			return crawl(cmd.Context(), conf)
+			ctx := cmd.Context()
+			// http://localhost:8080/debug/pprof
+			go http.ListenAndServe(":8080", nil)
+			go periodicMemDump(ctx, time.Minute*10)
+			return crawl(ctx, conf)
 		},
 	}
-	conf.bind(crawlCmd.Flags())
+	conf.Bind(crawlCmd.Flags())
 
 	c.AddCommand(
-		crawlCmd,
 		config.NewConfigCommand(),
 		&cobra.Command{
 			Use:   "list <url>",
@@ -106,10 +93,16 @@ func NewCLIRoot(conf *Config) *cobra.Command {
 			RunE:  runListCmd,
 		},
 		&cobra.Command{
-			Use:  "keywords",
-			Args: cobra.MinimumNArgs(1),
-			RunE: runKeywordsCmd,
+			Use:   "keywords",
+			Short: "Print the keywords for a website",
+			Args:  cobra.MinimumNArgs(1),
+			RunE:  runKeywordsCmd,
 		},
+		newPurgeCmd(conf),
+		newEnqueueCmd(conf),
+		crawlCmd,
+		newQueueCmd(conf),
+		newRedisCmd(conf),
 		&cobra.Command{
 			Use: "test", Hidden: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -121,7 +114,7 @@ func NewCLIRoot(conf *Config) *cobra.Command {
 	return c
 }
 
-func crawl(ctx context.Context, conf *Config) error {
+func crawl(ctx context.Context, conf *cmd.Config) error {
 	var (
 		err   error
 		start = time.Now()
@@ -131,12 +124,13 @@ func crawl(ctx context.Context, conf *Config) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 
-	conf.db, err = badger.Open(badger.DefaultOptions("/var/local/diktyo/queue"))
+	var qdb *badger.DB
+	opts := badger.DefaultOptions("/var/local/diktyo/visited")
+	qdb, err = badger.Open(opts)
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "could not open key-value storage")
 	}
-	defer closedb(conf.db)
-
+	defer closedb(qdb)
 	db, err := db.New(&conf.DB)
 	if err != nil {
 		return errors.Wrap(err, "could not connect to database")
@@ -144,21 +138,23 @@ func crawl(ctx context.Context, conf *Config) error {
 	defer db.Close()
 
 	var (
-		visitor = visitor{db: db, hosts: make(map[string]struct{})}
+		vis     = visitor.New(db)
 		ch      = make(chan *web.PageRequest, conf.QueueSize)
 		crawler = web.NewCrawler(
-			web.WithVisitor(&visitor),
-			web.WithLimit(config.GetUint("depth")),
+			web.WithVisitor(vis),
+			web.WithLimit(config.GetUint32("depth")),
 			web.WithQueue(ch),
 			web.WithSleep(conf.Sleep),
-			web.WithDB(conf.db),
+			web.WithDB(qdb),
+			web.WithDataDir("/var/local/diktyo"),
 		)
 	)
 
+	web.UserAgent = "Remora"
 	if len(conf.Seeds) < 1 {
 		return errors.New("no seed URLs")
 	}
-	visitor.addHosts(conf.AllowedHosts)
+	visitor.AddHosts(vis, conf.AllowedHosts)
 
 	go runtimeCommandHandler(ctx, stop, crawler)
 	for _, seed := range conf.Seeds {
@@ -167,22 +163,22 @@ func crawl(ctx context.Context, conf *Config) error {
 			log.Error(err)
 			continue
 		}
-		visitor.hosts[u.Host] = struct{}{}
+		visitor.AddHost(vis, u.Host)
+		log.Infof("crawler enqueue %s", seed)
 		crawler.Enqueue(web.NewPageRequest(u, 0))
 	}
 
 	log.WithFields(logrus.Fields{
-		"seeds": conf.Seeds, "max_depth": config.GetUint("depth")}).Info("Starting Crawl")
+		"seeds": conf.Seeds, "max_depth": config.GetUint("depth"),
+	}).Info("Starting Crawl")
 
 	crawler.Add(1)
 	go crawler.Crawl(ctx, conf.RequestLimit)
-	go http.ListenAndServe(":8080", nil)
 
 	select {
 	case <-sigs:
 		stop()
 		close(ch)
-		fmt.Println()
 	case <-ctx.Done():
 	}
 	err = crawler.Close()
@@ -197,9 +193,14 @@ func crawl(ctx context.Context, conf *Config) error {
 	return nil
 }
 
-func initConfig(c *Config) {
-	config.SetFilename("diktyo.yml")
+const DataDir = "/var/local/remora"
+
+func initConfig(c *cmd.Config) {
+	config.AddFile("remora.yml")
+	config.AddFile("config.yml")
 	config.AddPath(".")
+	config.AddPath("/var/local/diktyo")
+	config.AddPath(DataDir)
 	config.SetType("yaml")
 	config.SetConfig(c)
 	err := config.InitDefaults()
@@ -209,32 +210,39 @@ func initConfig(c *Config) {
 	if err = config.ReadConfigFile(); err != nil {
 		log.Fatal(errors.Wrap(err, "could not read config"))
 	}
-	if _, err = os.Stat("/var/local/diktyo"); os.IsNotExist(err) {
-		err = os.MkdirAll("/var/local/diktyo", 1777)
-		if err != nil {
-			log.WithError(err).Error("could not create runtime directory")
+	for _, path := range []string{
+		"/var/local/diktyo",
+		DataDir,
+	} {
+		if _, err = os.Stat(path); os.IsNotExist(err) {
+			err = os.MkdirAll(path, 1777)
+			if err != nil {
+				log.WithError(err).Error("could not create runtime directory")
+			}
 		}
 	}
 }
 
-func initLogger() {
-	// log.AddHook(logging.NewLogFileHook(&logfile, &logrus.JSONFormatter{
-	// 	TimestampFormat:   time.RFC3339,
-	// 	DisableHTMLEscape: true,
-	// }))
-	log.AddHook(logging.NewLogFileHook(&logfile, &logrus.TextFormatter{
-		DisableColors:   true,
-		PadLevelText:    true,
-		TimestampFormat: time.RFC3339,
-	}))
-	log.SetOutput(os.Stdout)
+func initLogger(lvl logrus.Level) {
+	log.SetOutput(io.Discard)
 	log.SetLevel(logrus.TraceLevel)
 	log.SetFormatter(&logging.PrefixedFormatter{
 		Prefix:           "",
 		TimeFormat:       time.RFC3339,
 		MaxMessageLength: 135,
 	})
+	logfile.Filename = "/var/local/diktyo/crawler.log"
+	log.AddHook(logging.NewLogFileHook(&logfile, &logrus.TextFormatter{
+		DisableColors:   true,
+		PadLevelText:    true,
+		TimestampFormat: time.RFC3339,
+	}))
+	log.AddHook(&logging.Hook{
+		Writer:    os.Stdout,
+		LogLevels: logrus.AllLevels[:lvl+1],
+	})
 	web.SetLogger(log)
+	visitor.SetLogger(log)
 }
 
 func closedb(db *badger.DB) {
@@ -246,4 +254,46 @@ func closedb(db *badger.DB) {
 	if err != nil {
 		log.WithError(err).Error("could not remove persistant queue")
 	}
+}
+
+func newQueueListCmdFunc(conf *cmd.Config) func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		queues, err := listQueues(
+			conf.MessageQueue.Host,
+			conf.MessageQueue.Management.Port,
+		)
+		if err != nil {
+			return err
+		}
+		for _, q := range queues {
+			fmt.Printf("%20s %s, %d\n", q.Name, q.State, q.Messages)
+		}
+		return nil
+	}
+}
+
+type RabbitQueue struct {
+	Name       string `json:"name"`
+	VHost      string `json:"vhost"`
+	Messages   int    `json:"messages"`
+	State      string `json:"state"`
+	AutoDelete bool   `json:"auto_delete"`
+}
+
+func listQueues(host string, port int) ([]RabbitQueue, error) {
+	var url = fmt.Sprintf("http://%s:%d/api/queues/", host, port)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.SetBasicAuth("guest", "guest")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	queues := make([]RabbitQueue, 0)
+	err = json.NewDecoder(resp.Body).Decode(&queues)
+	if err != nil {
+		return nil, err
+	}
+	return queues, nil
 }

@@ -89,11 +89,11 @@ func (v *Visitor) Visit(ctx context.Context, page *web.Page) {
 		return
 	default:
 	}
-	logVisit(page) // only handles logging
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	v.record(ctx, page)
 	atomic.AddInt64(&v.Visited, 1)
+	logVisit(page) // only handles logging
 }
 
 func logVisit(page *web.Page) {
@@ -106,9 +106,9 @@ func logVisit(page *web.Page) {
 		"resp":     fmt.Sprintf("%v", page.ResponseTime),
 	}).WithFields(memoryLogs(&mem))
 	var info = l.Debugf
-	// if page.Status >= 300 {
-	// 	info = l.Warnf
-	// }
+	if page.Status >= 300 {
+		info = l.Tracef
+	}
 	info("page{%s}", page.URL)
 }
 

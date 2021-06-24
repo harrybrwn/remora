@@ -1,8 +1,11 @@
 -- RFC 7230 section 3.1.1 states that the recomended
 -- minimum request line is 8000 bytes (8000 characters).
+--
 -- RFC 2181 section 11 states that the maximum domain
 -- name length including separators is 255.
+--
 -- The url prefix "https://" is 8 characters long.
+--
 -- As a superstitious precausion, this maximum size
 -- will be multiplied by 2.
 --
@@ -12,57 +15,48 @@
 CREATE DOMAIN url AS varchar(16526);
 
 CREATE TABLE page (
-    url url PRIMARY KEY,
-    ipv4 inet,
-    ipv6 inet,
-    links url[],
+  id    bytea PRIMARY KEY,
+  url   varchar(16526),
+  ipv4  inet,
+  ipv6  inet,
+  links url[],
 
-    crawled_at timestamp,
-    depth      int,
+  crawled_at timestamp,
+  depth      int,
 
-    -- HTTP Fields
-    redirected      boolean,
-    redirected_from url,
-    status          int, -- http status code
-    -- RFC 6838 section 4.2 states max length
-    -- of mime types as 127.
-    content_type    varchar(127),
-    response_time   interval,
+  -- HTTP Fields
+  redirected      boolean,
+  redirected_from url,
+  status          int, -- http status code
+  -- RFC 6838 section 4.2 states max length
+  -- of mime types as 127.
+  content_type  varchar(127),
+  response_time interval,
 
-    -- Webpage fields
-    title text,
-    keywords tsvector,
+  -- All character encodings found here
+  -- <https://html.spec.whatwg.org/multipage/parsing.html#character-encodings>.
+  -- The maximum length of all allowed encodings is 12.
+  chr_encoding varchar(12),
 
-    UNIQUE(url, ipv4, ipv6)
+  title    text,
+  keywords tsvector,
+
+  UNIQUE (url, ipv4, ipv6)
 );
 
+CREATE INDEX keyword_idx ON page USING GIST (keywords);
+-- CREATE INDEX url_idx     ON page USING GIN  (url);
+
 CREATE TABLE edge (
-  parent url NOT NULL,
+  parent_id bytea NOT NULL,
+  child_id bytea NOT NULL,
   child  url NOT NULL,
 
-  UNIQUE(parent, child),
-  CONSTRAINT no_loops CHECK (parent != child)
+  UNIQUE(parent_id, child_id, child)
 );
 
 CREATE UNIQUE INDEX idx_edge_parent_child
-  ON edge (parent, child);
-
-CREATE VIEW page_count AS
-  SELECT count(DISTINCT url)
-  FROM page;
-
-CREATE VIEW page_h AS
-  SELECT ipv4,
-         status,
-         left(url, 135) as URL,
-         array_length(links, 1) as links,
-         to_char(crawled_at, 'MM:DD:YYYY HH12:MI:SS AM') as crawled_at,
-         depth,
-         left(content_type, 16),
-         redirected,
-         response_time
-    FROM page;
-
+  ON edge (parent_id, child_id, child);
 
 CREATE MATERIALIZED VIEW hosts AS
   SELECT
@@ -72,11 +66,3 @@ CREATE MATERIALIZED VIEW hosts AS
     count(DISTINCT url) as n
   FROM page
   GROUP BY host, ipv4;
-
-REFRESH MATERIALIZED VIEW hosts;
-
-INSERT INTO edge (parent, child)
-VALUES (
-  'https://en.wikipedia.org/wiki/Gall',
-  'https://en.wikipedia.org/wiki/Indigenous_Australians'
-);

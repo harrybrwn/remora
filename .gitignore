@@ -1,5 +1,8 @@
 # Bin
+/bin/
 /diktyo
+/remora
+/deinopis
 
 # Testing
 /test
@@ -13,6 +16,8 @@
 /.vscode
 /*env*
 /diktyo.yml
+/config.yml
+/remora.yml
 
 # Notes
 /papers/
@@ -21,6 +26,7 @@ TODO*
 notes.*
 
 # Scripts
+/scripts/
 /psql
 /test
 /db/*.sql

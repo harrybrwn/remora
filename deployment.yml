@@ -1,0 +1,84 @@
+hosts:
+  - host: 10.0.0.201
+    image: remora:0.1
+    command: ["deinopis", "--host", "en.wikipedia.org"]
+    volumes: ["remora-config:/var/local/diktyo"]
+    instances:
+      - name: wiki
+      - name: species-wiki-scraper
+        command: ["deinopis", "--host", "species.wikimedia.org"]
+      - name: archive-scraper
+        command: ["deinopis", "--host", "archive.org"]
+      - name: nih-crawler
+        command: ["deinopis", "--host", "pubmed.ncbi.nlm.nih.gov"]
+      - name: goodreads
+        command: ["deinopis", "--host", "www.goodreads.com"]
+      - name: doi
+        command: ["deinopis", "--host", "doi.org"]
+      - name: pew
+        command: ["deinopis", "--host", "www.pewresearch.org"]
+      - name: another-pew
+        command: ["deinopis", "--host", "www.journalism.org"]
+      - name: sciencemag
+        command: ["deinopis", "--host", "www.sciencemag.org"]
+      - name: acm
+        command: ["deinopis", "--host", "www.acm.org"]
+  - host: 10.0.0.202
+    image: remora:0.1
+    command: ["deinopis", "--host", "en.wikipedia.org"]
+    volumes: ["remora-config:/var/local/diktyo"]
+    instances:
+      - name: wiki
+      - name: wiki2
+      - name: nature
+        command: ["deinopis", "--host", "www.nature.com"]
+      - name: wsj-scraper
+        command: ["deinopis", "--host", "www.wsj.com"]
+      - name: npr-scraper
+        command: ["deinopis", "--host", "www.npr.org"]
+      - name: openlib-scraper
+        command: ["deinopis", "--host", "openlibrary.org"]
+      - name: thegaurdian
+        command: ["deinopis", "--host", "www.theguardian.com"]
+      - name: acm-news
+        command: ["deinopis", "--host", "technews.acm.org"]
+      - name: acm
+        command: ["deinopis", "--host", "www.acm.org"]
+      - { name: quotes, command: ["deinopis", "--host", "quotes.toscrape.com"] }
+  - host: 10.0.0.203
+    image: remora:0.1
+    command: ["deinopis", "--host", "en.wikipedia.org"]
+    volumes: ["remora-config:/var/local/diktyo"]
+    instances:
+      - name: wiki
+      - name: wiki2
+      - name: wiki3
+      - name: wiki4
+      - name: wiki5
+      - name: wiki6
+      - name: wiki7
+      - name: species-wiki
+        command: ["deinopis", "--host", "species.wikimedia.org"]
+      - { name: 'goodreads', command: ["deinopis", "--host", "www.goodreads.com"] }
+      - { name: 'wikidata', command: ["deinopis", "--host", "www.wikidata.org"]   }
+  # - host: 10.0.0.200
+  #   image: remora:0.1
+  #   instances:
+  #     - { name: wiki, command: ["deinopis", "--host", "en.wikipedia.org"] }
+
+build:
+  image: remora:0.1
+  context: .
+  dockerfile: ./Dockerfile
+
+builds:
+  - host: unix:///var/run/docker.sock
+    context: .
+    dockerfile: ./Dockerfile
+  # - host: 10.0.0.200
+  - host: 10.0.0.201
+  - host: 10.0.0.202
+  - host: 10.0.0.203
+  # - host: 10.0.0.100
+  - host: 10.0.0.101
+

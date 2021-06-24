@@ -1,0 +1,41 @@
+# Misc
+/.git/
+/.gitignore
+/.vscode/
+/.env
+/config.yml
+/Dockerfile
+/docker-compose.yml
+/.dockerignore
+/deployment.yml
+
+/TODO
+*.md
+*.log
+*.dump
+/db/data/
+
+# Bin
+/bin/
+/remora
+/deinopis
+
+# Scripts
+/scripts/
+/cmd/docker/
+/cmd/frontier/
+/cmd/deploy
+/psql
+/test
+/Makefile
+**/*.sh
+**/*.sql
+
+# Tests
+**/*_test.go
+/web/testdata/
+
+# Deployment Code
+deployment.yml
+cmd/deploy
+cmd/docker

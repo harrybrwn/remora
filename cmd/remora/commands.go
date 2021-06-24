@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,24 +30,19 @@ func NewRuntimeCmd(c *web.Crawler) *cobra.Command {
 				cmd.Printf("heap: %02fMB; sys: %02fMB\nobjects: %v\n",
 					toMB(stats.HeapAlloc), toMB(stats.Sys), stats.HeapObjects)
 				return nil
-			},
-		},
+			}},
 		&cobra.Command{
 			Use: "count", Aliases: []string{"vertices", "n"},
-			Run: func(cmd *cobra.Command, _ []string) { cmd.Printf("count: %d\n", c.N()) },
-		},
+			Run: func(cmd *cobra.Command, _ []string) { cmd.Printf("count: %d\n", c.N()) }},
 		&cobra.Command{
 			Use: "statistics", Aliases: []string{"stats", "stat"},
-			Run: statsCmdRunFunc(c),
-		},
+			Run: statsCmdRunFunc(c)},
 		&cobra.Command{
 			Use: "clear",
-			Run: func(*cobra.Command, []string) { os.Stdout.Write([]byte("\x1b[1J\x1b[1;1H")) },
-		},
+			Run: func(*cobra.Command, []string) { os.Stdout.Write([]byte("\x1b[1J\x1b[1;1H")) }},
 		&cobra.Command{
 			Use: "gc", Short: "Run the garbage collector",
-			Run: func(*cobra.Command, []string) { runtime.GC() },
-		},
+			Run: func(*cobra.Command, []string) { runtime.GC() }},
 		&cobra.Command{
 			Use: "close", Short: "Close one of the spiders",
 			Args: cobra.ExactArgs(1),
@@ -95,11 +89,7 @@ func runtimeCommandHandler(ctx context.Context, stop context.CancelFunc, c *web.
 	}
 }
 
-const spiderStatFmt = `  - spider %d:
-	host:      %s
-	fetched:   %d
-	waittime:  %v
-	queuesize: %d
+const spiderStatFmt = `  - %28s, fetched: %d, queue: %d wait: %v
 `
 
 func statsCmdRunFunc(c *web.Crawler) func(*cobra.Command, []string) {
@@ -113,19 +103,18 @@ func statsCmdRunFunc(c *web.Crawler) func(*cobra.Command, []string) {
 		)
 		fmt.Fprintf(out, "  heap: %02fMB\n  sys-mem: %02fMB\n", toMB(mem.HeapAlloc), toMB(mem.Sys))
 		var tot, queued int64
-		for i, s := range sstats {
+		for _, s := range sstats {
 			tot += s.PagesFetched
 			queued += s.QueueSize
-			fmt.Fprintf(out, spiderStatFmt, i, s.Host, s.PagesFetched, s.WaitTime, s.QueueSize)
+			fmt.Fprintf(out, spiderStatFmt, s.Host, s.PagesFetched, s.QueueSize, s.WaitTime)
 		}
-		fmt.Fprintf(out, "  total fetched: %d\n  total queued: %d\n", tot, queued)
+		fmt.Fprintf(out, "  total fetched: %d\n  total queued:  %d\n", tot, queued)
 		lsm, vlog := c.DB.Size()
-		// m := c.DB.IndexCacheMetrics()
 		opts := c.DB.Opts()
 		fmt.Fprintf(out, `  badger db:
     dir: %s
     size:
-      lsm: %02fMB
+      lsm:  %02fMB
       vlog: %02fMB
     max-batch-count: %d
     max-batch-size:  %d
@@ -167,12 +156,14 @@ func newSetCmd() *cobra.Command {
 		&cobra.Command{
 			Use:     "loglevel",
 			Aliases: []string{"loglvl", "log-level", "log-lvl"},
+			Args:    cobra.ExactArgs(1),
 			RunE:    setLogLevelRunFunc},
 		&cobra.Command{
 			Use:  "sleep",
 			Args: cobra.ExactArgs(1),
-			Run:  func(cmd *cobra.Command, args []string) {},
-		},
+			Run: func(cmd *cobra.Command, args []string) {
+
+			}},
 	)
 	return c
 }
@@ -200,7 +191,7 @@ func runKeywordsCmd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cmd.Printf("%s\n", bytes.Join(k, []byte{' '}))
+	cmd.Printf("%s\n", strings.Join(k, " "))
 	return nil
 }
 

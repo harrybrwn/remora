@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"syscall"
 	"time"
 
@@ -75,26 +77,9 @@ func setErrorLogfile(l *logrus.Logger) error {
 	return setLoggerFile(l, "diktyo_errors")
 }
 
+// TODO remove this
 func ipAddrs(host string) (v4, v6 interface{}, err error) {
-	var addrs []net.IP
-	addrs, err = net.LookupIP(host)
-	if err != nil {
-		return
-	}
-	for _, addr := range addrs {
-		if addr.To4() != nil {
-			v4 = addr.String()
-		} else if addr.To16() != nil {
-			v6 = addr.String()
-		}
-	}
-	if v4 == "" {
-		v4 = nil
-	}
-	if v6 == "" {
-		v6 = nil
-	}
-	return
+	return internal.IPAddrs(host)
 }
 
 func memoryLogs(mem *runtime.MemStats) logrus.Fields {
@@ -144,4 +129,44 @@ func validURLScheme(scheme string) bool {
 		return true
 	}
 	return false
+}
+
+func periodicMemDump(ctx context.Context, d time.Duration) {
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+	err := os.Mkdir("/var/local/diktyo/mem", 0755)
+	if err != nil && !os.IsExist(err) {
+		log.WithError(err).Error("could not create memory dumps folder")
+	}
+	for {
+		select {
+		case <-ticker.C:
+			fmt.Println("tick")
+			var (
+				name string
+				f    *os.File
+			)
+			for i := 0; i < 5000; i++ {
+				name = fmt.Sprintf("/var/local/diktyo/mem/dump_%d.pprof", i)
+				_, err = os.Stat(name)
+				if os.IsNotExist(err) {
+					break
+				}
+			}
+
+			f, err = os.Create(name)
+			if err != nil {
+				log.WithError(err).Error("could not create memory dump")
+				continue
+			}
+			log.Infof("writing memory dump to %s", name)
+			err = pprof.WriteHeapProfile(f)
+			if err != nil {
+				log.WithError(err).Error("could not create memory dump")
+			}
+			f.Close()
+		case <-ctx.Done():
+			return
+		}
+	}
 }

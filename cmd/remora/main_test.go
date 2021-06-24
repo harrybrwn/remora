@@ -13,7 +13,13 @@ import (
 )
 
 func Test(t *testing.T) {
-	fmt.Println("http://quotes.toscrape.com/")
+	initLogger(logrus.InfoLevel)
+	for k, v := range log.Hooks {
+		fmt.Printf("%v %#[2]v\n", k, v)
+		for _, h := range v {
+			fmt.Printf("  %v\n", h)
+		}
+	}
 }
 
 func TestRedirects(t *testing.T) {
