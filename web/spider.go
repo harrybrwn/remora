@@ -171,14 +171,6 @@ func (s *spider) withContext(ctx context.Context) {
 	s.close = close
 }
 
-// PageQueue is a queue for pages
-type RequestQueue interface {
-	Enqueue(*PageRequest) error
-	Dequeue() (*PageRequest, error)
-	Close() error
-	Size() int64
-}
-
 func NewPageQueue(db *badger.DB, prefix []byte) RequestQueue {
 	return &pageQueue{queue.New(db, prefix)}
 }

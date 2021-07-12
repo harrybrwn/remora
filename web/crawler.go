@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/url"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
+	"github.com/harrybrwn/diktyo/storage"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
 )
@@ -19,7 +19,8 @@ type Crawler struct {
 	Sleep   time.Duration
 	Limit   uint32
 	DB      *badger.DB
-	DataDir string
+
+	urlSet storage.URLSet
 
 	wg    *sync.WaitGroup
 	queue chan *PageRequest
@@ -44,7 +45,7 @@ func WithDB(db *badger.DB) Option           { return func(c *Crawler) { c.DB = d
 func WithQueue(ch chan *PageRequest) Option { return func(c *Crawler) { c.queue = ch } }
 func WithSkipChan(ch chan *url.URL) Option  { return func(c *Crawler) { c.skip = ch } }
 func WithQueueSize(n int) Option            { return func(c *Crawler) { c.queue = make(chan *PageRequest, n) } }
-func WithDataDir(d string) Option           { return func(c *Crawler) { c.DataDir = d } }
+func WithURLSet(set storage.URLSet) Option  { return func(c *Crawler) { c.urlSet = set } }
 
 func NewCrawler(opts ...Option) *Crawler {
 	c := &Crawler{
@@ -63,9 +64,6 @@ func NewCrawler(opts ...Option) *Crawler {
 	if c.queue == nil {
 		c.queue = make(chan *PageRequest)
 	}
-	if c.DataDir == "" {
-		c.DataDir = "./crawler"
-	}
 	if c.DB == nil {
 		// Try not to do this, keeping this in memory will be a nightmare
 		opts := badger.DefaultOptions("")
@@ -73,8 +71,8 @@ func NewCrawler(opts ...Option) *Crawler {
 		opts.Logger = nil
 		c.DB, _ = badger.Open(opts)
 	}
-	if _, err := os.Stat(c.DataDir); os.IsNotExist(err) {
-		os.Mkdir(c.DataDir, 0744)
+	if c.urlSet == nil {
+		c.urlSet = storage.NewBadgerURLSet(c.DB)
 	}
 	return c
 }
@@ -95,7 +93,7 @@ Loop:
 	for {
 		select {
 		case u := <-c.skip:
-			c.markvisited(*u)
+			c.urlSet.Put(u)
 		case hostname := <-c.finished:
 			log.WithField("hostname", hostname).Debug("got finished signal")
 			c.mu.Lock()
@@ -214,15 +212,12 @@ func deleteAndCloseSpider(spiders map[string]*spider, hostname string) error {
 func (c *Crawler) wasVisited(u *url.URL) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	seen, err := c.urlSeen(*u)
-	if err != nil {
-		log.WithError(err).Error("could not access visited url set")
-	}
-	if seen {
+	if c.urlSet.Has(u) {
 		return true
 	}
-	if err = c.markvisited(*u); err != nil {
-		log.WithError(err).Error("could not access visited url set")
+	err := c.urlSet.Put(u)
+	if err != nil {
+		log.WithError(err).Error("could not access url set")
 	}
 	return false
 }
@@ -248,40 +243,6 @@ func (c *Crawler) getOrLaunchSpider(ctx context.Context, host string, sem *semap
 	return spider
 }
 
-func (c *Crawler) urlSeen(u url.URL) (bool, error) {
-	ok := false
-	u.Fragment = ""
-
-	key := urlKey(&u)
-	err := c.DB.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(key)
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if item.IsDeletedOrExpired() {
-			return nil
-		}
-		ok = true
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	return ok, nil
-}
-
-func (c *Crawler) markvisited(u url.URL) error {
-	u.Fragment = ""
-
-	key := urlKey(&u)
-	return c.DB.Update(func(txn *badger.Txn) error {
-		return txn.Set(key, []byte{1})
-	})
-}
-
 func urlKey(u *url.URL) []byte {
 	s := u.String()
 	key := make([]byte, 8, len(s)+8)
@@ -304,46 +265,6 @@ func (c *Crawler) newSpider(host string, sem *semaphore.Weighted) *spider {
 		close:    func() {},
 		q:        NewPageQueue(db, []byte(host)),
 	}
-}
-
-type visitedSet struct {
-	db *badger.DB
-}
-
-func (vs *visitedSet) Has(u *url.URL) bool {
-	var l = *u
-	ok := false
-	l.Fragment = ""
-
-	key := urlKey(&l)
-	err := vs.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(key)
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if item.IsDeletedOrExpired() {
-			return nil
-		}
-		ok = true
-		return nil
-	})
-	if err != nil {
-		return false
-	}
-	return ok
-}
-
-func (vs *visitedSet) Put(u *url.URL) error {
-	var l = *u
-	l.Fragment = ""
-
-	key := urlKey(&l)
-	return vs.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(key, []byte{1})
-	})
 }
 
 type NoOpVisitor struct{}

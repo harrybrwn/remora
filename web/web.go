@@ -62,3 +62,11 @@ func GetRobotsTxT(host string) (*robotstxt.RobotsData, error) {
 	}
 	return robotstxt.FromStatusAndBytes(resp.StatusCode, b)
 }
+
+// RequestQueue is a queue for pages
+type RequestQueue interface {
+	Enqueue(*PageRequest) error
+	Dequeue() (*PageRequest, error)
+	Close() error
+	Size() int64
+}

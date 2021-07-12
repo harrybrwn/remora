@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package web;
+
+option go_package = "github.com/harrybrwn/diktyo/web";
+
+message PageRequest {
+    string URL   = 1;
+    bytes  key   = 2;
+    uint32 depth = 3;
+    int32  retry = 4;
+}

@@ -4,6 +4,7 @@ package pb
 
 import (
 	context "context"
+	web "github.com/harrybrwn/diktyo/web"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -17,8 +18,8 @@ const _ = grpc.SupportPackageIsVersion6
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type PageFetcherClient interface {
-	Links(ctx context.Context, in *PageRequest, opts ...grpc.CallOption) (*PageResponse, error)
-	Enqueue(ctx context.Context, in *PageRequest, opts ...grpc.CallOption) (*Response, error)
+	Links(ctx context.Context, in *web.PageRequest, opts ...grpc.CallOption) (*PageResponse, error)
+	Enqueue(ctx context.Context, in *web.PageRequest, opts ...grpc.CallOption) (*Response, error)
 }
 
 type pageFetcherClient struct {
@@ -29,7 +30,7 @@ func NewPageFetcherClient(cc grpc.ClientConnInterface) PageFetcherClient {
 	return &pageFetcherClient{cc}
 }
 
-func (c *pageFetcherClient) Links(ctx context.Context, in *PageRequest, opts ...grpc.CallOption) (*PageResponse, error) {
+func (c *pageFetcherClient) Links(ctx context.Context, in *web.PageRequest, opts ...grpc.CallOption) (*PageResponse, error) {
 	out := new(PageResponse)
 	err := c.cc.Invoke(ctx, "/pb.PageFetcher/links", in, out, opts...)
 	if err != nil {
@@ -38,7 +39,7 @@ func (c *pageFetcherClient) Links(ctx context.Context, in *PageRequest, opts ...
 	return out, nil
 }
 
-func (c *pageFetcherClient) Enqueue(ctx context.Context, in *PageRequest, opts ...grpc.CallOption) (*Response, error) {
+func (c *pageFetcherClient) Enqueue(ctx context.Context, in *web.PageRequest, opts ...grpc.CallOption) (*Response, error) {
 	out := new(Response)
 	err := c.cc.Invoke(ctx, "/pb.PageFetcher/enqueue", in, out, opts...)
 	if err != nil {
@@ -51,8 +52,8 @@ func (c *pageFetcherClient) Enqueue(ctx context.Context, in *PageRequest, opts .
 // All implementations must embed UnimplementedPageFetcherServer
 // for forward compatibility
 type PageFetcherServer interface {
-	Links(context.Context, *PageRequest) (*PageResponse, error)
-	Enqueue(context.Context, *PageRequest) (*Response, error)
+	Links(context.Context, *web.PageRequest) (*PageResponse, error)
+	Enqueue(context.Context, *web.PageRequest) (*Response, error)
 	mustEmbedUnimplementedPageFetcherServer()
 }
 
@@ -60,10 +61,10 @@ type PageFetcherServer interface {
 type UnimplementedPageFetcherServer struct {
 }
 
-func (*UnimplementedPageFetcherServer) Links(context.Context, *PageRequest) (*PageResponse, error) {
+func (*UnimplementedPageFetcherServer) Links(context.Context, *web.PageRequest) (*PageResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Links not implemented")
 }
-func (*UnimplementedPageFetcherServer) Enqueue(context.Context, *PageRequest) (*Response, error) {
+func (*UnimplementedPageFetcherServer) Enqueue(context.Context, *web.PageRequest) (*Response, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Enqueue not implemented")
 }
 func (*UnimplementedPageFetcherServer) mustEmbedUnimplementedPageFetcherServer() {}
@@ -73,7 +74,7 @@ func RegisterPageFetcherServer(s *grpc.Server, srv PageFetcherServer) {
 }
 
 func _PageFetcher_Links_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PageRequest)
+	in := new(web.PageRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -85,13 +86,13 @@ func _PageFetcher_Links_Handler(srv interface{}, ctx context.Context, dec func(i
 		FullMethod: "/pb.PageFetcher/Links",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PageFetcherServer).Links(ctx, req.(*PageRequest))
+		return srv.(PageFetcherServer).Links(ctx, req.(*web.PageRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
 func _PageFetcher_Enqueue_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PageRequest)
+	in := new(web.PageRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -103,7 +104,7 @@ func _PageFetcher_Enqueue_Handler(srv interface{}, ctx context.Context, dec func
 		FullMethod: "/pb.PageFetcher/Enqueue",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PageFetcherServer).Enqueue(ctx, req.(*PageRequest))
+		return srv.(PageFetcherServer).Enqueue(ctx, req.(*web.PageRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }

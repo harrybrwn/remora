@@ -2,7 +2,9 @@ syntax = "proto3";
 
 package pb;
 
-option go_package = "github.com/harrybrwb/diktyo/web/pb";
+import "page_request.proto";
+
+option go_package = "github.com/harrybrwn/diktyo/web/pb";
 
 enum Status {
     Ok = 0;
@@ -13,13 +15,6 @@ enum Status {
 message Response {
     Status status  = 1;
     string message = 2;
-}
-
-message PageRequest {
-    string URL   = 1;
-    bytes  key   = 2;
-    uint32 depth = 3;
-    int32  retry = 4;
 }
 
 message PageResponse {
@@ -47,6 +42,6 @@ message Page {
 message None { }
 
 service PageFetcher {
-    rpc links(PageRequest) returns (PageResponse) {}
-    rpc enqueue(PageRequest) returns (Response) {}
+    rpc links(web.PageRequest) returns (PageResponse) {}
+    rpc enqueue(web.PageRequest) returns (Response) {}
 }

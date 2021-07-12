@@ -32,11 +32,11 @@ func newvis() *vis {
 }
 
 func TestCrawler(t *testing.T) {
-	t.Skip()
 	var (
 		v = newvis()
 		n int64
 	)
+	t.Skip()
 	log.SetLevel(logrus.FatalLevel)
 	v.filter = func(p *PageRequest, u *url.URL) error { return nil }
 	v.visit = func(ctx context.Context, p *Page) { atomic.AddInt64(&n, 1) }
@@ -115,14 +115,11 @@ func TestVisitedSet(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = c.markvisited(*u)
+		c.urlSet.Put(u)
 		if err != nil {
 			t.Fatal(err)
 		}
-		ok, err := c.urlSeen(*u)
-		if err != nil {
-			t.Fatal(err)
-		}
+		ok := c.urlSet.Has(u)
 		if !ok {
 			t.Errorf("url %q should be marked as visited", l)
 		}

@@ -3,7 +3,9 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,19 +15,20 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/harrybrwn/diktyo/web/pb"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
 
-//go:generate protoc -I../protobuf --go_out=paths=source_relative:./pb --go-grpc_out=paths=source_relative:./pb ../protobuf/page.proto
+//go:generate protoc -I.. -I../protobuf --go_out=paths=source_relative:./pb --go-grpc_out=paths=source_relative:./pb page.proto
+
+// go:generate protoc -I../protobuf --go_out=paths=source_relative:. ../protobuf/page_request.proto
 
 var (
-	HttpClient = http.DefaultClient
+	HttpClient = &http.Client{
+		Timeout: time.Minute,
+	}
 )
-
-type PageRequest = pb.PageRequest
 
 func NewPage(u *url.URL, depth uint32) *Page {
 	return &Page{
@@ -44,9 +47,13 @@ func NewPageFromString(link string, depth uint32) *Page {
 }
 
 func NewPageRequest(u *url.URL, depth uint32) *PageRequest {
+	s := u.String()
+	h := fnv.New128()
+	io.WriteString(h, s)
 	return &PageRequest{
-		URL:   u.String(),
+		URL:   s,
 		Depth: depth,
+		Key:   h.Sum(nil),
 	}
 }
 
@@ -56,6 +63,10 @@ func ParsePageRequest(link string, depth uint32) *PageRequest {
 		return nil
 	}
 	return NewPageRequest(u, depth)
+}
+
+func (req *PageRequest) HexKey() string {
+	return hex.EncodeToString(req.Key)
 }
 
 // Page holds metadata for a webpage
@@ -130,7 +141,7 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		return nil
 	}
 	doc := goquery.NewDocumentFromNode(root)
-	// p.Doc = doc
+	p.Doc = doc
 	p.Title = getTitle(doc)
 	p.Encoding = getCharset(doc)
 	var e error
