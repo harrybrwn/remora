@@ -2,6 +2,7 @@ package queue
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"sync"
@@ -265,6 +266,60 @@ func TestCloseQueue(t *testing.T) {
 	wg.Wait()
 }
 
-func eatb(_ []byte, e error) error {
-	return e
+func randomkeys(n int) [][]byte {
+	keys := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		keys[i] = make([]byte, 32)
+		_, err := rand.Read(keys[i])
+		if err != nil {
+			panic(err)
+		}
+	}
+	return keys
 }
+
+func TestRandomKeys(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		q    = q(t)
+		keys = randomkeys(512 * 2)
+		l    = len(keys)
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < l; i++ {
+			for _, fn := range []func() ([]byte, error){
+				q.Peek,
+				q.Pop,
+			} {
+				res, err := fn()
+				if err != nil {
+					t.Error(err)
+					continue
+				}
+				mu.Lock()
+				if !bytes.Equal(res, keys[i]) {
+					t.Errorf("expected %s, got %s", keys[i], res)
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < l; i++ {
+			mu.Lock()
+			k := keys[i]
+			mu.Unlock()
+			err := q.Put(k)
+			if err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func eatb(_ []byte, e error) error { return e }

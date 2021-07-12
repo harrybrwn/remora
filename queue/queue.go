@@ -38,7 +38,6 @@ func New(db *badger.DB, prefix []byte) Queue {
 	q := &queue{
 		db:     db,
 		prefix: prefix,
-		mu:     &mu,
 		empty:  sync.NewCond(&mu),
 		closed: 0,
 	}
@@ -49,7 +48,6 @@ type queue struct {
 	db     *badger.DB
 	prefix []byte
 
-	mu     *sync.Mutex
 	empty  *sync.Cond
 	closed uint32
 
@@ -58,8 +56,10 @@ type queue struct {
 }
 
 type node struct {
-	Key, Val, Next []byte
-	Count          int64
+	Key   []byte
+	Val   []byte
+	Next  []byte
+	Count int64
 }
 
 func (q *queue) Close() error {
@@ -89,8 +89,8 @@ func (q *queue) Put(data []byte) error {
 // PutKey will put a new value at the back of the queue by storing
 // some value using the given key in the queue backend.
 func (q *queue) PutKey(key, value []byte) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.empty.L.Lock()
+	defer q.empty.L.Unlock()
 	if q.isClosed() {
 		return ErrQueueClosed
 	}
@@ -143,8 +143,8 @@ Success:
 }
 
 func (q *queue) Pop() ([]byte, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.empty.L.Lock()
+	defer q.empty.L.Unlock()
 	q.waitSig() // halt if the stack is empty, continue on put event
 	if q.isClosed() {
 		return nil, ErrQueueClosed
@@ -168,9 +168,33 @@ func (q *queue) Pop() ([]byte, error) {
 	return node.Val, nil
 }
 
+func (q *queue) Peek() ([]byte, error) {
+	q.empty.L.Lock()
+	defer q.empty.L.Unlock()
+	q.waitSig() // halt if the stack is empty, continue on put event
+	if q.isClosed() {
+		return nil, ErrQueueClosed
+	}
+	node := &node{Key: q.head}
+	err := q.db.Update(func(txn *badger.Txn) error {
+		err := getNode(node, txn)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if node.Val == nil {
+		return bytes.TrimPrefix(node.Key, q.prefix), nil
+	}
+	return node.Val, nil
+}
+
 func (q *queue) Size() int64 {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.empty.L.Lock()
+	defer q.empty.L.Unlock()
 	return q.size
 }
 
@@ -182,6 +206,7 @@ func getNode(n *node, txn *badger.Txn) error {
 	return item.Value(func(val []byte) error {
 		return json.Unmarshal(val, n)
 	})
+	// return getNodeGob(n, txn)
 }
 
 func putNode(n *node, txn *badger.Txn) error {
@@ -190,6 +215,7 @@ func putNode(n *node, txn *badger.Txn) error {
 		return err
 	}
 	return txn.Set(n.Key, raw)
+	// return putNodeGob(n, txn)
 }
 
 func getNodeGob(n *node, txn *badger.Txn) error {
