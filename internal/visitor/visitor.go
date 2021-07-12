@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -24,12 +25,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const Timed = false
+const Timed = true
 
 var (
-	log *logrus.Logger = logrus.New()
-
+	log      *logrus.Logger = logrus.New()
 	hostname string
+
+	Verbose = false
 )
 
 func init() {
@@ -45,7 +47,7 @@ func SetLogger(l *logrus.Logger) { log = l }
 func New(db *sql.DB) *Visitor {
 	return &Visitor{
 		db:    db,
-		hosts: make(map[string]struct{}),
+		Hosts: make(map[string]struct{}),
 	}
 }
 
@@ -54,26 +56,36 @@ func AddHost(v web.Visitor, host ...string) {
 }
 
 func AddHosts(v web.Visitor, hosts []string) {
-	vis, ok := v.(*Visitor)
-	if !ok {
+	switch vis := v.(type) {
+	case *Visitor:
+		for _, h := range hosts {
+			vis.Hosts[h] = struct{}{}
+		}
+	case *FSVisitor:
+		for _, h := range hosts {
+			vis.Hosts[h] = struct{}{}
+		}
+	default:
 		panic("cannot add hosts to this visitor")
-	}
-
-	for _, h := range hosts {
-		vis.hosts[h] = struct{}{}
 	}
 }
 
 type Visitor struct {
 	db      *sql.DB
 	mu      sync.Mutex
-	hosts   map[string]struct{}
+	Hosts   map[string]struct{}
 	Visited int64
+}
+
+type stats struct {
+	page    time.Duration
+	edge    time.Duration
+	edgeDel time.Duration
 }
 
 func (v *Visitor) Filter(p *web.PageRequest, u *url.URL) error {
 	v.mu.Lock()
-	_, ok := v.hosts[u.Host]
+	_, ok := v.Hosts[u.Host]
 	v.mu.Unlock()
 	if ok {
 		return nil
@@ -91,15 +103,20 @@ func (v *Visitor) Visit(ctx context.Context, page *web.Page) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if page.Status != 200 {
+		logVisit(page, v.Visited) // only handles logging
+	} else if Verbose {
+		logVisit(page, v.Visited)
+	}
 	v.record(ctx, page)
 	atomic.AddInt64(&v.Visited, 1)
-	logVisit(page) // only handles logging
 }
 
-func logVisit(page *web.Page) {
+func logVisit(page *web.Page, n int64) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 	l := log.WithFields(logrus.Fields{
+		"n":        n,
 		"depth":    page.Depth,
 		"status":   page.Status,
 		"hostname": hostname,
@@ -107,12 +124,12 @@ func logVisit(page *web.Page) {
 	}).WithFields(memoryLogs(&mem))
 	var info = l.Debugf
 	if page.Status >= 300 {
-		info = l.Tracef
+		info = l.Warnf
 	}
 	info("page{%s}", page.URL)
 }
 
-const insertPageSQL = `
+var insertPageSQL = `
 INSERT INTO page (
 	id,
 	url,
@@ -152,9 +169,30 @@ ON CONFLICT (id)
 		keywords        = to_tsvector($13) || to_tsvector($14),
 		chr_encoding    = $15`
 
+func init() {
+	insertPageSQL = strings.Replace(insertPageSQL, "\t", " ", -1)
+	insertPageSQL = strings.Replace(insertPageSQL, "\n", " ", -1)
+
+	pat, err := regexp.Compile("[ ]+")
+	if err != nil {
+		panic(err)
+	}
+	insertPageSQL = pat.ReplaceAllString(insertPageSQL, " ")
+	insertPageSQL = strings.Replace(insertPageSQL, " = ", "=", -1)
+	insertPageSQL = strings.Replace(insertPageSQL, "( ", "(", -1)
+	insertPageSQL = strings.Replace(insertPageSQL, " )", ")", -1)
+	insertPageSQL = strings.Replace(insertPageSQL, ", ", ",", -1)
+}
+
 func (v *Visitor) record(ctx context.Context, page *web.Page) {
-	var pageurl = page.URL.String()
-	tx, err := v.db.BeginTx(ctx, nil)
+	var (
+		pageurl = page.URL.String()
+		start   = time.Now()
+	)
+	tx, err := v.db.BeginTx(ctx, &sql.TxOptions{
+		ReadOnly:  false,
+		Isolation: sql.LevelRepeatableRead,
+	})
 	if err != nil {
 		log.WithError(err).Error("could not create transaction")
 		return
@@ -182,9 +220,10 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 	io.WriteString(h, pageurl)
 	id := h.Sum(nil)
 
-	var p, e time.Duration
-
-	var wg sync.WaitGroup
+	var (
+		wg    sync.WaitGroup
+		stats stats
+	)
 	wg.Add(2)
 	go func() {
 		a := time.Now()
@@ -193,28 +232,33 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 		if err != nil {
 			return
 		}
-		p = time.Since(a)
+		stats.page = time.Since(a)
 	}()
 	go func() {
-		a := time.Now()
 		defer wg.Done()
-		err = insertEdges(ctx, tx, h, id, page)
+		err = insertEdges(ctx, tx, h, id, page, &stats)
 		if err != nil {
 			return
 		}
-		e = time.Since(a)
 	}()
 	wg.Wait()
 	if Timed {
 		log.WithFields(logrus.Fields{
-			"page":  p,
-			"edges": e,
-			"links": len(page.Links),
+			"page":     stats.page,
+			"edges":    stats.edge,
+			"edge_del": stats.edgeDel,
+			"links":    len(page.Links),
+			"response": page.ResponseTime,
+			"0-total":  time.Since(start) + page.ResponseTime,
 		}).Info("done with visit")
 	}
 }
 
-func insertPage(ctx context.Context, tx *sql.Tx, id []byte, page *web.Page) error {
+type execerCtx interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page) error {
 	select {
 	case <-ctx.Done():
 		return nil
@@ -234,7 +278,7 @@ func insertPage(ctx context.Context, tx *sql.Tx, id []byte, page *web.Page) erro
 		err = nil
 	}
 
-	_, err = tx.ExecContext(ctx, insertPageSQL,
+	_, err = handle.ExecContext(ctx, insertPageSQL,
 		id,
 		pageurl,
 		pq.Array(urlStrings(page.Links)),
@@ -267,7 +311,7 @@ func insertPage(ctx context.Context, tx *sql.Tx, id []byte, page *web.Page) erro
 	return nil
 }
 
-func insertEdges(ctx context.Context, tx *sql.Tx, h hash.Hash, id []byte, page *web.Page) error {
+func insertEdges(ctx context.Context, tx *sql.Tx, h hash.Hash, id []byte, page *web.Page, stats *stats) error {
 	select {
 	case <-ctx.Done():
 		return nil
@@ -275,7 +319,9 @@ func insertEdges(ctx context.Context, tx *sql.Tx, h hash.Hash, id []byte, page *
 	}
 	pageurl := page.URL.String()
 
+	now := time.Now()
 	_, err := tx.ExecContext(ctx, "DELETE FROM edge WHERE parent_id = $1", id)
+	stats.edgeDel = time.Since(now)
 	switch err {
 	case nil, sql.ErrTxDone, sqldriver.ErrBadConn:
 		break
@@ -291,10 +337,12 @@ func insertEdges(ctx context.Context, tx *sql.Tx, h hash.Hash, id []byte, page *
 
 	links := filterOutURL(pageurl, page.Links)
 	if len(links) > 0 {
+		now = time.Now()
 		edgeBuf, edgeValues := insertEdgesQuery(id, pageurl, links)
 		query := edgeBuf.String()
 		// Exec is the bottleneck here!
 		_, err = tx.ExecContext(ctx, query, edgeValues...)
+		stats.edge = time.Since(now)
 		switch err {
 		case nil, context.Canceled, sqldriver.ErrBadConn:
 			break
@@ -314,7 +362,7 @@ func insertEdgesQuery(id []byte, pageurl string, links []string) (*bytes.Buffer,
 		nlinks = len(links) - 1
 		h      = fnv.New128()
 	)
-	io.WriteString(&buf, "INSERT INTO edge (parent_id,child_id,child) VALUES ")
+	io.WriteString(&buf, "INSERT INTO edge(parent_id,child_id,child)VALUES ")
 	for i, l := range links {
 		h.Reset()
 		io.WriteString(h, l)
@@ -325,7 +373,7 @@ func insertEdgesQuery(id []byte, pageurl string, links []string) (*bytes.Buffer,
 			buf.Write([]byte{','})
 		}
 	}
-	io.WriteString(&buf, ` ON CONFLICT (parent_id,child_id,child) DO NOTHING`)
+	io.WriteString(&buf, ` ON CONFLICT(parent_id,child_id,child)DO NOTHING`)
 	return &buf, values
 }
 
