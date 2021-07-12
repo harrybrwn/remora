@@ -27,3 +27,4 @@ COPY --from=builder /app/bin /usr/bin
 RUN mkdir -p -m 3777 /var/local/diktyo
 
 WORKDIR /
+ENTRYPOINT ["remora"]

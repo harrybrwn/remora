@@ -9,10 +9,12 @@
 /.dockerignore
 /deployment.yml
 
+# Notes
 /TODO
 *.md
 *.log
 *.dump
+*.pdf
 /db/data/
 
 # Bin
@@ -23,19 +25,19 @@
 # Scripts
 /scripts/
 /cmd/docker/
-/cmd/frontier/
 /cmd/deploy
+/Makefile
 /psql
 /test
-/Makefile
 **/*.sh
 **/*.sql
 
 # Tests
 **/*_test.go
 /web/testdata/
+/crawl-output
 
 # Deployment Code
 deployment.yml
-cmd/deploy
-cmd/docker
+/cmd/deploy
+/cmd/docker

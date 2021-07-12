@@ -36,3 +36,5 @@ notes.*
 /db/data
 /_queue
 *.dump
+
+crawl-output

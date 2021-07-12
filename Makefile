@@ -2,6 +2,7 @@
 SOURCES=
 GOFLAGS=
 MAIN=./cmd/remora
+GENERATED=web/pb/page.pb.go web/pb/page_grpc.pb.go
 
 all: bin/remora bin/deinopis bin/deploy bin/docker
 
@@ -26,7 +27,7 @@ install: bin/remora bin/deinopis
 	install ./bin/remora ~/dev/go/bin/remora
 	install ./bin/deinopis ~/dev/go/bin/deinopis
 
-gen:
+gen: $(GENERATED)
 	@if [ ! -d web/pb ]; then mkdir web/pb; fi
 	@if [ ! -d frontier/pb ]; then mkdir frontier/pb; fi
 	go generate ./web
@@ -63,4 +64,4 @@ clean:
 	$(RM) ./remora ./deinopis
 	$(RM) -r ./bin
 
-.PHONY: install build gen clean up down
+.PHONY: install build clean up down
