@@ -365,17 +365,16 @@ func uploadToVolume(ctx context.Context, dk *multiDocker, volumes []*volumeData)
 				Name: vol.Volume.Name,
 			})
 			if err != nil {
-				log.Println(err)
-				continue
+				return err
 			}
+
 			volume := fmt.Sprintf("%s:/data", v.Name)
-			containerCfg := &container.Config{
-				Image:   "busybox",
-				Volumes: map[string]struct{}{volume: {}},
-			}
 			container, err := c.ContainerCreate(
 				ctx,
-				containerCfg,
+				&container.Config{
+					Image:   "busybox",
+					Volumes: map[string]struct{}{volume: {}},
+				},
 				&container.HostConfig{
 					Binds: []string{volume},
 					// AutoRemove: true,
@@ -394,15 +393,6 @@ func uploadToVolume(ctx context.Context, dk *multiDocker, volumes []*volumeData)
 			defer c.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{
 				RemoveVolumes: false,
 			})
-			// content, err := io.ReadAll(vol)
-			// if err != nil {
-			// 	return err
-			// }
-			// var buf bytes.Buffer
-			// if _, err = buf.Write(content); err != nil {
-			// 	return err
-			// }
-
 			err = c.CopyToContainer(
 				ctx,
 				container.ID,

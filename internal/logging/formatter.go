@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 // PrefixedFormatter is a logging text formatter that logs with a prefix
@@ -18,10 +21,14 @@ type PrefixedFormatter struct {
 	Prefix           string
 	TimeFormat       string
 	MaxMessageLength int
+	NoColor          bool
 
 	mu          sync.Mutex
 	maxFieldLen map[string]int
 	maxMsgLen   int
+	format      string
+
+	init sync.Once
 }
 
 func NewPrefixedFormatter(prefix, timeFormat string) *PrefixedFormatter {
@@ -33,6 +40,7 @@ func NewPrefixedFormatter(prefix, timeFormat string) *PrefixedFormatter {
 		TimeFormat:       timeFormat,
 		maxFieldLen:      make(map[string]int),
 		MaxMessageLength: 250,
+		format:           "",
 	}
 }
 
@@ -60,11 +68,6 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	levelStr := strings.ToUpper(e.Level.String())
 	var b bytes.Buffer
 
-	timeFormat := pf.TimeFormat
-	if timeFormat == "" {
-		timeFormat = time.RFC3339
-	}
-
 	msglen := len(e.Message)
 	pf.mu.Lock()
 	if msglen > pf.MaxMessageLength {
@@ -75,13 +78,31 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	}
 	pf.mu.Unlock()
 
-	format := "\x1b[90m[%s]\x1b[0m \x1b[%dm%-7s\x1b[0m %s: %s"
-	if pf.Prefix == "" {
-		format = "\x1b[90m[%s]\x1b[0m \x1b[%dm%-7s\x1b[0m %s%s"
-	}
+	pf.init.Do(func() {
+		if isTerm(e.Logger.Out) {
+			pf.NoColor = true
+		}
+		if pf.TimeFormat == "" {
+			pf.TimeFormat = time.RFC3339
+		}
+		if pf.NoColor {
+			if pf.Prefix == "" {
+				pf.format = "[%[1]s] %-7[3]s %[4]s%[5]s"
+			} else {
+				pf.format = "[%[1]s] %-7[3]s %[4]s: %[5]s"
+			}
+		} else {
+			if pf.Prefix == "" {
+				pf.format = "\x1b[90m[%s]\x1b[0m \x1b[%dm%-7s\x1b[0m %s%s"
+			} else {
+				pf.format = "\x1b[90m[%s]\x1b[0m \x1b[%dm%-7s\x1b[0m %s: %s"
+			}
+		}
+	})
+
 	pf.mu.Lock()
-	fmt.Fprintf(&b, format,
-		e.Time.Format(timeFormat), col, levelStr, pf.Prefix, e.Message)
+	fmt.Fprintf(&b, pf.format,
+		e.Time.Format(pf.TimeFormat), col, levelStr, pf.Prefix, e.Message)
 	fmt.Fprint(&b, strings.Repeat(" ", pf.maxMsgLen-msglen))
 	pf.mu.Unlock()
 
@@ -104,6 +125,15 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 		b.WriteByte('\n')
 	}
 	return b.Bytes(), nil
+}
+
+func isTerm(w io.Writer) bool {
+	switch v := w.(type) {
+	case *os.File:
+		return terminal.IsTerminal(int(v.Fd()))
+	default:
+		return false
+	}
 }
 
 // SilentFormatter is a logrus formatter that does nothing
