@@ -44,9 +44,9 @@ type Config struct {
 
 func (c *Config) Bind(flag *flag.FlagSet) {
 	flag.Int64Var(&c.QueueSize, "queue", c.QueueSize, "Size of the main queue")
-	flag.StringArrayVarP(&c.AllowedHosts, "allowed-hosts", "a", c.AllowedHosts,
-		"A list of hosts that the crawler is allowed to "+
-			"visit. The host of seed urls are added implicitly")
+	// flag.StringArrayVarP(&c.AllowedHosts, "allowed-hosts", "a", c.AllowedHosts,
+	// 	"A list of hosts that the crawler is allowed to "+
+	// 		"visit. The host of seed urls are added implicitly")
 	flag.DurationVar(&c.Sleep, "sleep", c.Sleep, "Sleep time for each spider request")
 	flag.UintVar(&c.Depth, "depth", c.Depth, "Crawler depth limit")
 	// flag.StringVar(&c.Profile, "profile", "", "config profile to use for the crawler")

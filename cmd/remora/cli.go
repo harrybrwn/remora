@@ -78,10 +78,6 @@ func newEnqueueCmd(conf *cmd.Config) *cobra.Command {
 }
 
 func newRedisCmd(conf *cmd.Config) *cobra.Command {
-	c := &cobra.Command{
-		Use:   "redis",
-		Short: "Manage the redis database",
-	}
 	newclient := func() (*redis.Client, error) {
 		client := redis.NewClient(conf.RedisOpts())
 		if err := client.Ping().Err(); err != nil {
@@ -90,9 +86,24 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 		}
 		return client, nil
 	}
+	c := &cobra.Command{
+		Use:   "redis",
+		Short: "Manage the redis database",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newclient()
+			if err != nil {
+				fmt.Println("could not connect to redis")
+				return nil
+			}
+			fmt.Println("redis connected.")
+			return c.Close()
+		},
+	}
+
 	c.AddCommand(
 		&cobra.Command{
 			Use: "list", Aliases: []string{"l"},
+			SilenceUsage: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				client, err := newclient()
 				if err != nil {
@@ -109,6 +120,7 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 				return nil
 			},
 		},
+
 		&cobra.Command{
 			Use:  "get",
 			Args: cobra.MinimumNArgs(1),
@@ -126,6 +138,7 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 				return nil
 			},
 		},
+
 		&cobra.Command{
 			Use: "delete", Aliases: []string{"del"},
 			Args: cobra.MinimumNArgs(1),
@@ -135,7 +148,6 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 					return err
 				}
 				defer cli.Close()
-
 				for _, k := range args {
 					err = cli.Del(k).Err()
 					if err != nil {
@@ -247,16 +259,32 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 	}
 	defer ch.Close()
 
-	const exchange = "page"
-	err = ch.ExchangeDeclare(exchange, "topic", true, false, false, false, nil)
+	err = frontier.DeclarePageExchange(ch)
 	if err != nil {
 		log.WithError(err).Error("could not declare exchange")
 		return err
 	}
 
+	front := frontier.Frontier{
+		Exchange: frontier.Exchange{
+			Name:    frontier.PageExchangeName,
+			Kind:    "topic",
+			Durable: true,
+		},
+	}
+	err = front.Connect(frontier.Connect{Host: conf.Host, Port: conf.Port})
+	if err != nil {
+		return err
+	}
+	defer front.Close()
+	publisher, err := front.Publisher()
+	if err != nil {
+		return err
+	}
+
 	wg.Add(len(seeds))
 	for _, seed := range seeds {
-		req := web.PageRequest{URL: seed, Depth: 0}
+		req := web.ParsePageRequest(seed, 0)
 		go func() {
 			defer wg.Done()
 			u, err := url.Parse(req.URL)
@@ -264,29 +292,33 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 				log.WithError(err).Error("could not parse seed url")
 				return
 			}
-			q, err := frontier.DeclareHostQueue(ch, u.Host)
-			if err != nil {
-				log.WithError(err).Errorf("could not declare queue for %q", u.Host)
-				return
-			}
+			// q, err := frontier.DeclareHostQueue(ch, u.Host)
+			// if err != nil {
+			// 	log.WithError(err).Errorf("could not declare queue for %q", u.Host)
+			// 	return
+			// }
 
-			rawreq, err := proto.Marshal(&req)
+			rawreq, err := proto.Marshal(req)
 			if err != nil {
 				log.WithError(err)
 				return
 			}
-			err = ch.Publish(
-				"",
-				// "any",
-				q.Name,
-				false, false,
-				amqp.Publishing{
-					Body:         rawreq,
-					DeliveryMode: amqp.Persistent,
-					ContentType:  "application/vnd.google.protobuf",
-					Priority:     0,
-				},
-			)
+			msg := amqp.Publishing{
+				Body:         rawreq,
+				DeliveryMode: amqp.Persistent,
+				ContentType:  "application/vnd.google.protobuf",
+				Type:         frontier.PageRequest.String(),
+				Priority:     0,
+			}
+			// err = ch.Publish(
+			// 	"",
+			// 	// "any",
+			// 	q.Name,
+			// 	false, false,
+			// 	msg,
+			// )
+			fmt.Println(u.Host)
+			err = publisher.Publish(u.Host, msg)
 			// err = frontier.PushRequestToHost(ch, &req, q.Name)
 			if err != nil {
 				log.WithError(err).Error("could not publish url request")

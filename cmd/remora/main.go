@@ -13,11 +13,14 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
+	"github.com/go-redis/redis"
 	"github.com/harrybrwn/config"
 	"github.com/harrybrwn/diktyo/cmd"
 	"github.com/harrybrwn/diktyo/db"
+	"github.com/harrybrwn/diktyo/frontier"
 	"github.com/harrybrwn/diktyo/internal/logging"
 	"github.com/harrybrwn/diktyo/internal/visitor"
+	"github.com/harrybrwn/diktyo/storage"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
@@ -55,8 +58,12 @@ func main() {
 	}
 	initLogger(lvl)
 	web.RetryLimit = 0
+
 	cmd := NewCLIRoot(&conf)
-	err = cmd.Execute()
+	conf.Bind(cmd.PersistentFlags())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	err = cmd.ExecuteContext(ctx)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -66,7 +73,21 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "remora",
 		Short: "The internet's symbiotic web crawler",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			lvl, err := logrus.ParseLevel(conf.LogLevel)
+			if err != nil {
+				log.WithError(err).Warn("could not parse log level")
+				return nil
+			}
+			log.SetLevel(lvl)
+			return nil
+		},
 	}
+	c.PersistentFlags().StringVar(&conf.LogLevel, "loglevel", conf.LogLevel, "set log level")
+	// c.PersistentFlags().UintVar(&conf.Depth, "depth", conf.Depth, "set the crawl depth limit (0 for no limit)")
+	// conf.Bind(c.PersistentFlags())
+
+	crawlFlags := crawlFlags{}
 	crawlCmd := &cobra.Command{
 		Use:   "crawl",
 		Short: "Start a full web crawl",
@@ -79,12 +100,13 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 			// http://localhost:8080/debug/pprof
 			go http.ListenAndServe(":8080", nil)
 			go periodicMemDump(ctx, time.Minute*10)
-			return crawl(ctx, conf)
+			return crawl(ctx, conf, &crawlFlags)
 		},
 	}
-	conf.Bind(crawlCmd.Flags())
+	crawlCmd.Flags().BoolVar(&crawlFlags.redis, "redis", crawlFlags.redis, "use redis as the visited url set")
 
 	c.AddCommand(
+		newSpiderCmd(conf),
 		config.NewConfigCommand(),
 		&cobra.Command{
 			Use:   "list <url>",
@@ -106,6 +128,9 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 		&cobra.Command{
 			Use: "test", Hidden: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
+				for i := 0; i < 30; i++ {
+					log.Info(i)
+				}
 				return nil
 			},
 		},
@@ -114,7 +139,11 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func crawl(ctx context.Context, conf *cmd.Config) error {
+type crawlFlags struct {
+	redis bool
+}
+
+func crawl(ctx context.Context, conf *cmd.Config, flags *crawlFlags) error {
 	var (
 		err   error
 		start = time.Now()
@@ -137,8 +166,19 @@ func crawl(ctx context.Context, conf *cmd.Config) error {
 	}
 	defer db.Close()
 
+	var set storage.URLSet
+	if flags.redis {
+		set = storage.NewRedisURLSet(redis.NewClient(conf.RedisOpts()))
+	} else {
+		set = storage.NewBadgerURLSet(qdb)
+	}
+
 	var (
-		vis     = visitor.New(db)
+		// vis     = visitor.New(db)
+		vis = &visitor.FSVisitor{
+			Base:  "./crawl-output",
+			Hosts: make(map[string]struct{}),
+		}
 		ch      = make(chan *web.PageRequest, conf.QueueSize)
 		crawler = web.NewCrawler(
 			web.WithVisitor(vis),
@@ -146,7 +186,7 @@ func crawl(ctx context.Context, conf *cmd.Config) error {
 			web.WithQueue(ch),
 			web.WithSleep(conf.Sleep),
 			web.WithDB(qdb),
-			web.WithDataDir("/var/local/diktyo"),
+			web.WithURLSet(set),
 		)
 	)
 
@@ -215,7 +255,7 @@ func initConfig(c *cmd.Config) {
 		DataDir,
 	} {
 		if _, err = os.Stat(path); os.IsNotExist(err) {
-			err = os.MkdirAll(path, 1777)
+			err = os.MkdirAll(path, 3777)
 			if err != nil {
 				log.WithError(err).Error("could not create runtime directory")
 			}
@@ -227,9 +267,11 @@ func initLogger(lvl logrus.Level) {
 	log.SetOutput(io.Discard)
 	log.SetLevel(logrus.TraceLevel)
 	log.SetFormatter(&logging.PrefixedFormatter{
-		Prefix:           "",
-		TimeFormat:       time.RFC3339,
+		Prefix: "",
+		// TimeFormat:       time.RFC3339,
+		TimeFormat:       time.Stamp,
 		MaxMessageLength: 135,
+		// NoColor:          true,
 	})
 	logfile.Filename = "/var/local/diktyo/crawler.log"
 	log.AddHook(logging.NewLogFileHook(&logfile, &logrus.TextFormatter{
@@ -243,6 +285,7 @@ func initLogger(lvl logrus.Level) {
 	})
 	web.SetLogger(log)
 	visitor.SetLogger(log)
+	frontier.SetLogger(log)
 }
 
 func closedb(db *badger.DB) {
