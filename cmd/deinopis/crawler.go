@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"os"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/go-redis/redis"
 	"github.com/harrybrwn/diktyo/frontier"
+	"github.com/harrybrwn/diktyo/storage"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -23,36 +25,37 @@ type crawler struct {
 	wait  time.Duration
 	v     web.Visitor
 
-	conn *amqp.Connection
-	chMu sync.Mutex    // amqp channel mutex for multithreaded publishing
-	ch   *amqp.Channel // this channel if for publishing only
+	conn      *amqp.Connection
+	chMu      sync.Mutex    // amqp channel mutex for multithreaded publishing
+	publisher *amqp.Channel // this channel if for publishing only
+	sleep     chan time.Duration
 
-	visited *redis.Client
-	mu      sync.Mutex
-	robots  *robotstxt.RobotsData
+	urlset storage.URLSet
+	mu     sync.Mutex
+	robots *robotstxt.RobotsData
 
-	// Purge the visited set when the crawler is closed
-	PurgeVisited bool
-	Prefetch     int
+	Prefetch int
 }
 
-func newCrawler(conf *Config, vis web.Visitor, conn *amqp.Connection) (*crawler, error) {
+func newCrawler(host string, vis web.Visitor, conn *amqp.Connection, redis *redis.Client, conf *Config) (*crawler, error) {
 	var err error
 	c := &crawler{
-		host:  conf.Host,
-		limit: conf.Depth,
-		wait:  getWait(conf.Host, &conf.Config),
-		v:     vis,
-		conn:  conn,
+		host:     host,
+		limit:    conf.Depth,
+		wait:     getWait(host, &conf.Config),
+		sleep:    make(chan time.Duration),
+		v:        vis,
+		conn:     conn,
+		urlset:   storage.NewRedisURLSet(redis),
+		Prefetch: conf.MessageQueue.Prefetch,
 	}
 
-	c.ch, err = c.conn.Channel()
+	c.publisher, err = c.conn.Channel()
 	if err != nil {
 		c.conn.Close()
 		return nil, errors.Wrap(err, "could not open amqp channel")
 	}
 	log.Trace("message queue channel open")
-	c.visited = redis.NewClient(conf.RedisOpts())
 
 	c.robots, err = web.GetRobotsTxT(c.host)
 	if err != nil {
@@ -61,21 +64,17 @@ func newCrawler(conf *Config, vis web.Visitor, conn *amqp.Connection) (*crawler,
 		log.Trace("retrieved robots.txt")
 	}
 	if c.wait == 0 {
-		c.wait = 1 // 1 microsecond
+		c.wait = 1 // 1 microsecond bc timers fail with 0
 	}
-	return c, c.visited.Ping().Err()
+	return c, nil
 }
 
 func (c *crawler) Close() error {
-	var err error
-	if c.PurgeVisited {
-		c.visited.FlushDB().Err()
-	}
-	err = c.ch.Close()
+	err := c.publisher.Close()
 	if err != nil {
 		return err
 	}
-	return c.visited.Close()
+	return nil
 }
 
 func (c *crawler) listen(ctx context.Context) error {
@@ -86,10 +85,10 @@ func (c *crawler) listen(ctx context.Context) error {
 		chanCancel = make(chan string)
 		blocked    = make(chan amqp.Blocking)
 	)
-	c.visited = c.visited.WithContext(ctx)
 
 	c.conn.NotifyClose(connClose)
 	c.conn.NotifyBlocked(blocked)
+
 	ch, err := c.conn.Channel()
 	if err != nil {
 		log.WithError(err).Error("could not create channel for consuming")
@@ -100,21 +99,21 @@ func (c *crawler) listen(ctx context.Context) error {
 	ch.NotifyClose(chanClose)
 	ch.NotifyCancel(chanCancel)
 
-	const exchange = "page"
-	err = ch.ExchangeDeclare(exchange, "topic", true, false, false, false, nil)
+	q, err := frontier.DeclareHostQueue(ch, c.host)
 	if err != nil {
-		log.WithError(err).Error("could not declare exchange")
 		return err
 	}
-	err = c.ch.ExchangeDeclare(exchange, "topic", true, false, false, false, nil)
+	err = frontier.DeclarePageExchange(c.publisher)
 	if err != nil {
 		log.WithError(err).Error("could not declare exchange with publisher channel")
 		return err
 	}
-
-	q, err := frontier.DeclareHostQueue(ch, c.host)
-	if err != nil {
-		return err
+	for _, k := range []string{q.Name, "any"} {
+		err = ch.QueueBind(q.Name, k, frontier.PageExchangeName, false, nil)
+		if err != nil {
+			log.WithError(err).Errorf("could not bind queue to %s", k)
+			continue
+		}
 	}
 
 	if c.Prefetch == 0 {
@@ -124,56 +123,47 @@ func (c *crawler) listen(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, k := range []string{q.Name, "any"} {
-		err = ch.QueueBind(q.Name, k, exchange, false, nil)
-		if err != nil {
-			log.WithError(err).Errorf("could not bind queue to %s", k)
-			continue
-		}
-	}
-	delivery, err := ch.Consume(
-		q.Name,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
+	delivery, err := ch.Consume(q.Name, "", false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
 
-	tick := time.NewTicker(c.wait)
-	defer tick.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 
 	log.Infof("checking message queue every %v", c.wait)
 	for {
 		select {
-		case msg := <-delivery:
-			log.WithFields(logrus.Fields{
-				"key":      msg.RoutingKey,
-				"tag":      msg.DeliveryTag,
-				"exchange": msg.Exchange,
-			}).Info("message")
-			go c.handleMsg(ctx, &msg)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-tick.C:
-				tick.Reset(c.wait)
-			}
 		case <-ctx.Done():
 			log.Info("stopping crawler")
 			return nil
-		case <-connClose:
-			log.Warning("connection closed")
-			return nil
-		case <-chanClose:
-			log.Warning("channel closed")
-			return nil
+		case tm := <-c.sleep:
+			tm = c.wait - tm
+			if tm < 0 {
+				break
+			}
+			timer.Reset(tm)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return nil
+			}
+		case msg := <-delivery:
+			log.WithFields(logrus.Fields{
+				"key": msg.RoutingKey, "tag": msg.DeliveryTag,
+				"exchange": msg.Exchange, "type": msg.Type,
+				"consumer": msg.ConsumerTag,
+			}).Trace("message")
+			go c.handleMsg(ctx, &msg)
+		case e := <-connClose:
+			log.WithError(e).Warning("connection closed")
+			return e
+		case e := <-chanClose:
+			log.WithError(e).Warning("channel closed")
+			return e
 		case b := <-blocked:
 			log.WithField("reason", b.Reason).Warning("connection blocked")
+			return fmt.Errorf("connection blocked: %v", b.Reason)
 		case tag := <-chanCancel:
 			log.WithField("tag", tag).Info("received a cancel event")
 			return nil
@@ -181,7 +171,8 @@ func (c *crawler) listen(ctx context.Context) error {
 	}
 }
 
-var errSkippedPage = errors.New("skipped page")
+func (c *crawler) Pause(dur time.Duration) { c.sleep <- dur }
+
 var hostname string
 
 func init() {
@@ -194,14 +185,27 @@ func init() {
 
 func (c *crawler) handleMsg(ctx context.Context, msg *amqp.Delivery) error {
 	var (
-		err error
-		req = new(web.PageRequest)
+		err   error
+		req   = new(web.PageRequest)
+		start = time.Now()
 	)
-	start := time.Now()
+
+	msgType := frontier.ParseMessageType(msg.Type)
+	if msgType != frontier.PageRequest {
+		// This message was not meant for use, ignore it and don't ack
+		log.Warn("skipping message: not a page request message")
+	}
+
 	defer func() {
-		log.Infof("handled message in %v", time.Since(start))
+		// only ack if the context is not canceled
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msg.Ack(false)
+		}
 	}()
-	defer func() { msg.Ack(false) }()
+
 	if len(msg.Body) == 0 {
 		log.WithFields(logrus.Fields{
 			"hostname": hostname,
@@ -216,49 +220,50 @@ func (c *crawler) handleMsg(ctx context.Context, msg *amqp.Delivery) error {
 		return err
 	}
 	page := web.NewPageFromString(req.URL, req.Depth)
+
+	c.mu.Lock()
+	test := c.robots.TestAgent(page.URL.Path, "*")
+	c.mu.Unlock()
+	if !test {
+		log.WithField("url", req.URL).Info("found in robots.txt")
+		return nil
+	}
+	if c.urlset.Has(page.URL) {
+		log.WithField("url", req.URL).Trace("skipping request")
+		return nil
+	}
+
 	c.v.LinkFound(page.URL)
-
-	// if c.shouldSkip(page) {
-	// 	log.WithFields(logrus.Fields{
-	// 		"url":   page.URL.String(),
-	// 		"depth": page.Depth,
-	// 		"limit": c.limit,
-	// 	}).Trace("skipping page")
-	// 	return errSkippedPage
-	// }
-
+	// Assume that if handleRequest is called then it made a
+	// request to the web server and so we need to wait for politness.
+	defer func() { c.sleep <- time.Since(start) }()
 	err = c.handleRequest(ctx, page)
 	if err != nil {
 		log.WithError(err).Error("error while handling request")
 		return nil
 	}
-
-	err = c.markSeen(*page.URL)
-	if err != nil {
-		log.WithError(err).WithField("url", req.URL).Warn("could not mark as seen")
-	}
-	if page.Redirected {
-		err = c.markSeen(*page.RedirectedFrom)
-		if err != nil {
-			log.WithError(err).Warn("could mark redirected url as seen")
-		}
-	}
 	return nil
 }
 
 func (c *crawler) handleRequest(ctx context.Context, page *web.Page) error {
-	err := page.FetchCtx(ctx)
+	fetchCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	err := page.FetchCtx(fetchCtx)
 	if err != nil {
+		cancel()
 		return errors.Wrap(err, "could not fetch page")
 	}
-	host := c.host
+	cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		c.v.Visit(ctx, page)
-		wg.Done()
-	}()
+	// If the page was redirected then the main url on the
+	// page struct changes to the redirect location (which
+	// is a pretty leaky abstraction).
+	// If we have seen the redirected url then skip it
+	if page.Redirected && c.urlset.Has(page.URL) {
+		return nil
+	}
+
+	var host = c.host
+	c.v.Visit(ctx, page)
 
 	haslinks := len(page.Links) > 0
 	// Only push the page's links if those pages will
@@ -267,64 +272,55 @@ func (c *crawler) handleRequest(ctx context.Context, page *web.Page) error {
 	// discarded in the future so we should not push them
 	// to the queue now.
 	if haslinks && (c.limit == 0 || page.Depth+1 < uint32(c.limit)) {
-		var mu sync.Mutex
-		keys := urlKeys(page.Links)
-		c.mu.Lock()
-		visited, err := c.visited.MGet(keys...).Result()
-		c.mu.Unlock()
-		if err != nil {
-			log.WithFields(logrus.Fields{
-				"error":   err,
-				"n-keys":  len(keys),
-				"n-links": len(page.Links),
-			}).Error("could not access set of visited urls")
-		}
-
+		visited := c.urlset.HasMulti(page.Links)
+		log.Info("queuing up links")
+		done := ctx.Done()
 		for i, l := range page.Links {
-			wg.Add(1)
-			go func(ix int, l *url.URL) {
-				defer wg.Done()
-				if l.Host == host {
-					c.mu.Lock()
-					test := c.robots.TestAgent(l.Path, "*")
-					c.mu.Unlock()
-					if !test {
-						return
-					}
+			select {
+			case <-done:
+				continue
+			default:
+			}
+			if l.Host == host {
+				c.mu.Lock()
+				test := c.robots.TestAgent(l.Path, "*")
+				c.mu.Unlock()
+				if !test {
+					continue
 				}
+			}
+			if visited[i] {
+				continue
+			}
 
-				mu.Lock()
-				if visited[ix] != nil {
-					mu.Unlock()
-					return
-				}
-				mu.Unlock()
-
-				r := web.NewPageRequest(l, page.Depth+1)
-				c.chMu.Lock()
-				err = frontier.PushRequestToHost(c.ch, r, l.Host)
-				c.chMu.Unlock()
-				if err != nil {
-					log.WithError(err).Error("could not publish discovered link")
-					return
-				}
-			}(i, l)
+			r := web.NewPageRequest(l, page.Depth+1)
+			select {
+			case <-done:
+				continue
+			default:
+			}
+			c.chMu.Lock()
+			err = frontier.PushRequestToHost(c.publisher, r, l.Host)
+			c.chMu.Unlock()
+			if err != nil {
+				log.WithError(err).Error("could not publish discovered link")
+				continue
+			}
 		}
 	}
-	wg.Wait()
-	return nil
-}
-
-func urlKeys(links []*url.URL) []string {
-	s := make([]string, len(links))
-	var u url.URL
-	for i, l := range links {
-		u = *l
-		u.Fragment = ""
-		u.RawFragment = ""
-		s[i] = u.String()
+	err = c.urlset.Put(page.URL)
+	if err != nil {
+		log.WithError(err).WithField("url", page.URL).Warn("could not mark as seen")
+		return err
 	}
-	return s
+	if page.Redirected {
+		err = c.urlset.Put(page.RedirectedFrom)
+		if err != nil {
+			log.WithError(err).WithField("ur", page.URL).Warn("could mark redirected url as seen")
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *crawler) depthLimitReached(d uint32) bool {
@@ -349,18 +345,5 @@ func (c *crawler) shouldSkipURL(u *url.URL, depth uint) bool {
 		log.WithField("url", u.String()).Trace("url path is in robots.txt")
 		return true
 	}
-	return c.seen(*u)
-}
-
-func (c *crawler) seen(u url.URL) bool {
-	u.Fragment = ""
-	u.RawFragment = ""
-	err := c.visited.Get(u.String()).Err()
-	return err == nil
-}
-
-func (c *crawler) markSeen(u url.URL) error {
-	u.Fragment = ""
-	u.RawFragment = ""
-	return c.visited.Set(u.String(), 1, 0).Err()
+	return c.urlset.Has(u)
 }
