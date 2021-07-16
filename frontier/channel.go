@@ -38,6 +38,7 @@ type channel struct {
 
 	notifyCancel chan string
 	notifyClosed chan *amqp.Error
+	prefetch     int
 }
 
 func initChannel(
@@ -45,15 +46,17 @@ func initChannel(
 	ch *channel,
 ) error {
 	ch.chOpen = sync.NewCond(&ch.mu)
-	// ch.reload = reload
 	ch.reload = make(chan struct{})
-	ch.ctx, ch.cancel = context.WithCancel(ctx)
+	if ch.ctx == nil {
+		ch.ctx, ch.cancel = context.WithCancel(ctx)
+	}
 	atomic.StoreInt32(&ch.open, 0)
 	go ch.handleReload()
 	return nil
 }
 
 func (c *channel) Close() error {
+	log.Debug("channel: closing channel")
 	defer close(c.reload)
 	c.cancel()
 	atomic.StoreInt32(&c.open, 0)
@@ -61,49 +64,86 @@ func (c *channel) Close() error {
 }
 
 func (c *channel) handleReload() {
+	defer log.Debug("channel: ending channel reloads")
 	c.reloadChannel() // initial channel
 	for {
 		select {
 		case <-c.ctx.Done():
+			log.Debug("channel: context canceled in reload handler")
 			return
 		case <-c.conndone:
-			c.cancel() // connection was closed on purpose
+			// c.cancel() // connection was closed on purpose
 			if c.ch != nil {
 				c.ch.Close()
 			}
+			log.Trace("channel: received connection done signal")
 			return
+		case <-c.notifyClosed:
+			atomic.StoreInt32(&c.open, 0)
+			// log.Debug("channel: close notify... reloading channel")
+			// go func() { <-c.reload }() // make sure the reload channel doesn't block
+			c.reloadChannel()
 		case _, ok := <-c.reload:
+			log.Debug("channel: received on reload channel")
 			if !ok {
-				// channel was closed
+				// reload channel was closed
 				return
 			}
 			atomic.StoreInt32(&c.open, 0)
-			log.Debug("reloading channel")
+			c.reloadChannel()
 		}
-		c.reloadChannel()
 	}
 }
 
 func (c *channel) reloadChannel() {
+	log.Debug("channel: reloading channel")
+	defer log.Debug("channel: channel reloaded")
+	atomic.StoreInt32(&c.open, 0)
+
 	c.mu.Lock()
-	if c.ch != nil {
-		// Close old channel in case its still open.
-		c.ch.Close()
-	}
+	log.Debug("channel: reload lock acquired")
+	defer c.mu.Unlock()
+	atomic.StoreInt32(&c.open, 0)
+
 	ch, err := c.conn.Channel()
 	if err != nil {
-		c.mu.Unlock()
+		log.WithError(err).Error("channel: could not create new channel")
 		return
 	}
-	c.moveChannel(ch)
+	log.Debug("channel: created new channel")
+
+	var closeOld bool
+	select {
+	case <-c.notifyClosed:
+		closeOld = false
+	default:
+		closeOld = true
+	}
+
+	if c.ch != nil && closeOld {
+		// Close old channel in case its still open.
+		log.Debug("channel: closing old channel")
+		err := c.ch.Close()
+		log.Debug("channel: old channel closed")
+		if err != nil {
+			log.WithError(err).Error("channel: could not close old channel")
+		}
+	}
+	err = c.moveChannel(ch)
+	if err != nil {
+		log.WithError(err).Error("could not set inner channel")
+		c.cancel() // this should error stop the channel
+		return
+	}
+	log.Debug("channel: new channel set")
 	atomic.StoreInt32(&c.open, 1)
 	c.chOpen.Broadcast()
-	c.mu.Unlock()
 }
 
 func (c *channel) wait() {
 	c.mu.Lock()
 	for c.notReady() {
+		log.Debug("channel: waiting for reload")
 		c.chOpen.Wait()
 	}
 	c.mu.Unlock()
@@ -117,7 +157,6 @@ func (c *channel) Publish(
 	if err := c.ctx.Err(); err != nil {
 		return amqp.ErrClosed
 	}
-
 	// wait for channel pointer, does not
 	// protect against multi-threaded publishing
 	// which is not safe.
@@ -137,8 +176,11 @@ func (c *channel) Consume(
 	autoAck, exclusive, noLocal, noWait bool,
 	args amqp.Table,
 ) (<-chan amqp.Delivery, error) {
+	// TODO Upon connection reload, queued messages are unabled to be be acknowledged
 	var deliveries = make(chan amqp.Delivery)
 	go func() {
+		defer close(deliveries)
+		defer log.Trace("channel: consumer done with re-tries")
 		for {
 			var (
 				ch  <-chan amqp.Delivery
@@ -146,15 +188,13 @@ func (c *channel) Consume(
 			)
 			select {
 			case <-c.ctx.Done():
-				close(deliveries)
+				log.Debug("channel: consumer context closed")
 				return
-			case <-c.notifyClosed:
-				log.Debug("channel close notify: reloading channel")
-				c.reloadChannel()
 			default:
 			}
+			log.Debug("channel: consumer is waiting for channel reload")
 			c.wait()
-
+			log.Debug("channel: consumer getting deliveries inner channel")
 			ch, err = c.ch.Consume(
 				queue,
 				consumer,
@@ -166,19 +206,25 @@ func (c *channel) Consume(
 			)
 			if err != nil {
 				// TODO: handle this error
-				log.WithError(err).Warn("could not consume")
+				log.WithError(err).Warn("channel: consumer could not consume")
+				time.Sleep(ReloadDelay)
 				goto NextConsumer
 			}
+
+			log.Debug("channel: consumer draining inner channel")
 			// Pipe the messages along to the outer
 			// caller's message channel.
 			for {
 				select {
+				case reason := <-c.notifyCancel:
+					log.WithField("reason", reason).Warn("channel: consumer canceled")
+					goto NextConsumer
 				case <-c.ctx.Done():
-					close(deliveries)
+					log.Debug("channel: consumer context closed")
 					return
 				case msg, ok := <-ch:
 					if !ok {
-						log.Debug("inner consumer closed")
+						log.Debug("channel: consumer inner channel closed")
 						goto NextConsumer
 					}
 					deliveries <- msg
@@ -193,10 +239,10 @@ func (c *channel) Consume(
 func (c *channel) Reload() error {
 	select {
 	case c.reload <- struct{}{}:
+		return nil
 	case <-c.ctx.Done():
 		return c.ctx.Err()
 	}
-	return nil
 }
 
 // For interfaces and whatnot
@@ -213,10 +259,21 @@ func (c *channel) notReady() bool {
 	return atomic.LoadInt32(&c.open) == 0
 }
 
-func (c *channel) moveChannel(ch *amqp.Channel) {
+func (c *channel) moveChannel(ch *amqp.Channel) error {
+	err := ch.Qos(c.prefetch, 0, false)
+	if err != nil {
+		return err
+	}
 	c.ch = ch
-	c.notifyCancel = make(chan string)
-	c.notifyClosed = make(chan *amqp.Error)
-	c.ch.NotifyCancel(c.notifyCancel)
-	c.ch.NotifyClose(c.notifyClosed)
+	c.notifyCancel = ch.NotifyCancel(make(chan string))
+	c.notifyClosed = ch.NotifyClose(make(chan *amqp.Error))
+	return nil
+}
+
+func (c *channel) WithContext(ctx context.Context) {
+	c.ctx, c.cancel = context.WithCancel(ctx)
+}
+
+func (c *channel) withPretch(prefetch int) {
+	c.prefetch = prefetch
 }

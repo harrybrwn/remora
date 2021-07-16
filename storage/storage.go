@@ -2,6 +2,7 @@ package storage
 
 import (
 	"net/url"
+	"sync"
 
 	"github.com/dgraph-io/badger/v3"
 	"github.com/go-redis/redis"
@@ -24,22 +25,24 @@ func NewRedisURLSet(client *redis.Client) URLSet {
 	return &redisURLSet{client}
 }
 
+func NewInMemoryURLSet() URLSet {
+	return &inMemoryURLSet{m: make(map[string]struct{})}
+}
+
 type redisURLSet struct {
 	client *redis.Client
 }
 
 func (set *redisURLSet) Has(u *url.URL) bool {
 	var l = *u
-	l.Fragment = ""
-	l.RawFragment = ""
+	stripURL(&l)
 	err := set.client.Get(l.String()).Err()
 	return err != redis.Nil
 }
 
 func (set *redisURLSet) Put(u *url.URL) error {
 	var l = *u
-	l.Fragment = ""
-	l.RawFragment = ""
+	stripURL(&l)
 	return set.client.Set(l.String(), 1, 0).Err()
 }
 
@@ -61,8 +64,7 @@ func urlKeys(links []*url.URL) []string {
 	var u url.URL
 	for i, l := range links {
 		u = *l
-		u.Fragment = ""
-		u.RawFragment = ""
+		stripURL(&u)
 		s[i] = u.String()
 	}
 	return s
@@ -79,7 +81,7 @@ type visitedSet struct {
 func (vs *visitedSet) Has(u *url.URL) bool {
 	var l = *u
 	ok := false
-	l.Fragment = ""
+	stripURL(&l)
 
 	key := urlKey(&l)
 	err := vs.db.View(func(txn *badger.Txn) error {
@@ -108,8 +110,7 @@ func (vs *visitedSet) HasMulti(urls []*url.URL) []bool {
 	var u url.URL
 	for i, l := range urls {
 		u = *l
-		u.Fragment = ""
-		u.RawFragment = ""
+		stripURL(&u)
 		keys[i] = urlKey(&u)
 	}
 	vs.db.View(func(txn *badger.Txn) error {
@@ -130,7 +131,7 @@ func (vs *visitedSet) HasMulti(urls []*url.URL) []bool {
 
 func (vs *visitedSet) Put(u *url.URL) error {
 	var l = *u
-	l.Fragment = ""
+	stripURL(&l)
 
 	key := urlKey(&l)
 	return vs.db.Update(func(txn *badger.Txn) error {
@@ -143,4 +144,45 @@ func urlKey(u *url.URL) []byte {
 	key := make([]byte, 8, len(s)+8)
 	copy(key[:], []byte("visited_"))
 	return append(key, []byte(s)...)
+}
+
+type inMemoryURLSet struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}
+
+func stripURL(u *url.URL) {
+	u.Fragment = ""
+	u.RawFragment = ""
+}
+
+func (s *inMemoryURLSet) Has(u *url.URL) bool {
+	var l = *u
+	stripURL(&l)
+	s.mu.Lock()
+	_, ok := s.m[l.String()]
+	s.mu.Unlock()
+	return ok
+}
+
+func (s *inMemoryURLSet) Put(u *url.URL) error {
+	var l = *u
+	stripURL(&l)
+	s.mu.Lock()
+	s.m[l.String()] = struct{}{}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *inMemoryURLSet) HasMulti(urls []*url.URL) []bool {
+	var l url.URL
+	ok := make([]bool, len(urls))
+	s.mu.Lock()
+	for i, url := range urls {
+		l = *url
+		stripURL(&l)
+		_, ok[i] = s.m[l.String()]
+	}
+	s.mu.Unlock()
+	return ok
 }

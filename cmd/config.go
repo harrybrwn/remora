@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-redis/redis"
 	"github.com/harrybrwn/diktyo/db"
+	"github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
 )
 
@@ -47,9 +48,8 @@ func (c *Config) Bind(flag *flag.FlagSet) {
 	// flag.StringArrayVarP(&c.AllowedHosts, "allowed-hosts", "a", c.AllowedHosts,
 	// 	"A list of hosts that the crawler is allowed to "+
 	// 		"visit. The host of seed urls are added implicitly")
-	flag.DurationVar(&c.Sleep, "sleep", c.Sleep, "Sleep time for each spider request")
+	// flag.DurationVar(&c.Sleep, "sleep", c.Sleep, "Sleep time for each spider request")
 	flag.UintVar(&c.Depth, "depth", c.Depth, "Crawler depth limit")
-	// flag.StringVar(&c.Profile, "profile", "", "config profile to use for the crawler")
 }
 
 func (c *Config) RedisOpts() *redis.Options {
@@ -88,4 +88,13 @@ func (mqc *MessageQueueConfig) URI() string {
 		mqc.Host,
 		mqc.Port,
 	)
+}
+
+func (c *Config) GetLevel() logrus.Level {
+	lvl, err := logrus.ParseLevel(c.LogLevel)
+	if err != nil {
+		logrus.WithError(err).Warn("could not parse log level")
+		return logrus.DebugLevel
+	}
+	return lvl
 }

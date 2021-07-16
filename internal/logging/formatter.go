@@ -27,6 +27,7 @@ type PrefixedFormatter struct {
 	maxFieldLen map[string]int
 	maxMsgLen   int
 	format      string
+	fieldFormat string
 
 	init sync.Once
 }
@@ -79,9 +80,6 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	pf.mu.Unlock()
 
 	pf.init.Do(func() {
-		if isTerm(e.Logger.Out) {
-			pf.NoColor = true
-		}
 		if pf.TimeFormat == "" {
 			pf.TimeFormat = time.RFC3339
 		}
@@ -91,12 +89,14 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 			} else {
 				pf.format = "[%[1]s] %-7[3]s %[4]s: %[5]s"
 			}
+			pf.fieldFormat = " %[2]s="
 		} else {
 			if pf.Prefix == "" {
 				pf.format = "\x1b[90m[%s]\x1b[0m \x1b[%dm%-7s\x1b[0m %s%s"
 			} else {
 				pf.format = "\x1b[90m[%s]\x1b[0m \x1b[%dm%-7s\x1b[0m %s: %s"
 			}
+			pf.fieldFormat = " \x1b[%[1]dm%[2]s\x1b[0m="
 		}
 	})
 
@@ -112,7 +112,7 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 		if !ok {
 			s = fmt.Sprint(val)
 		}
-		fmt.Fprintf(&b, " \x1b[%dm%s\x1b[0m=", col, k)
+		fmt.Fprintf(&b, pf.fieldFormat, col, k)
 		if !needsQuotes(s) {
 			b.WriteString(s)
 		} else {
@@ -127,7 +127,7 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func isTerm(w io.Writer) bool {
+func IsTerm(w io.Writer) bool {
 	switch v := w.(type) {
 	case *os.File:
 		return terminal.IsTerminal(int(v.Fd()))

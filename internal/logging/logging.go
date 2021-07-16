@@ -110,7 +110,7 @@ type Hook struct {
 // Fire will be called when some logging function is called with current hook
 // It will format log entry to string and write it to appropriate writer
 func (hook *Hook) Fire(entry *log.Entry) error {
-	line, err := entry.Bytes()
+	line, err := entry.Logger.Formatter.Format(entry)
 	if err != nil {
 		return err
 	}

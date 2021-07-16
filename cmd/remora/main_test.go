@@ -13,7 +13,7 @@ import (
 )
 
 func Test(t *testing.T) {
-	initLogger(logrus.InfoLevel)
+	initLogger(false, logrus.InfoLevel)
 	for k, v := range log.Hooks {
 		fmt.Printf("%v %#[2]v\n", k, v)
 		for _, h := range v {

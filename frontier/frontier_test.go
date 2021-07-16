@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/harrybrwn/diktyo/event"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 )
@@ -28,11 +29,11 @@ var testexchange = Exchange{
 	AutoDelete: false,
 }
 
-var (
-	_ EventBus  = (*Frontier)(nil)
-	_ Consumer  = (*consumer)(nil)
-	_ Publisher = (*publisher)(nil)
-)
+// var (
+// 	_ EventBus  = (*Frontier)(nil)
+// 	_ Consumer  = (*consumer)(nil)
+// 	_ Publisher = (*publisher)(nil)
+// )
 
 func Test(t *testing.T) {}
 
@@ -292,7 +293,7 @@ func TestConsumer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		go func(c Consumer, id int) {
+		go func(c event.Consumer, id int) {
 			defer c.Close()
 			deliveries, err := c.Consume(fmt.Sprintf("log.testing.%d", id))
 			if err != nil {
@@ -362,8 +363,8 @@ type channelbus struct {
 	deliveries map[string]chan amqp.Delivery
 	publishers map[string]chan amqp.Publishing
 
-	copts []ConsumerOpt
-	popts []PublisherOpt
+	copts []event.ConsumerOpt
+	popts []event.PublisherOpt
 
 	notifyCancel chan string
 }
@@ -430,17 +431,17 @@ func (cb *channelbus) Consume(keys ...string) (<-chan amqp.Delivery, error) {
 	return ch, nil
 }
 
-func (cb *channelbus) WithOpt(opts ...ConsumerOpt) error {
+func (cb *channelbus) WithOpt(opts ...event.ConsumerOpt) error {
 	cb.copts = append(cb.copts, opts...)
 	return nil
 }
 
-func (cb *channelbus) Consumer(queue string, opts ...ConsumerOpt) (Consumer, error) {
+func (cb *channelbus) Consumer(queue string, opts ...event.ConsumerOpt) (event.Consumer, error) {
 	cb.copts = opts
 	return cb, nil
 }
 
-func (cb *channelbus) Publisher(opts ...PublisherOpt) (Publisher, error) {
+func (cb *channelbus) Publisher(opts ...event.PublisherOpt) (event.Publisher, error) {
 	cb.popts = opts
 	return cb, nil
 }

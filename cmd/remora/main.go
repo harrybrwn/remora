@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
@@ -50,13 +52,6 @@ func main() {
 		conf cmd.Config
 	)
 	godotenv.Load()
-	initConfig(&conf)
-	lvl, err := logrus.ParseLevel(conf.LogLevel)
-	if err != nil {
-		log.Warn("could not parse log level")
-		lvl = logrus.DebugLevel
-	}
-	initLogger(lvl)
 	web.RetryLimit = 0
 
 	cmd := NewCLIRoot(&conf)
@@ -65,45 +60,46 @@ func main() {
 	defer stop()
 	err = cmd.ExecuteContext(ctx)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
 func NewCLIRoot(conf *cmd.Config) *cobra.Command {
+	var (
+		configfile string
+		noColor    bool
+	)
 	c := &cobra.Command{
 		Use:   "remora",
-		Short: "The internet's symbiotic web crawler",
+		Short: "The internet's symbiotic organism.",
+		Long:  "",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			lvl, err := logrus.ParseLevel(conf.LogLevel)
-			if err != nil {
-				log.WithError(err).Warn("could not parse log level")
-				return nil
+			// Parse the loglevel before reading the config file
+			var (
+				lvl logrus.Level = logrus.DebugLevel
+				err error
+			)
+			level := conf.LogLevel
+			if conf.LogLevel != "" {
+				lvl = conf.GetLevel()
 			}
-			log.SetLevel(lvl)
+			err = prerun(configfile, conf)
+			if err != nil {
+				return err
+			}
+			// If logLevel has changed in the config file but not as a flag
+			// then parse the config file log level.
+			if lvl == 0 || (level != conf.LogLevel && !cmd.Flags().Lookup("loglevel").Changed) {
+				lvl = conf.GetLevel()
+			}
+			initLogger(noColor, lvl)
 			return nil
 		},
 	}
 	c.PersistentFlags().StringVar(&conf.LogLevel, "loglevel", conf.LogLevel, "set log level")
-	// c.PersistentFlags().UintVar(&conf.Depth, "depth", conf.Depth, "set the crawl depth limit (0 for no limit)")
-	// conf.Bind(c.PersistentFlags())
-
-	crawlFlags := crawlFlags{}
-	crawlCmd := &cobra.Command{
-		Use:   "crawl",
-		Short: "Start a full web crawl",
-		Long:  "Start a full web crawl.",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) > 0 {
-				conf.Seeds = args
-			}
-			ctx := cmd.Context()
-			// http://localhost:8080/debug/pprof
-			go http.ListenAndServe(":8080", nil)
-			go periodicMemDump(ctx, time.Minute*10)
-			return crawl(ctx, conf, &crawlFlags)
-		},
-	}
-	crawlCmd.Flags().BoolVar(&crawlFlags.redis, "redis", crawlFlags.redis, "use redis as the visited url set")
+	c.PersistentFlags().StringVar(&configfile, "config", configfile, "use a different config file")
+	c.PersistentFlags().BoolVar(&noColor, "no-color", noColor, "disable output colors")
 
 	c.AddCommand(
 		newSpiderCmd(conf),
@@ -122,15 +118,31 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 		},
 		newPurgeCmd(conf),
 		newEnqueueCmd(conf),
-		crawlCmd,
 		newQueueCmd(conf),
 		newRedisCmd(conf),
 		&cobra.Command{
 			Use: "test", Hidden: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
-				for i := 0; i < 30; i++ {
-					log.Info(i)
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use: "test-log", Hidden: true,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				var (
+					wg  sync.WaitGroup
+					n   = 30
+					log = log.WithField("test", time.Now())
+					fn  = []func(...interface{}){
+						log.Trace, log.Debug, log.Info, log.Warn, log.Error,
+					}
+					l = len(fn)
+				)
+				wg.Add(n)
+				for i := 0; i < n; i++ {
+					func(i int) { fn[i%l](i); wg.Done() }(i)
 				}
+				wg.Wait()
 				return nil
 			},
 		},
@@ -159,7 +171,7 @@ func crawl(ctx context.Context, conf *cmd.Config, flags *crawlFlags) error {
 	if err != nil {
 		return errors.Wrap(err, "could not open key-value storage")
 	}
-	defer closedb(qdb)
+	defer closeDB(qdb)
 	db, err := db.New(&conf.DB)
 	if err != nil {
 		return errors.Wrap(err, "could not connect to database")
@@ -235,20 +247,31 @@ func crawl(ctx context.Context, conf *cmd.Config, flags *crawlFlags) error {
 
 const DataDir = "/var/local/remora"
 
-func initConfig(c *cmd.Config) {
+func prerun(configfile string, conf *cmd.Config) error {
+	if configfile != "" {
+		dir, file := filepath.Split(configfile)
+		if dir == "" {
+			dir = "."
+		}
+		if file == "" {
+			return errors.New("no config file given")
+		}
+		config.AddPath(dir)
+		config.AddFile(file)
+	}
 	config.AddFile("remora.yml")
 	config.AddFile("config.yml")
 	config.AddPath(".")
 	config.AddPath("/var/local/diktyo")
 	config.AddPath(DataDir)
 	config.SetType("yaml")
-	config.SetConfig(c)
+	config.SetConfig(conf)
 	err := config.InitDefaults()
 	if err != nil {
-		log.Fatal(errors.Wrap(err, "could not set config defaults"))
+		return errors.Wrap(err, "could not set config defaults")
 	}
-	if err = config.ReadConfigFile(); err != nil {
-		log.Fatal(errors.Wrap(err, "could not read config"))
+	if err = config.ReadConfig(); err != nil {
+		return errors.Wrap(err, "could not read config")
 	}
 	for _, path := range []string{
 		"/var/local/diktyo",
@@ -261,17 +284,24 @@ func initConfig(c *cmd.Config) {
 			}
 		}
 	}
+	return nil
 }
 
-func initLogger(lvl logrus.Level) {
+func initLogger(nocolor bool, lvl logrus.Level) {
+	out := os.Stdout
+	maxlen := 135
+	if !logging.IsTerm(out) {
+		nocolor = true
+		maxlen = 1
+	}
 	log.SetOutput(io.Discard)
 	log.SetLevel(logrus.TraceLevel)
 	log.SetFormatter(&logging.PrefixedFormatter{
 		Prefix: "",
 		// TimeFormat:       time.RFC3339,
 		TimeFormat:       time.Stamp,
-		MaxMessageLength: 135,
-		// NoColor:          true,
+		MaxMessageLength: maxlen,
+		NoColor:          nocolor,
 	})
 	logfile.Filename = "/var/local/diktyo/crawler.log"
 	log.AddHook(logging.NewLogFileHook(&logfile, &logrus.TextFormatter{
@@ -280,7 +310,7 @@ func initLogger(lvl logrus.Level) {
 		TimestampFormat: time.RFC3339,
 	}))
 	log.AddHook(&logging.Hook{
-		Writer:    os.Stdout,
+		Writer:    out,
 		LogLevels: logrus.AllLevels[:lvl+1],
 	})
 	web.SetLogger(log)
@@ -288,7 +318,7 @@ func initLogger(lvl logrus.Level) {
 	frontier.SetLogger(log)
 }
 
-func closedb(db *badger.DB) {
+func closeDB(db *badger.DB) {
 	err := db.Close()
 	if err != nil {
 		log.WithError(err).Error("could not close persistant queue")

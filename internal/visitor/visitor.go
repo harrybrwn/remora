@@ -250,6 +250,7 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 			"links":    len(page.Links),
 			"response": page.ResponseTime,
 			"0-total":  time.Since(start) + page.ResponseTime,
+			"n":        v.Visited,
 		}).Info("done with visit")
 	}
 }

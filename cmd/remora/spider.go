@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"github.com/go-redis/redis"
 	"github.com/harrybrwn/diktyo/cmd"
 	"github.com/harrybrwn/diktyo/db"
+	"github.com/harrybrwn/diktyo/event"
 	"github.com/harrybrwn/diktyo/frontier"
 	"github.com/harrybrwn/diktyo/internal/visitor"
 	"github.com/harrybrwn/diktyo/storage"
@@ -26,21 +29,32 @@ import (
 
 func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 	var (
-		hosts []string
-		nop   bool
+		hosts    []string
+		nop      bool
+		prefetch int
+		sleep    time.Duration
 	)
 	c := &cobra.Command{
 		Use: "spider", Short: "Start a spider",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			hosts = append(hosts, args...)
 			if len(hosts) == 0 {
 				return errors.New("no hosts to crawl with spider")
 			}
+			if cmd.Flags().Lookup("prefetch").Changed {
+				conf.MessageQueue.Prefetch = prefetch
+			}
+			if cmd.Flags().Lookup("sleep").Changed {
+				conf.Sleep = sleep
+			}
+
 			db, redis, err := getDataStores(conf)
 			if err != nil {
 				return errors.Wrap(err, "datastore connection failure")
 			}
+			log.Info("connected to datastores")
 			defer func() {
 				db.Close()
 				redis.Close()
@@ -56,32 +70,43 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 				}}
 			)
 			if nop {
-				db.Close()
 				vis = &web.NoOpVisitor{}
+				if err = db.Close(); err != nil {
+					log.WithError(err).Warn("couldn't close database")
+				}
 			} else {
 				vis = visitor.New(db)
 			}
 			err = front.Connect(frontier.Connect{
 				Host: conf.MessageQueue.Host,
 				Port: conf.MessageQueue.Port,
+				Config: &amqp.Config{
+					// Heartbeat: time.Millisecond,
+					Heartbeat: time.Second * 10,
+					Locale:    "en_US",
+				},
 			})
 			if err != nil {
 				return errors.Wrap(err, "could not connect to frontier")
 			}
-			defer front.Close()
+			defer func() {
+				front.Close()
+				log.Info("spider: message queue connection closed")
+				stop()
+			}()
 
 			for i, host := range hosts {
-				spiders[i], err = newSpider(conf, host, vis, &front, storage.NewRedisURLSet(redis))
-				if err != nil {
-					return err
+				spiders[i] = &spider{
+					Host:     host,
+					Prefetch: conf.MessageQueue.Prefetch,
+					Limit:    conf.Depth,
+					Wait:     getWait(host, conf, cmd),
+					Bus:      &front,
+					URLSet:   storage.NewRedisURLSet(redis),
+					Visitor:  vis,
 				}
-				spiders[i].Wait = getWait(host, conf, cmd)
 			}
 			for _, sp := range spiders {
-				log.WithFields(logrus.Fields{
-					"wait": sp.Wait,
-					"host": sp.host,
-				}).Info("starting spider")
 				go sp.start(ctx)
 			}
 			<-ctx.Done()
@@ -90,8 +115,9 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 	}
 	c.Flags().BoolVar(&nop, "nop", nop, "no operation when visiting a page")
 	c.Flags().StringArrayVar(&hosts, "host", hosts, "host of website being crawled")
+	c.Flags().DurationVar(&sleep, "sleep", sleep, "")
 	c.Flags().IntVar(
-		&conf.MessageQueue.Prefetch, "prefetch",
+		&prefetch, "prefetch",
 		conf.MessageQueue.Prefetch,
 		"number of messages prefetched from the message queue")
 	return c
@@ -113,67 +139,91 @@ func getDataStores(conf *cmd.Config) (d *sql.DB, r *redis.Client, err error) {
 }
 
 type spider struct {
-	host  string
-	limit uint
-	v     web.Visitor
 	sleep chan time.Duration
 
 	robots *robotstxt.RobotsData
 	mu     sync.Mutex
 
-	urlset   storage.URLSet
-	front    *frontier.Frontier
-	prefetch int
+	// Settings
+	Prefetch int
+	Limit    uint
 	Wait     time.Duration
+	Host     string
+
+	// Hooks
+	Visitor web.Visitor
+	URLSet  storage.URLSet
+	Bus     event.Bus
 }
 
-func newSpider(
-	conf *cmd.Config, host string, vis web.Visitor, front *frontier.Frontier, urlset storage.URLSet) (*spider, error) {
-	var (
-		err error
-		sp  = spider{
-			host:     host,
-			limit:    conf.Depth,
-			Wait:     conf.Sleep,
-			v:        vis,
-			front:    front,
-			urlset:   urlset,
-			sleep:    make(chan time.Duration),
-			prefetch: conf.MessageQueue.Prefetch,
-		}
-	)
-	sp.robots, err = web.GetRobotsTxT(host)
+func (s *spider) init() {
+	s.sleep = make(chan time.Duration)
+
+	if s.Host == "" {
+		log.Error("spider has no host")
+		return
+	}
+	if s.URLSet == nil {
+		log.Warn("spider has no URL set")
+		s.URLSet = &noOpURLSet{}
+	}
+	if s.Bus == nil {
+		log.Warn("spider has no event bus")
+		s.Bus = &noOpEventBus{ch: make(chan amqp.Delivery)}
+	}
+	if s.robots == nil {
+		s.robots = web.AllowAll()
+	}
+	if s.Visitor == nil {
+		s.Visitor = &web.NoOpVisitor{}
+	}
+	if s.Wait == 0 {
+		s.Wait = 1
+	}
+	if s.Prefetch == 0 {
+		s.Prefetch = 1
+	}
+}
+
+func (s *spider) start(ctx context.Context) (err error) {
+	s.robots, err = web.GetRobotsTxT(s.Host)
 	if err != nil {
-		return nil, err
+		log.WithError(err).Error("could not get robots.txt")
+		return err
 	}
-	if sp.Wait == 0 {
-		sp.Wait = 1
-	}
-	return &sp, nil
-}
+	s.init()
 
-func (s *spider) start(ctx context.Context) error {
-	publisher, err := s.front.Publisher()
+	log.WithFields(logrus.Fields{
+		"wait": s.Wait,
+		"host": s.Host,
+	}).Info("starting spider")
+	publisher, err := s.Bus.Publisher(
+		event.PublishWithContext(ctx),
+	)
 	if err != nil {
 		log.WithError(err).Error("could not create publisher")
 		return err
 	}
-	consumer, err := s.front.Consumer(
-		s.host,
+	consumer, err := s.Bus.Consumer(
+		s.Host,
 		frontier.WithAutoAck(false),
-		frontier.WithPrefetch(s.prefetch),
+		frontier.WithPrefetch(s.Prefetch),
+		event.ConsumeWithContext(ctx),
 	)
 	if err != nil {
 		return err
 	}
 	defer consumer.Close()
 
-	deliveries, err := consumer.Consume(s.host)
+	deliveries, err := consumer.Consume(s.Host)
 	if err != nil {
 		return err
 	}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	defer func() {
+		log.WithField("host", s.Host).Info("stopping spider")
+	}()
 
 	for {
 		select {
@@ -184,7 +234,7 @@ func (s *spider) start(ctx context.Context) error {
 			if tm < 0 {
 				break
 			}
-			log.Infof("sleeping for %v", tm)
+			log.Debugf("sleeping for %v", tm)
 			timer.Reset(tm)
 			select {
 			case <-timer.C:
@@ -212,33 +262,44 @@ func (s *spider) start(ctx context.Context) error {
 				log.WithError(err).Error("could not unmarshal page request")
 				continue
 			}
-			log.WithFields(logrus.Fields{
-				"url":   req.URL,
-				"depth": req.Depth,
-			}).Trace("handle request")
-
 			go func() {
 				err = s.handle(ctx, &req, publisher)
 				if err == nil {
 					if err = msg.Ack(false); err != nil {
-						log.WithError(err).Warning("could not acknowledge message")
+						log.WithFields(logrus.Fields{
+							"acknowledger":     fmt.Sprintf("%+v", msg.Acknowledger),
+							"acknowledgerType": fmt.Sprintf("%T", msg.Acknowledger),
+							"error":            err,
+						}).Warning("could not acknowledge message")
 					}
 				}
+				log.WithFields(logrus.Fields{
+					"url":   req.URL,
+					"depth": req.Depth,
+				}).Debug("request handled")
 			}()
 		}
 	}
 }
 
-func (s *spider) handle(ctx context.Context, req *web.PageRequest, pub frontier.Publisher) error {
+func (s *spider) handle(
+	ctx context.Context,
+	req *web.PageRequest,
+	pub event.Publisher,
+) error {
 	var (
 		start = time.Now()
 		page  = web.NewPageFromString(req.URL, req.Depth)
 	)
 	if page == nil {
-		log.WithField("url", req.URL).Error("could not create page from page request")
-		return errors.New("could not parse page request url")
+		err := errors.New("could not parse page request url")
+		log.WithFields(logrus.Fields{
+			"url":   req.URL,
+			"error": err,
+		}).Error("could not get page from page request")
+		return err
 	}
-	s.v.LinkFound(page.URL)
+	s.Visitor.LinkFound(page.URL)
 
 	s.mu.Lock()
 	ok := s.robots.TestAgent(page.URL.Path, "*")
@@ -247,7 +308,7 @@ func (s *spider) handle(ctx context.Context, req *web.PageRequest, pub frontier.
 		log.WithField("url", req.URL).Trace("found in robots.txt")
 		return nil
 	}
-	if s.urlset.Has(page.URL) {
+	if s.URLSet.Has(page.URL) {
 		log.WithField("url", req.URL).Trace("already seen")
 		return nil
 	}
@@ -268,11 +329,11 @@ func (s *spider) handle(ctx context.Context, req *web.PageRequest, pub frontier.
 		s.mu.Lock()
 		ok = s.robots.TestAgent(page.URL.Path, "*")
 		s.mu.Unlock()
-		if ok || s.urlset.Has(page.URL) {
+		if ok || s.URLSet.Has(page.URL) {
 			return nil
 		}
 	}
-	s.v.Visit(ctx, page)
+	s.Visitor.Visit(ctx, page)
 
 	haslinks := len(page.Links) > 0
 	// Only push the page's links if those pages will
@@ -280,15 +341,15 @@ func (s *spider) handle(ctx context.Context, req *web.PageRequest, pub frontier.
 	// going to exceed the depth limit then they will be
 	// discarded in the future so we should not push them
 	// to the queue now.
-	if haslinks && (s.limit == 0 || page.Depth+1 < uint32(s.limit)) {
-		visited := s.urlset.HasMulti(page.Links)
+	if haslinks && (s.Limit == 0 || page.Depth+1 < uint32(s.Limit)) {
+		visited := s.URLSet.HasMulti(page.Links)
 		done := ctx.Done()
 		for i, l := range page.Links {
 			select {
 			case <-done:
 			default:
 			}
-			if l.Host == s.host {
+			if l.Host == s.Host {
 				s.mu.Lock()
 				ok = s.robots.TestAgent(l.Path, "*")
 				s.mu.Unlock()
@@ -319,12 +380,12 @@ func (s *spider) handle(ctx context.Context, req *web.PageRequest, pub frontier.
 		}
 	}
 
-	err = s.urlset.Put(page.URL)
+	err = s.URLSet.Put(page.URL)
 	if err != nil {
 		log.WithError(err).WithField("url", page.URL).Warn("could not mark as seen")
 	}
 	if page.Redirected {
-		err = s.urlset.Put(page.RedirectedFrom)
+		err = s.URLSet.Put(page.RedirectedFrom)
 		if err != nil {
 			log.WithError(err).WithField("url", page.URL).Warn("could mark redirected url as seen")
 		}
@@ -357,3 +418,32 @@ func getWait(
 	}
 	return tm
 }
+
+type noOpURLSet struct{}
+
+func (*noOpURLSet) Put(*url.URL) error           { return nil }
+func (*noOpURLSet) Has(*url.URL) bool            { return false }
+func (*noOpURLSet) HasMulti(u []*url.URL) []bool { return make([]bool, len(u)) }
+
+type noOpEventBus struct {
+	ch chan amqp.Delivery
+}
+
+func (b *noOpEventBus) Close() error {
+	if b.ch != nil {
+		close(b.ch)
+	}
+	return nil
+}
+func (b *noOpEventBus) Consumer(string, ...event.ConsumerOpt) (event.Consumer, error) {
+	if b.ch == nil {
+		b.ch = make(chan amqp.Delivery)
+	}
+	return b, nil
+}
+func (b *noOpEventBus) Consume(...string) (<-chan amqp.Delivery, error) {
+	return b.ch, nil
+}
+func (b *noOpEventBus) Publisher(...event.PublisherOpt) (event.Publisher, error) { return b, nil }
+func (b *noOpEventBus) Publish(string, amqp.Publishing) error                    { return nil }
+func (b *noOpEventBus) WithOpt(...event.ConsumerOpt) error                       { return nil }

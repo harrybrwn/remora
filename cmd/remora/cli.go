@@ -277,7 +277,7 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 		return err
 	}
 	defer front.Close()
-	publisher, err := front.Publisher()
+	pub, err := front.Publisher()
 	if err != nil {
 		return err
 	}
@@ -292,11 +292,6 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 				log.WithError(err).Error("could not parse seed url")
 				return
 			}
-			// q, err := frontier.DeclareHostQueue(ch, u.Host)
-			// if err != nil {
-			// 	log.WithError(err).Errorf("could not declare queue for %q", u.Host)
-			// 	return
-			// }
 
 			rawreq, err := proto.Marshal(req)
 			if err != nil {
@@ -310,16 +305,7 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 				Type:         frontier.PageRequest.String(),
 				Priority:     0,
 			}
-			// err = ch.Publish(
-			// 	"",
-			// 	// "any",
-			// 	q.Name,
-			// 	false, false,
-			// 	msg,
-			// )
-			fmt.Println(u.Host)
-			err = publisher.Publish(u.Host, msg)
-			// err = frontier.PushRequestToHost(ch, &req, q.Name)
+			err = pub.Publish(u.Host, msg)
 			if err != nil {
 				log.WithError(err).Error("could not publish url request")
 				return
