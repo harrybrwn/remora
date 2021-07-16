@@ -14,11 +14,13 @@
 
 # Config
 /.vscode
+/config/
 /*env*
 /diktyo.yml
 /config.yml
 /remora.yml
 /deployment.yml
+Dockerfile.arm
 
 # Notes
 /papers/

@@ -17,7 +17,7 @@ COPY . /app/src
 WORKDIR /app/src
 
 RUN go generate ./web
-RUN CGO_ENABLED=0 go build -o /app/bin/deinopis ./cmd/deinopis
+# RUN CGO_ENABLED=0 go build -o /app/bin/deinopis ./cmd/deinopis
 RUN CGO_ENABLED=0 go build -o /app/bin/remora ./cmd/remora
 
 # Main Image

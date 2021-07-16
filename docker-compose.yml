@@ -36,6 +36,8 @@ services:
     image: rabbitmq:3-management-alpine
     container_name: diktyo-msgq
     restart: unless-stopped
+    environment:
+      RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
     ports:
       - target: 5672
         published: 5672
@@ -47,17 +49,3 @@ services:
         mode: bridge
     volumes:
       - ~/.docker-conf/rabbitmq/:/var/lib/rabbitmq/
-
-  remora:
-    image: remora:0.1
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: "test-crawler"
-    command:
-      - 'deinopis'
-      - '--host'
-      - 'en.wikipedia.org'
-    network_mode: host
-    volumes:
-      - /var/local/diktyo:/var/local/diktyo
