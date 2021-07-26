@@ -13,6 +13,34 @@ import (
 )
 
 func Test(t *testing.T) {
+	t.Skip()
+	var (
+		mu sync.RWMutex
+	)
+	reader := func(i int) {
+		mu.RLock()
+		fmt.Printf("reader %d acquire\n", i)
+		time.Sleep(time.Second)
+		fmt.Printf("reader %d release\n", i)
+		mu.RUnlock()
+	}
+	writer := func(i int) {
+		mu.Lock()
+		fmt.Printf("writer %d acquire\n", i)
+		time.Sleep(time.Second * 2)
+		fmt.Printf("writer %d release\n", i)
+		mu.Unlock()
+	}
+
+	for i := 0; i < 10; i++ {
+		if i%2 == 0 {
+			go reader(i)
+		} else {
+			go writer(i)
+		}
+	}
+	<-time.After(time.Second * 10)
+
 }
 
 func q(t *testing.T) *queue {
@@ -66,7 +94,7 @@ func TestMultiPushPop(t *testing.T) {
 	defer rm(q)
 	keys := []string{"one", "two", "three"}
 	for _, k := range keys {
-		if err = q.Put([]byte(k)); err != nil {
+		if err = q.PutKey([]byte(k), []byte(k)); err != nil {
 			t.Fatal(err)
 		}
 	}

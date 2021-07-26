@@ -5,6 +5,8 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"errors"
+	"hash"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 
@@ -25,28 +27,41 @@ type Queue interface {
 	Close() error
 }
 
-func Open(opts badger.Options, prefix []byte) (Queue, error) {
+type Option func(*queue)
+
+func Open(opts badger.Options, prefix []byte, options ...Option) (Queue, error) {
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
 	}
-	return New(db, prefix), nil
+	return New(db, prefix, options...), nil
 }
 
-func New(db *badger.DB, prefix []byte) Queue {
+func New(db *badger.DB, prefix []byte, opts ...Option) Queue {
 	var mu sync.Mutex
 	q := &queue{
 		db:     db,
 		prefix: prefix,
 		empty:  sync.NewCond(&mu),
 		closed: 0,
+		hash:   fnv.New128(),
+	}
+	for _, o := range opts {
+		o(q)
 	}
 	return q
+}
+
+func WithHash(h hash.Hash) Option {
+	return func(q *queue) {
+		q.hash = h
+	}
 }
 
 type queue struct {
 	db     *badger.DB
 	prefix []byte
+	hash   hash.Hash
 
 	empty  *sync.Cond
 	closed uint32
@@ -79,18 +94,25 @@ func (q *queue) signal() {
 }
 
 func (q *queue) isClosed() bool {
-	return q.closed > 0
+	return atomic.LoadUint32(&q.closed) > 0
 }
 
 func (q *queue) Put(data []byte) error {
-	return q.PutKey(data, nil)
+	if q.isClosed() {
+		return ErrQueueClosed
+	}
+	_, err := q.hash.Write(data)
+	if err != nil {
+		return err
+	}
+	key := q.hash.Sum(nil)
+	q.hash.Reset()
+	return q.PutKey(key, data)
 }
 
 // PutKey will put a new value at the back of the queue by storing
 // some value using the given key in the queue backend.
 func (q *queue) PutKey(key, value []byte) error {
-	q.empty.L.Lock()
-	defer q.empty.L.Unlock()
 	if q.isClosed() {
 		return ErrQueueClosed
 	}
@@ -101,10 +123,15 @@ func (q *queue) PutKey(key, value []byte) error {
 	)
 	key = bytes.Join([][]byte{q.prefix, key}, nil)
 
+	q.empty.L.Lock()
+	defer q.empty.L.Unlock()
 	if q.head == nil || q.size == 0 {
 		q.head = key
 		q.tail = key
 		err = q.db.Update(func(txn *badger.Txn) error {
+			if q.isClosed() {
+				return ErrQueueClosed
+			}
 			return putNode(&node{Key: key, Val: value}, txn)
 		})
 		if err != nil {
@@ -122,6 +149,9 @@ func (q *queue) PutKey(key, value []byte) error {
 	}
 	err = q.db.Update(func(txn *badger.Txn) error {
 		tail := &node{Key: next}
+		if q.isClosed() {
+			return ErrQueueClosed
+		}
 		err := getNode(tail, txn)
 		if err != nil {
 			return err
