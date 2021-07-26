@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"errors"
 	"hash/fnv"
 	"io"
 	"net/http"
@@ -15,14 +14,13 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
 
 //go:generate protoc -I.. -I../protobuf --go_out=paths=source_relative:./pb --go-grpc_out=paths=source_relative:./pb page.proto
-
-// go:generate protoc -I../protobuf --go_out=paths=source_relative:. ../protobuf/page_request.proto
 
 var (
 	HttpClient = &http.Client{
@@ -87,6 +85,9 @@ type Page struct {
 	Title    string
 	Encoding string
 	Words    []string
+
+	Response *http.Response
+	Hash     [16]byte
 }
 
 // Fetch will take a page and fetch the document to retrieve
@@ -118,8 +119,8 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 	p.ResponseTime = time.Since(now)
+	p.Response = resp // TODO This will use lots of memory...
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		p.RetryAfter = getRetryTime(resp.Header)
@@ -134,7 +135,18 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		p.URL = resp.Request.URL
 	}
 
-	root, err := html.ParseWithOptions(resp.Body)
+	var (
+		buf  bytes.Buffer
+		hash = fnv.New128()
+	)
+	_, err = io.Copy(&buf, io.TeeReader(resp.Body, hash))
+	if err != nil {
+		return errors.Wrap(err, "could not read http response body")
+	}
+	copy(p.Hash[:], hash.Sum(nil))
+	resp.Body.Close()
+
+	root, err := html.ParseWithOptions(&buf)
 	if err != nil {
 		// Could be an image or non-html page,
 		// don't return an error

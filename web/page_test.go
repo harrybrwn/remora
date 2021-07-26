@@ -1,78 +1,64 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"fmt"
 	"html/template"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/dgraph-io/badger/v3"
 )
 
 func Test(t *testing.T) {
+	var buf, b bytes.Buffer
+	buf.WriteString("hello")
+	io.Copy(os.Stdout, &buf)
+	io.Copy(os.Stdout, io.TeeReader(&buf, &b))
+	s := buf.String()
+	println()
+	fmt.Println(len(s))
+	p := NewPageFromString("https://en.wikipedia.org/", 0)
+	p.Fetch()
+	fmt.Println(p.Hash)
+}
+
+func TestSitemap(t *testing.T) {
 	t.Skip()
-	var (
-		err error
-	)
-	u := urlsfunc(t)
-	l := newLocalListener()
-	base := "http://" + l.Addr().String()
-	testpages := make([]*testpage, 0)
-	for i := 0; i < 500; i++ {
-		l := make([]string, 0)
-		for j := 0; j < 200; j++ {
-			l = append(l, "/"+strconv.FormatInt(int64(rand.Intn(500)), 10))
-		}
-		testpages = append(testpages, &testpage{
-			Title: strconv.FormatInt(int64(i), 10),
-			Links: u(base, l...),
-		})
-	}
-	srv := newserver(l, newTestSite(testpages))
-	srv.Start()
-	defer srv.Close()
-	HttpClient = srv.Client()
-
-	c := NewCrawler(
-		WithVisitor(&testvisitor{}),
-		WithLimit(2),
-		WithQueueSize(100),
-	)
-
-	opts := badger.DefaultOptions("")
-	opts.InMemory = true
-	c.DB, err = badger.Open(opts)
+	s := "https://www.npr.org/live-updates/sitemap.xml"
+	// s = "https://www.goodreads.com/siteindex.author.xml"
+	sm, err := GetSitemap(s)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	page := ParsePageRequest(base+"/1", 0)
-	c.Enqueue(page)
-	ctx, stop := context.WithCancel(context.Background())
-	c.wg.Add(1)
-	c.Crawl(ctx, 10)
-	defer stop()
-	<-ctx.Done()
+	if len(sm.SitemapContents) == 0 {
+		sm.FillContents(context.Background(), 500)
+	}
+	fmt.Printf("%+v\n", sm)
 }
 
-type testvisitor struct {
-	NoOpVisitor
-}
-
-func (tv *testvisitor) LinkFound(u *url.URL) {
-	// fmt.Println(u)
+func TestURLKey(t *testing.T) {
+	link := "https://ar.wikipedia.org/wiki/%D9%85%D9%88%D8%B3%D9%88%D8%B9%D8%A9"
+	u, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("visited_" + link)
+	got := urlKey(u)
+	if !bytes.Equal(got, want) {
+		t.Errorf("wrong result: got %q, want %q", got, want)
+	}
 }
 
 func TestFetch(t *testing.T) {
+	t.Skip()
 	t.Run("Fetch en.wikipedia", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(testHTTPHandler))
 		defer srv.Close()
@@ -231,15 +217,4 @@ func newserver(l net.Listener, h http.Handler) *httptest.Server {
 		Listener: l,
 		Config:   &http.Server{Handler: h},
 	}
-}
-
-func inMemDB(t *testing.T) *badger.DB {
-	opts := badger.DefaultOptions("")
-	opts.InMemory = true
-	opts.Logger = log
-	db, err := badger.Open(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return db
 }
