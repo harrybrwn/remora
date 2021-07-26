@@ -2,27 +2,22 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"net"
 	_ "net/http/pprof"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/badger/v3"
-	"github.com/go-redis/redis"
 	"github.com/harrybrwn/config"
 	"github.com/harrybrwn/diktyo/cmd"
-	"github.com/harrybrwn/diktyo/db"
 	"github.com/harrybrwn/diktyo/frontier"
 	"github.com/harrybrwn/diktyo/internal/logging"
+	"github.com/harrybrwn/diktyo/internal/rabbitmq"
 	"github.com/harrybrwn/diktyo/internal/visitor"
-	"github.com/harrybrwn/diktyo/storage"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
@@ -32,10 +27,6 @@ import (
 )
 
 var (
-	client = http.Client{
-		Transport: http.DefaultTransport,
-		Timeout:   time.Second * 20,
-	}
 	log     = logrus.New()
 	logfile = lumberjack.Logger{
 		Filename:   "crawler.log",
@@ -52,8 +43,6 @@ func main() {
 		conf cmd.Config
 	)
 	godotenv.Load()
-	web.RetryLimit = 0
-
 	cmd := NewCLIRoot(&conf)
 	conf.Bind(cmd.PersistentFlags())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -103,6 +92,11 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 
 	c.AddCommand(
 		newSpiderCmd(conf),
+		newPurgeCmd(conf),
+		newEnqueueCmd(conf),
+		newQueueCmd(conf),
+		newRedisCmd(conf),
+		newHitCmd(),
 		config.NewConfigCommand(),
 		&cobra.Command{
 			Use:   "list <url>",
@@ -116,13 +110,27 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 			Args:  cobra.MinimumNArgs(1),
 			RunE:  runKeywordsCmd,
 		},
-		newPurgeCmd(conf),
-		newEnqueueCmd(conf),
-		newQueueCmd(conf),
-		newRedisCmd(conf),
 		&cobra.Command{
 			Use: "test", Hidden: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
+				r := &net.Resolver{
+					PreferGo: true,
+					Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+						d := net.Dialer{
+							Timeout: time.Millisecond * 10000,
+						}
+						return d.DialContext(ctx, network, "8.8.8.8:53")
+					},
+				}
+				t := time.Now()
+				ips, err := r.LookupHost(cmd.Context(), "www.google.com")
+				if err != nil {
+					return err
+				}
+				for _, ip := range ips {
+					fmt.Println(ip)
+				}
+				fmt.Println(time.Since(t))
 				return nil
 			},
 		},
@@ -149,100 +157,6 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 	)
 	c.SetUsageTemplate(config.IndentedCobraHelpTemplate)
 	return c
-}
-
-type crawlFlags struct {
-	redis bool
-}
-
-func crawl(ctx context.Context, conf *cmd.Config, flags *crawlFlags) error {
-	var (
-		err   error
-		start = time.Now()
-		sigs  = make(chan os.Signal, 1)
-	)
-	signal.Notify(sigs, os.Interrupt)
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
-
-	var qdb *badger.DB
-	opts := badger.DefaultOptions("/var/local/diktyo/visited")
-	qdb, err = badger.Open(opts)
-	if err != nil {
-		return errors.Wrap(err, "could not open key-value storage")
-	}
-	defer closeDB(qdb)
-	db, err := db.New(&conf.DB)
-	if err != nil {
-		return errors.Wrap(err, "could not connect to database")
-	}
-	defer db.Close()
-
-	var set storage.URLSet
-	if flags.redis {
-		set = storage.NewRedisURLSet(redis.NewClient(conf.RedisOpts()))
-	} else {
-		set = storage.NewBadgerURLSet(qdb)
-	}
-
-	var (
-		// vis     = visitor.New(db)
-		vis = &visitor.FSVisitor{
-			Base:  "./crawl-output",
-			Hosts: make(map[string]struct{}),
-		}
-		ch      = make(chan *web.PageRequest, conf.QueueSize)
-		crawler = web.NewCrawler(
-			web.WithVisitor(vis),
-			web.WithLimit(config.GetUint32("depth")),
-			web.WithQueue(ch),
-			web.WithSleep(conf.Sleep),
-			web.WithDB(qdb),
-			web.WithURLSet(set),
-		)
-	)
-
-	web.UserAgent = "Remora"
-	if len(conf.Seeds) < 1 {
-		return errors.New("no seed URLs")
-	}
-	visitor.AddHosts(vis, conf.AllowedHosts)
-
-	go runtimeCommandHandler(ctx, stop, crawler)
-	for _, seed := range conf.Seeds {
-		u, err := url.Parse(seed)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		visitor.AddHost(vis, u.Host)
-		log.Infof("crawler enqueue %s", seed)
-		crawler.Enqueue(web.NewPageRequest(u, 0))
-	}
-
-	log.WithFields(logrus.Fields{
-		"seeds": conf.Seeds, "max_depth": config.GetUint("depth"),
-	}).Info("Starting Crawl")
-
-	crawler.Add(1)
-	go crawler.Crawl(ctx, conf.RequestLimit)
-
-	select {
-	case <-sigs:
-		stop()
-		close(ch)
-	case <-ctx.Done():
-	}
-	err = crawler.Close()
-	if err != nil {
-		log.WithError(err).Error("could not close web crawler")
-	}
-
-	log.WithFields(logrus.Fields{
-		"duration": time.Since(start),
-		"total":    crawler.N(),
-	}).Info("Stopping Crawler")
-	return nil
 }
 
 const DataDir = "/var/local/remora"
@@ -318,23 +232,13 @@ func initLogger(nocolor bool, lvl logrus.Level) {
 	frontier.SetLogger(log)
 }
 
-func closeDB(db *badger.DB) {
-	err := db.Close()
-	if err != nil {
-		log.WithError(err).Error("could not close persistant queue")
-	}
-	err = os.RemoveAll(db.Opts().Dir)
-	if err != nil {
-		log.WithError(err).Error("could not remove persistant queue")
-	}
-}
-
 func newQueueListCmdFunc(conf *cmd.Config) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
-		queues, err := listQueues(
-			conf.MessageQueue.Host,
-			conf.MessageQueue.Management.Port,
-		)
+		ms := rabbitmq.ManagementServer{
+			Host: conf.MessageQueue.Host,
+			Port: conf.MessageQueue.Management.Port,
+		}
+		queues, err := ms.Queues()
 		if err != nil {
 			return err
 		}
@@ -343,30 +247,4 @@ func newQueueListCmdFunc(conf *cmd.Config) func(*cobra.Command, []string) error 
 		}
 		return nil
 	}
-}
-
-type RabbitQueue struct {
-	Name       string `json:"name"`
-	VHost      string `json:"vhost"`
-	Messages   int    `json:"messages"`
-	State      string `json:"state"`
-	AutoDelete bool   `json:"auto_delete"`
-}
-
-func listQueues(host string, port int) ([]RabbitQueue, error) {
-	var url = fmt.Sprintf("http://%s:%d/api/queues/", host, port)
-	req, _ := http.NewRequest("GET", url, nil)
-	req.SetBasicAuth("guest", "guest")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	queues := make([]RabbitQueue, 0)
-	err = json.NewDecoder(resp.Body).Decode(&queues)
-	if err != nil {
-		return nil, err
-	}
-	return queues, nil
 }

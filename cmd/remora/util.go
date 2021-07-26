@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/url"
@@ -13,9 +13,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/harrybrwn/diktyo/event"
+	"github.com/harrybrwn/diktyo/frontier"
 	"github.com/harrybrwn/diktyo/internal"
+	"github.com/harrybrwn/diktyo/web"
 	"github.com/sirupsen/logrus"
+	"github.com/streadway/amqp"
 )
+
+func publish(p event.Publisher, hash hash.Hash, host string, req *web.PageRequest) error {
+	hash.Reset()
+	_, err := io.WriteString(hash, host)
+	if err != nil {
+		return err
+	}
+	var (
+		key = fmt.Sprintf("%x.%s", hash.Sum(nil)[:2], host)
+		msg = amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			Priority:     0,
+		}
+	)
+	err = frontier.SetPageReqAsMessageBody(req, &msg)
+	if err != nil {
+		return err
+	}
+	return p.Publish(key, msg)
+}
 
 func isTooManyOpenFiles(err error) bool {
 	e := internal.UnwrapAll(err)
@@ -24,57 +48,6 @@ func isTooManyOpenFiles(err error) bool {
 		return false
 	}
 	return errno == syscall.EMFILE || errno == syscall.ENFILE
-}
-
-func findNthFile(format string) (string, error) {
-	var (
-		nth  int
-		name string
-		err  error
-	)
-	for {
-		if nth > 1000 {
-			return "", errors.New("too many output files")
-		}
-		name = fmt.Sprintf(format, nth)
-		_, err = os.Stat(name)
-		if os.IsNotExist(err) || nth > 1_000 {
-			return name, nil
-		}
-		nth++
-	}
-}
-
-func setLoggerFile(l *logrus.Logger, name string) error {
-	name, err := findNthFile(name + "_%d.log")
-	if err != nil {
-		return err
-	}
-	logfile, err := os.Create(name)
-	if err != nil {
-		return err
-	}
-	// Don't close file, it will be held for the entire program
-	// duration anyways. If the caller really wants to close, then
-	// they can use an type assertion for `interface { Close() error }`
-	l.SetOutput(logfile)
-	return nil
-}
-
-func loggerFile(name string) io.Writer {
-	name, err := findNthFile(name + "_%d.log")
-	if err != nil {
-		return nil
-	}
-	logfile, err := os.Create(name)
-	if err != nil {
-		return nil
-	}
-	return logfile
-}
-
-func setErrorLogfile(l *logrus.Logger) error {
-	return setLoggerFile(l, "diktyo_errors")
 }
 
 // TODO remove this
@@ -111,24 +84,19 @@ func isNoSuchHost(err error) bool {
 	return false
 }
 
-func validURLScheme(scheme string) bool {
-	switch scheme {
-	case
-		"ftp",          // file transfer protocol
-		"irc",          // IRC chat
-		"mailto",       // email
-		"tel",          // telephone
-		"sms",          // text messaging
-		"fb-messenger", // facebook messenger
-		"waze",         // waze maps app
-		"whatsapp",     // whatsapp messenger app
-		"javascript",
-		"":
-		return false
-	case "http", "https": // TODO add support for other protocols later
-		return true
+func periodicMemLogs(ctx context.Context, d time.Duration) {
+	var mem runtime.MemStats
+	tick := time.NewTicker(d)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			runtime.ReadMemStats(&mem)
+			log.WithFields(memoryLogs(&mem)).Info("memory")
+		}
 	}
-	return false
 }
 
 func periodicMemDump(ctx context.Context, d time.Duration) {

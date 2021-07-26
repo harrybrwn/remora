@@ -1,19 +1,26 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"hash/fnv"
+	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis"
 	"github.com/harrybrwn/diktyo/cmd"
 	"github.com/harrybrwn/diktyo/frontier"
+	"github.com/harrybrwn/diktyo/internal/rabbitmq"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/streadway/amqp"
-	"google.golang.org/protobuf/proto"
 )
 
 func newPurgeCmd(conf *cmd.Config) *cobra.Command {
@@ -28,7 +35,12 @@ func newPurgeCmd(conf *cmd.Config) *cobra.Command {
 			Use: "queue", Aliases: []string{"queues", "q"},
 			Short: "Purge all rabbitMQ queues",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return purgeQueues(conf.MessageQueue, del)
+				ms := rabbitmq.ManagementServer{
+					Host: conf.MessageQueue.Host,
+					Port: conf.MessageQueue.Management.Port,
+				}
+				fmt.Printf("%+v\n", ms)
+				return purgeQueues(ms, conf.MessageQueue, del)
 			},
 		},
 		&cobra.Command{
@@ -47,7 +59,11 @@ func newPurgeCmd(conf *cmd.Config) *cobra.Command {
 					return err
 				}
 				defer log.Info("purged redis")
-				return purgeQueues(conf.MessageQueue, del)
+				ms := rabbitmq.ManagementServer{
+					Host: conf.MessageQueue.Host,
+					Port: conf.MessageQueue.Management.Port,
+				}
+				return purgeQueues(ms, conf.MessageQueue, del)
 			},
 		},
 	)
@@ -55,26 +71,93 @@ func newPurgeCmd(conf *cmd.Config) *cobra.Command {
 }
 
 func newEnqueueCmd(conf *cmd.Config) *cobra.Command {
-	var fromConfig bool
+	var (
+		fromConfig bool
+		useSitemap bool
+	)
 	c := &cobra.Command{
 		Use:   "enqueue",
 		Short: "Send a url to the frontier",
 		Long:  "Send a url to the frontier of the distributed crawler",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			seeds := args[:]
-			if fromConfig {
-				seeds = conf.Seeds
+			var (
+				seeds = make(chan string)
+				wg    sync.WaitGroup
+			)
+			if useSitemap {
+				web.HttpClient.Timeout = time.Minute * 10 // yikes!
+				wg.Add(len(args))
+				go func() {
+					wg.Wait()
+					close(seeds)
+					log.Info("closed url channel")
+				}()
+				for _, host := range args {
+					log.Infof("getting sitemap for %q", host)
+					go gatherSitemap(cmd.Context(), host, seeds, &wg)
+				}
+			} else {
+				var urls []string
+				if fromConfig {
+					urls = conf.Seeds[:]
+				} else {
+					urls = args[:]
+				}
+				l := len(urls)
+				if l < 1 {
+					return errors.New("no urls to enqueue")
+				}
+				wg.Add(l)
+				go func() {
+					wg.Wait()
+					close(seeds)
+					log.Info("closed url channel")
+				}()
+				for _, s := range urls {
+					go func(s string) {
+						defer wg.Done()
+						seeds <- s
+					}(s)
+				}
 			}
-			if len(seeds) < 1 {
-				return errors.New("no seed urls given")
-			}
-			log.Infof("enqueue %v", seeds)
-			return enqueue(&conf.MessageQueue, seeds...)
+			return enqueue(cmd.Context(), &conf.MessageQueue, seeds)
 		},
 	}
 	c.Flags().BoolVar(&fromConfig, "from-config", fromConfig,
 		"enqueue the seed urls defined in the config file")
+	c.Flags().BoolVar(&useSitemap, "use-sitemap", useSitemap, "enqueue urls in the website's sitemap")
 	return c
+}
+
+func gatherSitemap(ctx context.Context, host string, ch chan string, wg *sync.WaitGroup) error {
+	defer wg.Done()
+	robs, err := web.GetRobotsTxT(host)
+	if err != nil {
+		log.WithError(err).Warn("could not get robots.txt")
+		return err
+	}
+	for _, sitemapURL := range robs.Sitemaps {
+		wg.Add(1)
+		go func(l string) {
+			defer wg.Done()
+			sitemapindex, err := web.GetSitemap(l)
+			if err != nil {
+				log.WithError(err).WithField("url", l).Warn("could not get sitemap")
+				return
+			}
+			sitemapindex.FillContents(ctx, 3)
+			for _, sitemap := range sitemapindex.SitemapContents {
+				for _, u := range sitemap.URLS {
+					select {
+					case ch <- u.Loc:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}(sitemapURL)
+	}
+	return nil
 }
 
 func newRedisCmd(conf *cmd.Config) *cobra.Command {
@@ -120,7 +203,6 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 				return nil
 			},
 		},
-
 		&cobra.Command{
 			Use:  "get",
 			Args: cobra.MinimumNArgs(1),
@@ -138,7 +220,32 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 				return nil
 			},
 		},
-
+		&cobra.Command{
+			Use:  "has",
+			Args: cobra.MinimumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				client, err := newclient()
+				if err != nil {
+					return err
+				}
+				defer client.Close()
+				err = client.Get(args[0]).Err()
+				fmt.Println(err != redis.Nil)
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:  "put <key> <value>",
+			Args: cobra.ExactArgs(2),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				cli, err := newclient()
+				if err != nil {
+					return err
+				}
+				defer cli.Close()
+				return cli.Set(args[0], args[1], 0).Err()
+			},
+		},
 		&cobra.Command{
 			Use: "delete", Aliases: []string{"del"},
 			Args: cobra.MinimumNArgs(1),
@@ -158,6 +265,55 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			},
 		},
 	)
+	return c
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func newHitCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "hit",
+		Short: "",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req, err := http.NewRequest("HEAD", args[0], nil)
+			if err != nil {
+				return err
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			var l int
+			for key := range resp.Header {
+				l = max(l, len(key))
+			}
+			for key, vals := range resp.Header {
+				fmt.Printf("%s%s%v\n", key, strings.Repeat(" ", l-len(key)+1), vals)
+			}
+			fmt.Println()
+
+			s := resp.Header.Get("Last-Modified")
+			if s != "" {
+				lastMod, err := time.Parse(time.RFC1123, s)
+				if err != nil {
+					return err
+				}
+				fmt.Println("last modified", time.Since(lastMod), "ago")
+			}
+			s = resp.Header.Get("Cache-Control")
+			if s != "" {
+				fmt.Println("Cache Control:", s)
+			}
+			return nil
+		},
+	}
 	return c
 }
 
@@ -184,6 +340,23 @@ func newQueueCmd(conf *cmd.Config) *cobra.Command {
 			RunE: newQueueListCmdFunc(conf),
 		},
 		&cobra.Command{
+			Use: "channels", Short: "List all channels",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				ms := rabbitmq.ManagementServer{
+					Host: conf.MessageQueue.Host,
+					Port: conf.MessageQueue.Management.Port,
+				}
+				channels, err := ms.Channels()
+				if err != nil {
+					return err
+				}
+				for _, c := range channels {
+					fmt.Println(c.Name, c.Number, c.MessageStats.DeliverGetDetails.Rate)
+				}
+				return nil
+			},
+		},
+		&cobra.Command{
 			Use: "peek", Short: "Peek at the front of a queue",
 			Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -205,11 +378,8 @@ func purgeRedis(conf *cmd.Config, args []string) error {
 	return c.Del(args...).Err()
 }
 
-func purgeQueues(conf cmd.MessageQueueConfig, del bool) error {
-	queues, err := listQueues(
-		conf.Host,
-		conf.Management.Port,
-	)
+func purgeQueues(ms rabbitmq.ManagementServer, conf cmd.MessageQueueConfig, del bool) error {
+	queues, err := ms.Queues()
 	if err != nil {
 		return err
 	}
@@ -232,7 +402,7 @@ func purgeQueues(conf cmd.MessageQueueConfig, del bool) error {
 	var wg sync.WaitGroup
 	wg.Add(len(queues))
 	for _, queue := range queues {
-		go func(q RabbitQueue) {
+		go func(q rabbitmq.Queue) {
 			defer wg.Done()
 			n, err := fn(q.Name)
 			if err != nil {
@@ -246,7 +416,7 @@ func purgeQueues(conf cmd.MessageQueueConfig, del bool) error {
 	return nil
 }
 
-func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
+func enqueue(ctx context.Context, conf *cmd.MessageQueueConfig, seeds <-chan string) error {
 	var wg sync.WaitGroup
 	conn, err := amqp.Dial(conf.URI())
 	if err != nil {
@@ -272,7 +442,7 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 			Durable: true,
 		},
 	}
-	err = front.Connect(frontier.Connect{Host: conf.Host, Port: conf.Port})
+	err = front.Connect(ctx, frontier.Connect{Host: conf.Host, Port: conf.Port})
 	if err != nil {
 		return err
 	}
@@ -282,36 +452,133 @@ func enqueue(conf *cmd.MessageQueueConfig, seeds ...string) error {
 		return err
 	}
 
-	wg.Add(len(seeds))
-	for _, seed := range seeds {
-		req := web.ParsePageRequest(seed, 0)
-		go func() {
-			defer wg.Done()
-			u, err := url.Parse(req.URL)
-			if err != nil {
-				log.WithError(err).Error("could not parse seed url")
+	spinCtx, cancelSpinner := context.WithCancel(ctx)
+	go func() {
+		var (
+			i uint64
+			c byte
+		)
+		for {
+			select {
+			case <-spinCtx.Done():
 				return
+			default:
 			}
+			switch i % 4 {
+			case 0:
+				c = '\\'
+			case 1:
+				c = '|'
+			case 2:
+				c = '/'
+			case 3:
+				c = '-'
+			}
+			fmt.Printf("\r%c", c)
+			time.Sleep(time.Millisecond * 50)
+			i++
+		}
+	}()
 
-			rawreq, err := proto.Marshal(req)
-			if err != nil {
-				log.WithError(err)
-				return
+	n := 0
+	for {
+		select {
+		case <-ctx.Done():
+			cancelSpinner()
+			return nil
+		case seed, ok := <-seeds:
+			if !ok {
+				goto done
 			}
-			msg := amqp.Publishing{
-				Body:         rawreq,
-				DeliveryMode: amqp.Persistent,
-				ContentType:  "application/vnd.google.protobuf",
-				Type:         frontier.PageRequest.String(),
-				Priority:     0,
-			}
-			err = pub.Publish(u.Host, msg)
-			if err != nil {
-				log.WithError(err).Error("could not publish url request")
-				return
-			}
-		}()
+			wg.Add(1)
+			req := web.ParsePageRequest(seed, 0)
+			n++
+			go func() {
+				defer wg.Done()
+				u, err := url.Parse(req.URL)
+				if err != nil {
+					log.WithError(err).Error("could not parse seed url")
+					return
+				}
+
+				hash := fnv.New128()
+				// io.WriteString(hash, u.Host)
+				// rawreq, err := proto.Marshal(req)
+				// if err != nil {
+				// 	log.WithError(err)
+				// 	return
+				// }
+				// msg := amqp.Publishing{
+				// 	Body:         rawreq,
+				// 	DeliveryMode: amqp.Persistent,
+				// 	ContentType:  "application/vnd.google.protobuf",
+				// 	Type:         frontier.PageRequest.String(),
+				// 	Priority:     0,
+				// }
+				// key := fmt.Sprintf("%x.%s", hash.Sum(nil)[:2], u.Host)
+				// err = pub.Publish(key, msg)
+
+				err = publish(pub, hash, u.Host, req)
+				if err != nil {
+					log.WithError(err).Error("could not publish url request")
+					return
+				}
+			}()
+		}
 	}
+done:
 	wg.Wait()
+	cancelSpinner()
+	fmt.Print("\r")
+	log.Infof("queued %d pages", n)
+	return nil
+}
+
+func runListCmd(cmd *cobra.Command, args []string) error {
+	page := web.NewPageFromString(args[0], 0)
+	err := page.FetchCtx(cmd.Context())
+	if err != nil {
+		return err
+	}
+	for _, l := range page.Links {
+		fmt.Println(l)
+	}
+	fmt.Println(len(page.Links), "links found")
+	return nil
+}
+
+func runKeywordsCmd(cmd *cobra.Command, args []string) error {
+	p := web.NewPageFromString(args[0], 0)
+	err := p.FetchCtx(cmd.Context())
+	if err != nil {
+		return err
+	}
+	k, err := p.Keywords()
+	if err != nil {
+		return err
+	}
+	cmd.Printf("%s\n", strings.Join(k, " "))
+	return nil
+}
+
+func getMemStats() *runtime.MemStats {
+	var s runtime.MemStats
+	runtime.ReadMemStats(&s)
+	return &s
+}
+
+func toMB(bytes uint64) float64 {
+	return float64(bytes) / 1024.0 / 1024.0
+}
+
+func setLogLevelRunFunc(_ *cobra.Command, args []string) error {
+	if len(args) < 1 {
+		return errors.New("no level given")
+	}
+	lvl, err := logrus.ParseLevel(args[0])
+	if err != nil {
+		return err
+	}
+	log.SetLevel(lvl)
 	return nil
 }

@@ -1,25 +1,25 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"net/url"
 	"os"
+	"os/signal"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/harrybrwn/diktyo/event"
+	"github.com/harrybrwn/diktyo/internal/visitor"
+	"github.com/harrybrwn/diktyo/storage"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/sirupsen/logrus"
+	"github.com/streadway/amqp"
+	"google.golang.org/protobuf/proto"
 )
 
 func Test(t *testing.T) {
-	initLogger(false, logrus.InfoLevel)
-	for k, v := range log.Hooks {
-		fmt.Printf("%v %#[2]v\n", k, v)
-		for _, h := range v {
-			fmt.Printf("  %v\n", h)
-		}
-	}
 }
 
 func TestRedirects(t *testing.T) {
@@ -62,30 +62,69 @@ func TestRedirects(t *testing.T) {
 	wg.Wait()
 }
 
-func TestRuntimeCommands(t *testing.T) {
-	var (
-		crawler = web.NewCrawler()
-		cmd     = NewRuntimeCmd(crawler)
-		buf     bytes.Buffer
-	)
-	cmd.SetOut(&buf)
-	cmd.SetArgs([]string{"count"})
-	err := cmd.Execute()
-	if err != nil {
-		t.Error()
-	}
-	if buf.String() != "count: 0\n" {
-		t.Error("wrong output")
-	}
-	buf.Reset()
+type vis struct{}
 
-	cmd.SetArgs([]string{"help"})
-	err = cmd.Execute()
+func (*vis) Filter(*web.PageRequest, *url.URL) error { return nil }
+func (*vis) Visit(_ context.Context, p *web.Page)    { log.Infof("visit %s", p.URL.String()) }
+func (*vis) LinkFound(*url.URL)                      {}
+
+func TestSpider(t *testing.T) {
+	log.SetLevel(logrus.TraceLevel)
+	// log.SetLevel(logrus.InfoLevel)
+	// log.SetLevel(logrus.PanicLevel)
+	web.SetLogger(log)
+	visitor.SetLogger(log)
+	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
+	defer cancel()
+	// opts := badger.DefaultOptions("")
+	// opts.Logger = nil
+	// opts.InMemory = true
+	// db, err := badger.Open(opts)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
+	// bus := eventqueue.New(db)
+	bus := event.NewChannelBus()
+	defer func() {
+		// close bus before db
+		bus.Close()
+		// db.Close()
+	}()
+	req := web.PageRequest{
+		URL:   "https://en.wikipedia.org/wiki/Main_Page",
+		Depth: 0,
+	}
+	raw, err := proto.Marshal(&req)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	if buf.Len() == 0 {
-		t.Error("should output help message, got zero length output")
+	go func() {
+		<-time.After(time.Second * 2)
+		pub, _ := bus.Publisher()
+		log.Info("publishing seed url")
+		err = pub.Publish("en.wikipedia.org", amqp.Publishing{Body: raw})
+		if err != nil {
+			t.Error(err)
+			cancel()
+		}
+	}()
+
+	ctx, cancel = context.WithTimeout(ctx, time.Second*5)
+	defer cancel()
+	s := &spider{
+		Wait:    time.Millisecond * 500 * 2 * 10,
+		Host:    "en.wikipedia.org",
+		Visitor: &vis{},
+		URLSet:  storage.NewInMemoryURLSet(),
+		Bus:     bus,
 	}
-	buf.Reset()
+	go func() {
+		err = s.start(ctx)
+		if err != nil {
+			t.Error(err)
+			cancel()
+		}
+	}()
+	<-ctx.Done()
 }
