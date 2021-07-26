@@ -17,6 +17,18 @@ type FSVisitor struct {
 	mu    sync.Mutex
 }
 
+func (fsv *FSVisitor) Filter(p *web.PageRequest, u *url.URL) error {
+	fsv.mu.Lock()
+	_, ok := fsv.Hosts[u.Host]
+	fsv.mu.Unlock()
+	if ok {
+		return nil
+	}
+	return web.ErrSkipURL
+}
+
+func (fsv *FSVisitor) LinkFound(u *url.URL) {}
+
 func (fsv *FSVisitor) Visit(ctx context.Context, p *web.Page) {
 	select {
 	case <-ctx.Done():
@@ -66,15 +78,3 @@ func writePage(w io.Writer, p *web.Page) error {
 	_, err = io.WriteString(w, body)
 	return err
 }
-
-func (fsv *FSVisitor) Filter(p *web.PageRequest, u *url.URL) error {
-	fsv.mu.Lock()
-	_, ok := fsv.Hosts[u.Host]
-	fsv.mu.Unlock()
-	if ok {
-		return nil
-	}
-	return web.ErrSkipURL
-}
-
-func (fsv *FSVisitor) LinkFound(u *url.URL) {}

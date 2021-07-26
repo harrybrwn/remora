@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-redis/redis"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/sirupsen/logrus"
 )
@@ -19,6 +21,14 @@ var logs bytes.Buffer
 func init() {
 	log.SetLevel(logrus.DebugLevel) // make sure loggins is happening
 	log.SetOutput(&logs)            // but logging is silent
+}
+
+type redisMock struct{}
+
+func (rm *redisMock) MGet(...string) *redis.SliceCmd { return &redis.SliceCmd{} }
+func (rm *redisMock) Get(string) *redis.StringCmd    { return &redis.StringCmd{} }
+func (rm *redisMock) Set(string, interface{}, time.Duration) *redis.StatusCmd {
+	return &redis.StatusCmd{}
 }
 
 func TestVisit(t *testing.T) {
@@ -34,7 +44,7 @@ func TestVisit(t *testing.T) {
 		ctx    = context.Background()
 		page   = web.NewPageFromString("https://en.wikipedia.org/wiki/Main_Page", 0)
 		pageid = getID(page.URL.String())
-		v      = New(db)
+		v      = New(db, &redisMock{})
 	)
 	AddHost(v, "en.wikipedia.org")
 	links := []string{

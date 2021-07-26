@@ -10,6 +10,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -19,7 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-redis/redis"
 	"github.com/harrybrwn/diktyo/internal"
+	"github.com/harrybrwn/diktyo/storage"
 	"github.com/harrybrwn/diktyo/web"
 	"github.com/lib/pq" // database driver
 	"github.com/sirupsen/logrus"
@@ -44,10 +47,12 @@ func init() {
 
 func SetLogger(l *logrus.Logger) { log = l }
 
-func New(db *sql.DB) *Visitor {
+func New(db *sql.DB, redis storage.Redis) *Visitor {
 	return &Visitor{
-		db:    db,
-		Hosts: make(map[string]struct{}),
+		db:     db,
+		hashes: hashSet{redis},
+		Hosts:  make(map[string]struct{}),
+		// hashes: make(map[[16]byte]struct{}),
 	}
 }
 
@@ -72,8 +77,8 @@ func AddHosts(v web.Visitor, hosts []string) {
 
 type Visitor struct {
 	db      *sql.DB
-	mu      sync.Mutex
 	Hosts   map[string]struct{}
+	hashes  hashSet
 	Visited int64
 }
 
@@ -84,13 +89,14 @@ type stats struct {
 }
 
 func (v *Visitor) Filter(p *web.PageRequest, u *url.URL) error {
-	v.mu.Lock()
-	_, ok := v.Hosts[u.Host]
-	v.mu.Unlock()
-	if ok {
-		return nil
-	}
-	return web.ErrSkipURL
+	// v.mu.Lock()
+	// _, ok := v.Hosts[u.Host]
+	// v.mu.Unlock()
+	// if ok {
+	// 	return nil
+	// }
+	// return web.ErrSkipURL
+	return nil
 }
 
 func (v *Visitor) LinkFound(u *url.URL) {}
@@ -101,6 +107,15 @@ func (v *Visitor) Visit(ctx context.Context, page *web.Page) {
 		return
 	default:
 	}
+	if v.hashes.has(page.Hash) {
+		log.WithFields(logrus.Fields{
+			"url":  page.URL.String(),
+			"hash": hex.EncodeToString(page.Hash[:]),
+		}).Warn("already seen page content hash")
+		return
+	}
+	v.hashes.put(page.Hash)
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if page.Status != 200 {
@@ -118,7 +133,7 @@ func logVisit(page *web.Page, n int64) {
 	l := log.WithFields(logrus.Fields{
 		"n":        n,
 		"depth":    page.Depth,
-		"status":   page.Status,
+		"status":   fmt.Sprintf("%d %s", page.Status, http.StatusText(page.Status)),
 		"hostname": hostname,
 		"resp":     fmt.Sprintf("%v", page.ResponseTime),
 	}).WithFields(memoryLogs(&mem))
@@ -170,9 +185,9 @@ ON CONFLICT (id)
 		chr_encoding    = $15`
 
 func init() {
+	// Programatically making the SQL query smaller
 	insertPageSQL = strings.Replace(insertPageSQL, "\t", " ", -1)
 	insertPageSQL = strings.Replace(insertPageSQL, "\n", " ", -1)
-
 	pat, err := regexp.Compile("[ ]+")
 	if err != nil {
 		panic(err)
@@ -249,9 +264,9 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 			"edge_del": stats.edgeDel,
 			"links":    len(page.Links),
 			"response": page.ResponseTime,
-			"0-total":  time.Since(start) + page.ResponseTime,
+			"0-total":  time.Since(start),
 			"n":        v.Visited,
-		}).Info("done with visit")
+		}).Debug("done with visit")
 	}
 }
 
@@ -269,6 +284,7 @@ func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page
 	var (
 		redirectedFrom string
 		pageurl        = page.URL.String()
+		status         int
 	)
 	if page.Redirected {
 		redirectedFrom = page.RedirectedFrom.String()
@@ -278,6 +294,7 @@ func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page
 		log.Warn("could not resolve ip for ", page.URL.Host)
 		err = nil
 	}
+	status = page.Response.StatusCode
 
 	_, err = handle.ExecContext(ctx, insertPageSQL,
 		id,
@@ -288,7 +305,7 @@ func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page
 		page.Depth,
 		page.Redirected,
 		redirectedFrom,
-		page.Status,
+		status,
 		page.ResponseTime.String(),
 		ipv4,
 		ipv6,
@@ -348,7 +365,10 @@ func insertEdges(ctx context.Context, tx *sql.Tx, h hash.Hash, id []byte, page *
 		case nil, context.Canceled, sqldriver.ErrBadConn:
 			break
 		default:
-			log.WithError(err).Error("could not insert edges")
+			log.WithFields(logrus.Fields{
+				"error": err,
+				"url":   pageurl,
+			}).Error("could not insert edges")
 			return err
 		}
 	}
@@ -374,7 +394,7 @@ func insertEdgesQuery(id []byte, pageurl string, links []string) (*bytes.Buffer,
 			buf.Write([]byte{','})
 		}
 	}
-	io.WriteString(&buf, ` ON CONFLICT(parent_id,child_id,child)DO NOTHING`)
+	io.WriteString(&buf, ` ON CONFLICT(parent_id,child_id)DO NOTHING`)
 	return &buf, values
 }
 
@@ -411,4 +431,17 @@ func memoryLogs(mem *runtime.MemStats) logrus.Fields {
 		"GCs":    mem.NumGC,
 		"lastGC": lastGC.Truncate(time.Millisecond),
 	}
+}
+
+type hashSet struct {
+	r storage.Redis
+}
+
+func (h *hashSet) has(b [16]byte) bool {
+	err := h.r.Get(hex.EncodeToString(b[:])).Err()
+	return err != redis.Nil
+}
+
+func (h *hashSet) put(b [16]byte) error {
+	return h.r.Set(hex.EncodeToString(b[:]), 2, 0).Err()
 }
