@@ -32,6 +32,7 @@ func New(cfg *Config) (*sql.DB, error) {
 	}
 	err = db.Ping()
 	if err != nil {
+		db.Close()
 		return nil, errors.Wrap(err, "could not ping postgres")
 	}
 	return db, nil

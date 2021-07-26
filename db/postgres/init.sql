@@ -41,22 +41,20 @@ CREATE TABLE page (
   title    text,
   keywords tsvector,
 
-  UNIQUE (url, ipv4, ipv6)
+  UNIQUE (url)
 );
 
 CREATE INDEX keyword_idx ON page USING GIST (keywords);
--- CREATE INDEX url_idx     ON page USING GIN  (url);
 
 CREATE TABLE edge (
-  parent_id bytea NOT NULL,
-  child_id bytea NOT NULL,
-  child  url NOT NULL,
-
-  UNIQUE(parent_id, child_id, child)
+  parent_id bytea,
+  child_id bytea,
+  child  url,
+  UNIQUE(parent_id, child_id)
 );
 
-CREATE UNIQUE INDEX idx_edge_parent_child
-  ON edge (parent_id, child_id, child);
+-- CREATE UNIQUE INDEX idx_edge_parent_child
+--   ON edge (parent_id, child_id, child);
 
 CREATE MATERIALIZED VIEW hosts AS
   SELECT
