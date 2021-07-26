@@ -32,12 +32,12 @@ services:
       - 6379:6379
     restart: unless-stopped
 
-  rabbitmq:
+  mq:
     image: rabbitmq:3-management-alpine
     container_name: diktyo-msgq
     restart: unless-stopped
-    environment:
-      RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
+    # environment:
+    #  RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
     ports:
       - target: 5672
         published: 5672

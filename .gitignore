@@ -20,6 +20,7 @@
 /config.yml
 /remora.yml
 /deployment.yml
+/docker-bake*
 Dockerfile.arm
 
 # Notes

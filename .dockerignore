@@ -1,21 +1,16 @@
 # Misc
 /.git/
-/.gitignore
-/.vscode/
-/.env
-/config.yml
 /Dockerfile
-/docker-compose.yml
-/.dockerignore
-/deployment.yml
+/Dockerfile*
 
 # Notes
 /TODO
 *.md
 *.log
 *.dump
-*.pdf
 /db/data/
+/papers/
+**/*.pdf
 
 # Bin
 /bin/
@@ -25,7 +20,7 @@
 # Scripts
 /scripts/
 /cmd/docker/
-/cmd/deploy
+/cmd/deploy/
 /Makefile
 /psql
 /test
@@ -35,9 +30,20 @@
 # Tests
 **/*_test.go
 /web/testdata/
-/crawl-output
+/crawl-output/
 
 # Deployment Code
 deployment.yml
 /cmd/deploy
 /cmd/docker
+
+# Local Config
+/.vscode/
+/config/
+/.gitignore
+/.dockerignore
+/.env
+/config.yml
+/docker-compose.yml
+/deployment.yml
+/docker-bake*

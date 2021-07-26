@@ -9,9 +9,7 @@ import (
 	"github.com/streadway/amqp"
 )
 
-var (
-	ReloadDelay = time.Second * 2
-)
+var ReloadDelay = time.Second * 2
 
 type channelCreator interface {
 	Channel() (*amqp.Channel, error)
@@ -38,7 +36,10 @@ type channel struct {
 
 	notifyCancel chan string
 	notifyClosed chan *amqp.Error
-	prefetch     int
+
+	// Need to save the prefetch for after reloading the
+	// raw channel
+	prefetch int
 }
 
 func initChannel(
@@ -56,7 +57,6 @@ func initChannel(
 }
 
 func (c *channel) Close() error {
-	log.Debug("channel: closing channel")
 	defer close(c.reload)
 	c.cancel()
 	atomic.StoreInt32(&c.open, 0)
@@ -72,7 +72,6 @@ func (c *channel) handleReload() {
 			log.Debug("channel: context canceled in reload handler")
 			return
 		case <-c.conndone:
-			// c.cancel() // connection was closed on purpose
 			if c.ch != nil {
 				c.ch.Close()
 			}
@@ -80,8 +79,6 @@ func (c *channel) handleReload() {
 			return
 		case <-c.notifyClosed:
 			atomic.StoreInt32(&c.open, 0)
-			// log.Debug("channel: close notify... reloading channel")
-			// go func() { <-c.reload }() // make sure the reload channel doesn't block
 			c.reloadChannel()
 		case _, ok := <-c.reload:
 			log.Debug("channel: received on reload channel")
@@ -97,21 +94,19 @@ func (c *channel) handleReload() {
 
 func (c *channel) reloadChannel() {
 	log.Debug("channel: reloading channel")
-	defer log.Debug("channel: channel reloaded")
+	defer log.Info("channel: channel reloaded")
 	atomic.StoreInt32(&c.open, 0)
 
 	c.mu.Lock()
-	log.Debug("channel: reload lock acquired")
 	defer c.mu.Unlock()
-	atomic.StoreInt32(&c.open, 0)
 
 	ch, err := c.conn.Channel()
 	if err != nil {
 		log.WithError(err).Error("channel: could not create new channel")
 		return
 	}
-	log.Debug("channel: created new channel")
 
+	// TODO this is horrible, plz help me
 	var closeOld bool
 	select {
 	case <-c.notifyClosed:
@@ -122,9 +117,7 @@ func (c *channel) reloadChannel() {
 
 	if c.ch != nil && closeOld {
 		// Close old channel in case its still open.
-		log.Debug("channel: closing old channel")
 		err := c.ch.Close()
-		log.Debug("channel: old channel closed")
 		if err != nil {
 			log.WithError(err).Error("channel: could not close old channel")
 		}
@@ -135,7 +128,6 @@ func (c *channel) reloadChannel() {
 		c.cancel() // this should error stop the channel
 		return
 	}
-	log.Debug("channel: new channel set")
 	atomic.StoreInt32(&c.open, 1)
 	c.chOpen.Broadcast()
 }
@@ -161,7 +153,6 @@ func (c *channel) Publish(
 	// protect against multi-threaded publishing
 	// which is not safe.
 	c.wait()
-
 	return c.ch.Publish(
 		exchange,
 		key,
@@ -176,11 +167,12 @@ func (c *channel) Consume(
 	autoAck, exclusive, noLocal, noWait bool,
 	args amqp.Table,
 ) (<-chan amqp.Delivery, error) {
-	// TODO Upon connection reload, queued messages are unabled to be be acknowledged
+	// TODO Upon connection reload, queued messages are
+	// unabled to be be acknowledged... wtf is happening
 	var deliveries = make(chan amqp.Delivery)
 	go func() {
 		defer close(deliveries)
-		defer log.Trace("channel: consumer done with re-tries")
+		defer log.Debug("channel: consumer done with re-tries")
 		for {
 			var (
 				ch  <-chan amqp.Delivery
@@ -211,13 +203,13 @@ func (c *channel) Consume(
 				goto NextConsumer
 			}
 
-			log.Debug("channel: consumer draining inner channel")
 			// Pipe the messages along to the outer
 			// caller's message channel.
 			for {
 				select {
 				case reason := <-c.notifyCancel:
-					log.WithField("reason", reason).Warn("channel: consumer canceled")
+					log.WithField(
+						"reason", reason).Warn("channel: consumer canceled")
 					goto NextConsumer
 				case <-c.ctx.Done():
 					log.Debug("channel: consumer context closed")
@@ -227,7 +219,15 @@ func (c *channel) Consume(
 						log.Debug("channel: consumer inner channel closed")
 						goto NextConsumer
 					}
-					deliveries <- msg
+					// deliveries <- msg
+					select {
+					case deliveries <- msg:
+						// TODO msg.Ack(false)
+					case <-c.ctx.Done():
+						return
+					case <-c.notifyCancel:
+						goto NextConsumer
+					}
 				}
 			}
 		NextConsumer:
@@ -251,13 +251,9 @@ func (c *channel) Channel() (*amqp.Channel, error) {
 	return c.ch, nil
 }
 
-func (ch *channel) Canceled() <-chan string {
-	return ch.notifyCancel
-}
+func (ch *channel) Canceled() <-chan string { return ch.notifyCancel }
 
-func (c *channel) notReady() bool {
-	return atomic.LoadInt32(&c.open) == 0
-}
+func (c *channel) notReady() bool { return atomic.LoadInt32(&c.open) == 0 }
 
 func (c *channel) moveChannel(ch *amqp.Channel) error {
 	err := ch.Qos(c.prefetch, 0, false)
@@ -274,6 +270,12 @@ func (c *channel) WithContext(ctx context.Context) {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 }
 
-func (c *channel) withPretch(prefetch int) {
+func (c *channel) Qos(prefetch int, size int, global bool) error {
+	c.wait()
 	c.prefetch = prefetch
+	return c.ch.Qos(prefetch, size, global)
+}
+
+func (c *channel) WithPrefetch(prefetch int) error {
+	return c.Qos(prefetch, 0, false)
 }

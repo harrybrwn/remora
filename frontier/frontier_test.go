@@ -202,11 +202,12 @@ func TestConsumerPlain(t *testing.T) {
 	t.Skip()
 	signals := make(chan os.Signal, 5)
 	signal.Notify(signals, os.Interrupt)
+	ctx, cancel := context.WithCancel(context.Background())
 	var (
 		front = &Frontier{Exchange: Exchange{
 			Name: exchange, Durable: true, AutoDelete: true}}
 	)
-	err := front.Connect(Connect{Host: "localhost", Port: 5672})
+	err := front.Connect(ctx, Connect{Host: "localhost", Port: 5672})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,6 +228,7 @@ func TestConsumerPlain(t *testing.T) {
 			t.Error(err)
 		}
 	}
+	cancel()
 }
 
 func TestConsumer(t *testing.T) {
@@ -234,10 +236,12 @@ func TestConsumer(t *testing.T) {
 	logrus.SetLevel(logrus.DebugLevel)
 	signals := make(chan os.Signal, 5)
 	signal.Notify(signals, os.Interrupt)
+	timeout := time.Second * 2
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	var (
 		front = &Frontier{Exchange: testexchange}
 	)
-	err := front.Connect(Connect{Host: "localhost", Port: 5672})
+	err := front.Connect(ctx, Connect{Host: "localhost", Port: 5672})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,8 +252,6 @@ func TestConsumer(t *testing.T) {
 	// 	front.conn.Close()
 	// }()
 
-	timeout := time.Second * 2
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	c, err := front.Consumer(
 		queuename,
@@ -321,7 +323,10 @@ func TestPublisher(t *testing.T) {
 	wait = time.Millisecond * 250
 	wait = time.Millisecond * 100
 	wait = time.Millisecond
-	err := front.Connect(Connect{Host: "localhost", Port: 5672})
+	err := front.Connect(
+		context.Background(),
+		Connect{Host: "localhost", Port: 5672},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
