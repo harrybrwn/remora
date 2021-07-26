@@ -3,16 +3,19 @@ package storage
 import (
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/dgraph-io/badger/v3"
 	"github.com/go-redis/redis"
+	"github.com/sirupsen/logrus"
 )
+
+var log *logrus.Logger = logrus.New()
 
 type Store interface {
 	Get([]byte) ([]byte, error)
 	Set([]byte, []byte) error
 	Has([]byte) bool
-	Close() error
 }
 
 type URLSet interface {
@@ -21,22 +24,29 @@ type URLSet interface {
 	HasMulti([]*url.URL) []bool
 }
 
-func NewRedisURLSet(client *redis.Client) URLSet {
-	return &redisURLSet{client}
+type Redis interface {
+	MGet(...string) *redis.SliceCmd
+	Get(string) *redis.StringCmd
+	Set(string, interface{}, time.Duration) *redis.StatusCmd
 }
 
-func NewInMemoryURLSet() URLSet {
-	return &inMemoryURLSet{m: make(map[string]struct{})}
-}
+func SetLogger(l *logrus.Logger) { log = l }
+
+func NewRedisURLSet(client Redis) URLSet   { return &redisURLSet{client} }
+func NewBadgerURLSet(db *badger.DB) URLSet { return &visitedSet{db} }
+func NewInMemoryURLSet() URLSet            { return &inMemoryURLSet{m: make(map[string]struct{})} }
 
 type redisURLSet struct {
-	client *redis.Client
+	client Redis
 }
 
 func (set *redisURLSet) Has(u *url.URL) bool {
 	var l = *u
 	stripURL(&l)
 	err := set.client.Get(l.String()).Err()
+	if err != nil && err != redis.Nil {
+		log.WithError(err).Warn("failed to get key from redis")
+	}
 	return err != redis.Nil
 }
 
@@ -68,10 +78,6 @@ func urlKeys(links []*url.URL) []string {
 		s[i] = u.String()
 	}
 	return s
-}
-
-func NewBadgerURLSet(db *badger.DB) *visitedSet {
-	return &visitedSet{db}
 }
 
 type visitedSet struct {
@@ -185,4 +191,76 @@ func (s *inMemoryURLSet) HasMulti(urls []*url.URL) []bool {
 	}
 	s.mu.Unlock()
 	return ok
+}
+
+func NewBadgerStore(db *badger.DB) *badgerstore {
+	return &badgerstore{db}
+}
+
+func NewRedisStore(client *redis.Client) *redisstore {
+	return &redisstore{client}
+}
+
+type badgerstore struct {
+	db *badger.DB
+}
+
+func (s *badgerstore) Get(k []byte) ([]byte, error) {
+	var res []byte
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(k)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			copy(res, val)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func (s *badgerstore) Set(k, v []byte) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(k, v)
+	})
+}
+
+func (s *badgerstore) Has(k []byte) bool {
+	var res bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get(k)
+		if err == nil {
+			res = true
+		}
+		return nil
+	})
+	if err != nil {
+		res = false
+	}
+	return res
+}
+
+type redisstore struct {
+	client *redis.Client
+}
+
+func (rs *redisstore) Get(k []byte) ([]byte, error) {
+	res, err := rs.client.Get(string(k)).Result()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(res), err
+}
+
+func (rs *redisstore) Set(k, v []byte) error {
+	return rs.client.Set(string(k), v, 0).Err()
+}
+
+func (rs *redisstore) Has(k []byte) bool {
+	err := rs.client.Get(string(k)).Err()
+	return err != redis.Nil
 }
