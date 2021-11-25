@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package web;
 
-option go_package = "github.com/harrybrwn/diktyo/web";
+option go_package = "github.com/harrybrwn/remora/web";
 
 message PageRequest {
     string URL   = 1;

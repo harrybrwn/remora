@@ -2,4 +2,4 @@ syntax = "proto3";
 
 package fronteer;
 
-option go_package = "github.com/harrybrwb/diktyo/fronteer/pb";
+option go_package = "github.com/harrybrwn/remora/fronteer/pb";

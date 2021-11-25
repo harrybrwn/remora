@@ -4,7 +4,7 @@ package pb;
 
 import "protobuf/page.proto";
 
-option go_package = "github.com/harrybrwb/diktyo/web/pb";
+option go_package = "github.com/harrybrwn/remora/web/pb";
 
 message SpiderConfig {
 	string host = 1;

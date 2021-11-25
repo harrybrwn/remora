@@ -4,7 +4,7 @@ package pb;
 
 import "page_request.proto";
 
-option go_package = "github.com/harrybrwn/diktyo/web/pb";
+option go_package = "github.com/harrybrwn/remora/web/pb";
 
 enum Status {
     Ok = 0;
