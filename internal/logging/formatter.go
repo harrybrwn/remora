@@ -32,9 +32,11 @@ type PrefixedFormatter struct {
 	init sync.Once
 }
 
+const DefaultTimeFormat = time.RFC3339
+
 func NewPrefixedFormatter(prefix, timeFormat string) *PrefixedFormatter {
 	if timeFormat == "" {
-		timeFormat = time.RFC3339
+		timeFormat = DefaultTimeFormat
 	}
 	return &PrefixedFormatter{
 		Prefix:           prefix,
@@ -49,7 +51,7 @@ func NewPrefixedFormatter(prefix, timeFormat string) *PrefixedFormatter {
 func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	var col color.Attribute
 	switch e.Level {
-	case logrus.PanicLevel, logrus.ErrorLevel:
+	case logrus.PanicLevel, logrus.FatalLevel, logrus.ErrorLevel:
 		col = color.FgRed
 	case logrus.WarnLevel:
 		col = color.FgYellow
@@ -58,7 +60,7 @@ func (pf *PrefixedFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	case logrus.DebugLevel, logrus.TraceLevel:
 		col = color.FgWhite
 	default:
-		return nil, errors.New("unknown logging level")
+		return nil, errors.New("unknown logging level" + fmt.Sprintf(" %d", e.Level))
 	}
 	var keys []string
 	for k := range e.Data {

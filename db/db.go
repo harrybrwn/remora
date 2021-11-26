@@ -2,24 +2,27 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/pkg/errors"
 )
 
 type Config struct {
-	Host     string `yaml:"host" default:"localhost"`
-	Port     int    `yaml:"port" default:"5432"`
-	User     string `yaml:"user" env:"POSTGRES_USER"`
-	Password string `yaml:"password" env:"POSTGRES_PASSWORD"`
-	Name     string `yaml:"name" env:"POSTGRES_DB"`
-	SSL      string `yaml:"ssl" default:"disable"`
+	Host     string `yaml:"host" config:"host" default:"localhost"`
+	Port     int    `yaml:"port" config:"port" default:"5432"`
+	User     string `yaml:"user" config:"user" env:"POSTGRES_USER"`
+	Password string `yaml:"password" config:"password" env:"POSTGRES_PASSWORD"`
+	Name     string `yaml:"name" config:"name" env:"POSTGRES_DB"`
+	SSL      string `yaml:"ssl" config:"ssl" default:"disable"`
 }
 
 func New(cfg *Config) (*sql.DB, error) {
@@ -36,6 +39,32 @@ func New(cfg *Config) (*sql.DB, error) {
 		return nil, errors.Wrap(err, "could not ping postgres")
 	}
 	return db, nil
+}
+
+func WaitForNew(ctx context.Context, cfg *Config, ping time.Duration) (*sql.DB, error) {
+	os.Unsetenv("PGSERVICEFILE") // lib/pq panics when this is set
+	os.Unsetenv("PGSERVICE")
+	db, err := sql.Open("postgres", cfg.dsn())
+	if err != nil {
+		return nil, err
+	}
+	err = db.Ping()
+	if err == nil {
+		return db, nil
+	}
+	ticker := time.NewTicker(ping)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, driver.ErrBadConn
+		case <-ticker.C:
+			err = db.Ping()
+			if err == nil {
+				return db, nil
+			}
+		}
+	}
 }
 
 func ServiceFileExists() {

@@ -29,7 +29,7 @@ type Queue interface {
 
 type Option func(*queue)
 
-func Open(opts badger.Options, prefix []byte, options ...Option) (Queue, error) {
+func Open(opts badger.Options, prefix []byte, options ...Option) (*queue, error) {
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
@@ -37,7 +37,7 @@ func Open(opts badger.Options, prefix []byte, options ...Option) (Queue, error) 
 	return New(db, prefix, options...), nil
 }
 
-func New(db *badger.DB, prefix []byte, opts ...Option) Queue {
+func New(db *badger.DB, prefix []byte, opts ...Option) *queue {
 	var mu sync.Mutex
 	q := &queue{
 		db:     db,

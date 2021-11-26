@@ -82,9 +82,9 @@ type Page struct {
 	RetryAfter     time.Duration
 
 	Doc      *goquery.Document
-	Title    string
 	Encoding string
 	Words    []string
+	IsHTML   bool
 
 	Response *http.Response
 	Hash     [16]byte
@@ -106,13 +106,15 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 	now := time.Now()
 	u := p.URL
 	req := &http.Request{
-		Method:  "GET",
-		Proto:   "HTTP/1.1",
-		Host:    p.URL.Host,
-		URL:     u,
-		Body:    http.NoBody,
-		GetBody: defaultGetBody,
-		Header:  http.Header{"User-Agent": {UserAgent}},
+		Method:     "GET",
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Host:       p.URL.Host,
+		URL:        u,
+		Body:       http.NoBody,
+		GetBody:    defaultGetBody,
+		Header:     http.Header{"User-Agent": {UserAgent}},
 	}
 	req = req.WithContext(ctx)
 	resp, err := HttpClient.Do(req)
@@ -150,11 +152,12 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 	if err != nil {
 		// Could be an image or non-html page,
 		// don't return an error
+		p.IsHTML = false
 		return nil
 	}
+	p.IsHTML = true
 	doc := goquery.NewDocumentFromNode(root)
 	p.Doc = doc
-	p.Title = getTitle(doc)
 	p.Encoding = getCharset(doc)
 	var e error
 	p.Links, e = getLinks(doc, p.URL)
@@ -193,6 +196,13 @@ func (p *Page) Head(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	return nil
+}
+
+func (p *Page) Title() string {
+	if p.Doc == nil {
+		return ""
+	}
+	return getTitle(p.Doc)
 }
 
 var cleanWordsRegex = regexp.MustCompile(`[\(\)/.,!?;:'"\[\]]`)

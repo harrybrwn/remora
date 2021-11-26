@@ -1,60 +1,49 @@
-# SOURCES=$(shell find . -name '*.go' -type f)
-SOURCES=
-GOFLAGS=
-MAIN=./cmd/remora
+VERSION=$(shell git describe --tags --abbrev=0)-$(shell git rev-parse --short HEAD)
+COMMIT=$(shell git rev-parse HEAD)
+HASH=$(shell ./scripts/sourcehash.sh -e './cmd/deploy/*')
+DATE=$(shell date -R)
+GOFLAGS=-trimpath \
+		-ldflags "-w -s \
+			-X 'github.com/harrybrwn/remora/cmd.version=$(VERSION)' \
+			-X 'github.com/harrybrwn/remora/cmd.date=$(DATE)'       \
+			-X 'github.com/harrybrwn/remora/cmd.commit=$(COMMIT)'   \
+			-X 'github.com/harrybrwn/remora/cmd.sourcehash=$(HASH)'"
 GENERATED=web/pb/page.pb.go web/pb/page_grpc.pb.go
 TOOLS=bin/deploy bin/docker
+BINDIR=./bin
 
-all: bin/remora $(TOOLS)
+all: $(BINDIR)/remora $(TOOLS)
 
-build: remora $(TOOLS)
-
-remora: gen
-	go build $(GOFLAGS) $(MAIN)
-
-bin/remora: gen $(SOURCES)
-	go build -o $@ $(GOFLAGS) $(MAIN)
-
-bin/docker: ./cmd/docker/main.go
-	go build -o $@ ./cmd/docker
-
-bin/deploy: ./cmd/deploy/main.go
-	go build -o $@ ./cmd/deploy
-
-install: bin/remora
+install: $(BINDIR)/remora
 	install ./bin/remora ~/dev/go/bin/remora
 
-gen: $(GENERATED)
+.PHONY: $(BINDIR)/remora
+$(BINDIR)/remora: $(GENERATED)
+	CGO_ENABLED=0 go build -o $@ $(GOFLAGS) ./cmd/remora
+
+$(BINDIR)/docker: ./cmd/docker/main.go
+	CGO_ENABLED=0 go build -o $@ ./cmd/docker
+
+$(BINDIR)/deploy: ./cmd/deploy/main.go $(shell find ./cmd/deploy -name '*.go')
+	CGO_ENABLED=0 go build -o $@ ./cmd/deploy
+
+gen:
+	go generate ./web ./cmd/remora
+
+web/pb/page.pb.go web/pb/page_grpc.pb.go: protobuf/page.proto
 	@if [ ! -d web/pb ]; then mkdir web/pb; fi
 	go generate ./web
 
-docker-buildx:
-	bash scripts/buildx.sh
+test:
+	go test -cover -v ./web ./storage ./storage/queue ./internal/... ./cmd/api
 
 image:
 	docker image build \
-		-t remora:0.1  \
+		-t remora:latest  \
 		-f ./Dockerfile .
-
-docker-pi:
-	docker \
-		-H 192.168.0.25 \
-		image build     \
-		-t remora:0.1   \
-		-f ./Dockerfile .
-
-up: bin/docker bin/deploy
-	./scripts/config.sh
-	bin/deploy up
-
-down: bin/deploy
-	bin/deploy down
-
-upload: bin/docker
-	./upload.sh
 
 clean:
 	$(RM) ./remora
 	$(RM) -r ./bin
 
-.PHONY: install build clean up down
+.PHONY: all gen test clean image install

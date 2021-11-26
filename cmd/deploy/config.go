@@ -1,58 +1,36 @@
 package main
 
-import "strings"
+import (
+	"strings"
 
-type Instance struct {
-	Host     string   `yaml:"host"`
-	Image    string   `yaml:"image"`
-	Name     string   `yaml:"name"`
-	Volumes  []string `yaml:"volumes"`
-	Command  []string `yaml:"command"`
-	Replicas int      `yaml:"replicas"`
-	Build    *Build   `yaml:"build"`
-}
+	"github.com/docker/docker/client"
+	"github.com/harrybrwn/remora/internal/deploy"
+)
 
-type Build struct {
-	Host       string `yaml:"host"`
-	Image      string `yaml:"image"`
-	Context    string `yaml:"context"`
-	Dockerfile string `yaml:"dockerfile"`
-}
-
-func (b *Build) setDefaults() {
-	if b.Context == "" {
-		b.Context = "."
-	}
-	if b.Dockerfile == "" {
-		b.Dockerfile = "./Dockerfile"
-	}
-}
-
-type ConfigHost struct {
-	Host      string     `yaml:"host"`
-	Image     string     `yaml:"image"`
-	Command   []string   `yaml:"command"`
-	Volumes   []string   `yaml:"volumes"`
-	Instances []Instance `yaml:"instances"`
-}
-
-type ConfigVolume struct {
-	Name  string   `yaml:"name"`
-	Files []string `yaml:"files"`
-}
+type (
+	Instance     = deploy.Instance
+	Build        = deploy.Build
+	ConfigHost   = deploy.ConfigHost
+	UploadConfig = deploy.UploadConfig
+)
 
 type Config struct {
-	Build     Build        `yaml:"build"`
-	Instances []Instance   `yaml:"instances"`
-	Hosts     []ConfigHost `yaml:"hosts"`
-	Builds    []Build
-	Volumes   []ConfigVolume
+	Image     string         `yaml:"image"`
+	Volumes   []string       `yaml:"volumes"`
+	Build     Build          `yaml:"build"`
+	Instances []Instance     `yaml:"instances"`
+	Hosts     []ConfigHost   `yaml:"hosts"`
+	Builds    []Build        `yaml:"builds"`
+	Uploads   []UploadConfig `yaml:"uploads"`
 }
 
 func (c *Config) interpolate() {
+	if c.Build.Image == "" {
+		c.Build.Image = c.Image
+	}
 	for i := range c.Hosts {
 		if c.Hosts[i].Image == "" {
-			c.Hosts[i].Image = c.Build.Image
+			c.Hosts[i].Image = c.Image
 		}
 		h := c.Hosts[i]
 		for j := range c.Hosts[i].Instances {
@@ -68,14 +46,16 @@ func (c *Config) interpolate() {
 			if len(c.Hosts[i].Instances[j].Volumes) == 0 {
 				c.Hosts[i].Instances[j].Volumes = h.Volumes
 			}
+			c.interpolateVolumes(&c.Hosts[i].Instances[j])
 		}
 	}
 	for i := range c.Instances {
+		c.interpolateVolumes(&c.Instances[i])
 		if c.Instances[i].Name == "" {
 			continue
 		}
 		if c.Instances[i].Image == "" {
-			c.Instances[i].Image = c.Build.Image
+			c.Instances[i].Image = c.Image
 		}
 	}
 	for i := range c.Builds {
@@ -88,6 +68,21 @@ func (c *Config) interpolate() {
 		if c.Builds[i].Dockerfile == "" {
 			c.Builds[i].Dockerfile = c.Build.Dockerfile
 		}
+	}
+}
+
+func (c *Config) interpolateVolumes(in *Instance) {
+	var vols = in.Volumes[:]
+	for _, volouter := range c.Volumes {
+		// If config volume is not in the instsance
+		// volume list then add it
+		for _, v := range vols {
+			if volouter == v {
+				goto found
+			}
+		}
+		in.Volumes = append(in.Volumes, volouter)
+	found:
 	}
 }
 
@@ -122,12 +117,99 @@ func (f *instanceFilter) NameOK(name string) bool {
 func newFilter(s string) *instanceFilter {
 	parts := strings.SplitN(s, ":", 2)
 	if len(parts) < 2 {
-		panic("invalid filter string") // TODO handle this
+		parts = append(parts, "*")
 	}
 	return &instanceFilter{
 		Host: parts[0],
 		Name: parts[1],
 	}
+}
+
+type HostConfig struct {
+	Host      string
+	Builds    []Build
+	Instances []Instance
+}
+
+func (hc *HostConfig) dockerURL() (string, error) {
+	h := hc.Host
+	_, err := client.ParseHostURL(h)
+	if err != nil {
+		h, err = parseDockerHost(h)
+		if err != nil {
+			return "", err
+		}
+	}
+	return h, nil
+}
+
+func (c *Config) HostConfigs(filters ...Filter) map[string]*HostConfig {
+	var (
+		builds  = make(map[Build]struct{})
+		m       = make(map[string]*HostConfig)
+		newconf = func(h string) *HostConfig {
+			return &HostConfig{Host: h, Builds: make([]Build, 0), Instances: make([]Instance, 0)}
+		}
+	)
+
+	for _, build := range c.Builds {
+		build.InitDefaults()
+		l, ok := m[build.Host]
+		if !ok {
+			l = newconf(build.Host)
+			m[build.Host] = l
+		}
+		if _, ok = builds[build]; !ok {
+			l.Builds = append(l.Builds, build)
+		}
+	}
+	for _, in := range c.Instances {
+		l, ok := m[in.Host]
+		if !ok {
+			l = newconf(in.Host)
+			m[in.Host] = l
+		}
+		l.Instances = append(l.Instances, in)
+		build := buildFromInstance(in)
+		build.InitDefaults()
+		if _, ok = builds[build]; !ok {
+			l.Builds = append(l.Builds, build)
+		}
+	}
+	for _, h := range c.Hosts {
+		l, ok := m[h.Host]
+		if !ok {
+			l = newconf(h.Host)
+			m[h.Host] = l
+		}
+		l.Instances = append(l.Instances, h.Instances...)
+		build := Build{Host: h.Host, Image: h.Image}
+		build.InitDefaults()
+		if _, ok = builds[build]; !ok {
+			l.Builds = append(l.Builds, build)
+		}
+	}
+	// apply filters
+	for host, conf := range m {
+		for _, f := range filters {
+			if !f.HostOK(host) {
+				delete(m, host)
+				continue
+			}
+
+			l := len(conf.Instances)
+			ins := conf.Instances
+			for i := 0; i < l; i++ {
+				if !f.NameOK(ins[i].Name) {
+					ins = remove(i, ins)
+					l--
+					i--
+				}
+			}
+			conf.Instances = ins
+		}
+	}
+	return m
 }
 
 func (c *Config) instances(ids ...string) []Instance {
@@ -143,43 +225,28 @@ func (c *Config) instances(ids ...string) []Instance {
 }
 
 func (c *Config) findInstances(ids []string) []Instance {
-	type pair struct {
-		host, name string
+	var (
+		res     = make([]Instance, 0)
+		filters = Filters(ids)
+	)
+	for _, in := range c.Instances {
+		for _, f := range filters {
+			if f.Matches(in.Host, in.Name) {
+				res = append(res, in)
+			}
+		}
 	}
-	res := make([]Instance, 0)
-	m := make(map[pair]Instance)
-	for _, inst := range c.Instances {
-		p := pair{host: inst.Host, name: inst.Name}
-		m[p] = inst
-	}
+	// oof
 	for _, h := range c.Hosts {
-		for _, inst := range h.Instances {
-			p := pair{host: inst.Host, name: inst.Name}
-			m[p] = inst
+		for _, in := range h.Instances {
+			for _, f := range filters {
+				if f.Matches(in.Host, in.Name) {
+					res = append(res, in)
+				}
+			}
 		}
-	}
-	for _, id := range ids {
-		parts := strings.Split(id, ":")
-		if len(parts) != 2 {
-			continue
-		}
-		p := pair{host: parts[0], name: parts[1]}
-		inst, ok := m[p]
-		if !ok {
-			continue
-		}
-		res = append(res, inst)
 	}
 	return res
-}
-
-func shouldFilterOut(i *Instance, filters []Filter) bool {
-	for _, f := range filters {
-		if !f.Matches(i.Host, i.Name) {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *Config) HostInstances(filters ...Filter) map[string][]Instance {
@@ -216,41 +283,14 @@ func (c *Config) HostInstances(filters ...Filter) map[string][]Instance {
 }
 
 func remove(index int, arr []Instance) []Instance {
-	l := len(arr)
+	l := len(arr) - 1
 	arr[index] = arr[l]
 	return arr[:l]
 }
 
-func (c *Config) hosts() []string {
-	var (
-		ok bool
-		i  = 0
-		m  = make(map[string]struct{})
-	)
-	for _, in := range c.Instances {
-		if _, ok = m[in.Host]; !ok {
-			m[in.Host] = struct{}{}
-		}
-	}
-	for _, h := range c.Hosts {
-		if _, ok = m[h.Host]; !ok {
-			m[h.Host] = struct{}{}
-		}
-	}
-	hosts := make([]string, len(m))
-	for host := range m {
-		hosts[i] = host
-		i++
-	}
-	return hosts
-}
-
-func (c *Config) docker(filters ...string) (*multiDocker, error) {
-	dk, err := newMultiDocker(c.hosts())
-	if err != nil {
-		return nil, err
-	}
-	return dk, nil
+func (c *Config) docker(filters ...string) *multiDocker {
+	dk := newMultiDocker(c.HostConfigs(Filters(filters)...))
+	return dk
 }
 
 func (c *Config) builds(hosts ...string) []Build {
@@ -268,7 +308,7 @@ func (c *Config) builds(hosts ...string) []Build {
 	)
 
 	for _, b := range c.Builds {
-		b.setDefaults()
+		b.InitDefaults()
 		add(b)
 	}
 	for _, in := range c.Instances {
@@ -277,7 +317,7 @@ func (c *Config) builds(hosts ...string) []Build {
 	}
 	for _, in := range c.Hosts {
 		b := Build{Host: in.Host, Image: in.Image}
-		b.setDefaults()
+		b.InitDefaults()
 		add(b)
 	}
 
@@ -296,4 +336,19 @@ func (c *Config) builds(hosts ...string) []Build {
 		return newbuilds
 	}
 	return builds
+}
+
+func buildFromInstance(in Instance) Build {
+	var b Build
+	if in.Build != nil {
+		b = *in.Build
+	}
+	if b.Host == "" {
+		b.Host = in.Host
+	}
+	if b.Image == "" {
+		b.Image = in.Image
+	}
+	b.InitDefaults()
+	return b
 }

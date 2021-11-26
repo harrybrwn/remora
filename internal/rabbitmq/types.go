@@ -1,9 +1,111 @@
 package rabbitmq
 
+import "fmt"
+
+type Error struct {
+	Err    string `json:"error"`
+	Reason string `json:"reason"`
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("rabbitmq: %s %s", e.Err, e.Reason)
+}
+
+type Overview struct {
+	ManagementVersion       string `json:"management_version"`
+	RatesMode               string `json:"rates_mode"`
+	SampleRetentionPolicies struct {
+		Global   []int `json:"global"`
+		Basic    []int `json:"basic"`
+		Detailed []int `json:"detailed"`
+	} `json:"sample_retention_policies"`
+	ExchangeTypes []struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Enabled     bool   `json:"enabled"`
+	} `json:"exchange_types"`
+	ProductVersion    string       `json:"product_version"`
+	ProductName       string       `json:"product_name"`
+	RabbitmqVersion   string       `json:"rabbitmq_version"`
+	ClusterName       string       `json:"cluster_name"`
+	ErlangVersion     string       `json:"erlang_version"`
+	ErlangFullVersion string       `json:"erlang_full_version"`
+	DisableStats      bool         `json:"disable_stats"`
+	EnableQueueTotals bool         `json:"enable_queue_totals"`
+	MessageStats      MessageStats `json:"message_stats"`
+	ChurnRates        struct {
+		ChannelClosed         int     `json:"channel_closed"`
+		ChannelClosedDetails  details `json:"channel_closed_details"`
+		ChannelCreated        int     `json:"channel_created"`
+		ChannelCreatedDetails struct {
+			Rate float64 `json:"rate"`
+		} `json:"channel_created_details"`
+		ConnectionClosed        int `json:"connection_closed"`
+		ConnectionClosedDetails struct {
+			Rate float64 `json:"rate"`
+		} `json:"connection_closed_details"`
+		ConnectionCreated        int `json:"connection_created"`
+		ConnectionCreatedDetails struct {
+			Rate float64 `json:"rate"`
+		} `json:"connection_created_details"`
+		QueueCreated        int `json:"queue_created"`
+		QueueCreatedDetails struct {
+			Rate float64 `json:"rate"`
+		} `json:"queue_created_details"`
+		QueueDeclared        int     `json:"queue_declared"`
+		QueueDeclaredDetails details `json:"queue_declared_details"`
+		QueueDeleted         int     `json:"queue_deleted"`
+		QueueDeletedDetails  details `json:"queue_deleted_details"`
+	} `json:"churn_rates"`
+	QueueTotals struct {
+		Messages                      int     `json:"messages"`
+		MessagesDetails               details `json:"messages_details"`
+		MessagesReady                 int     `json:"messages_ready"`
+		MessagesReadyDetails          details `json:"messages_ready_details"`
+		MessagesUnacknowledged        int     `json:"messages_unacknowledged"`
+		MessagesUnacknowledgedDetails details `json:"messages_unacknowledged_details"`
+	} `json:"queue_totals"`
+	ObjectTotals struct {
+		Channels    int `json:"channels"`
+		Connections int `json:"connections"`
+		Consumers   int `json:"consumers"`
+		Exchanges   int `json:"exchanges"`
+		Queues      int `json:"queues"`
+	} `json:"object_totals"`
+	StatisticsDbEventQueue int    `json:"statistics_db_event_queue"`
+	Node                   string `json:"node"`
+	Listeners              []struct {
+		Node      string `json:"node"`
+		Protocol  string `json:"protocol"`
+		IPAddress string `json:"ip_address"`
+		Port      int    `json:"port"`
+		// SocketOpts struct {
+		// 	Backlog     int           `json:"backlog"`
+		// 	Nodelay     bool          `json:"nodelay"`
+		// 	Linger      []interface{} `json:"linger"`
+		// 	ExitOnClose bool          `json:"exit_on_close"`
+		// 	CowboyOpts  struct {
+		// 		Sendfile bool `json:"sendfile"`
+		// 	} `json:"cowboy_opts"`
+		// 	Port     int    `json:"port"`
+		// 	Protocol string `json:"protocol"`
+		// } `json:"socket_opts,omitempty"`
+	} `json:"listeners"`
+	Contexts []struct {
+		SslOpts     []interface{} `json:"ssl_opts"`
+		Node        string        `json:"node"`
+		Description string        `json:"description"`
+		Path        string        `json:"path"`
+		CowboyOpts  string        `json:"cowboy_opts"`
+		Port        string        `json:"port"`
+		Protocol    string        `json:"protocol,omitempty"`
+	} `json:"contexts"`
+}
+
 type Channel struct {
 	Name              string `json:"name"`
-	Node              string `json:"node"`
 	Number            int    `json:"number"`
+	Node              string `json:"node"`
 	AcksUncommitted   int    `json:"acks_uncommitted"`
 	Confirm           bool   `json:"confirm"`
 	ConnectionDetails struct {
@@ -53,17 +155,18 @@ type Queue struct {
 		Q2                int           `json:"q2"`
 		Q3                int           `json:"q3"`
 		Q4                int           `json:"q4"`
-		TargetRAMCount    string        `json:"target_ram_count"`
+		// TargetRAMCount    string        `json:"target_ram_count"`
+		TargetRAMCount interface{} `json:"target_ram_count"`
 	} `json:"backing_queue_status"`
-	ConsumerCapacity          int  `json:"consumer_capacity"`
-	ConsumerUtilisation       int  `json:"consumer_utilisation"`
-	Consumers                 int  `json:"consumers"`
-	Durable                   bool `json:"durable"`
+	ConsumerCapacity          float64     `json:"consumer_capacity"`
+	ConsumerUtilisation       float64     `json:"consumer_utilisation"`
+	Consumers                 int         `json:"consumers"`
+	Durable                   bool        `json:"durable"`
+	Exclusive                 bool        `json:"exclusive"`
+	ExclusiveConsumerTag      interface{} `json:"exclusive_consumer_tag"`
 	EffectivePolicyDefinition struct {
 	} `json:"effective_policy_definition"`
-	Exclusive            bool        `json:"exclusive"`
-	ExclusiveConsumerTag interface{} `json:"exclusive_consumer_tag"`
-	GarbageCollection    struct {
+	GarbageCollection struct {
 		FullsweepAfter  int `json:"fullsweep_after"`
 		MaxHeapSize     int `json:"max_heap_size"`
 		MinBinVheapSize int `json:"min_bin_vheap_size"`
@@ -104,7 +207,7 @@ type Queue struct {
 	Vhost                         string       `json:"vhost"`
 }
 
-type Connection []struct {
+type Connection struct {
 	AuthMechanism    string `json:"auth_mechanism"`
 	ChannelMax       int    `json:"channel_max"`
 	Channels         int    `json:"channels"`
@@ -113,8 +216,9 @@ type Connection []struct {
 			ConnectionBlocked    bool `json:"connection.blocked"`
 			ConsumerCancelNotify bool `json:"consumer_cancel_notify"`
 		} `json:"capabilities"`
-		Product string `json:"product"`
-		Version string `json:"version"`
+		Product        string `json:"product"`
+		Version        string `json:"version"`
+		ConnectionName string `json:"connection_name"`
 	} `json:"client_properties"`
 	ConnectedAt       int64 `json:"connected_at"`
 	FrameMax          int   `json:"frame_max"`
@@ -153,6 +257,7 @@ type Connection []struct {
 	Timeout                int         `json:"timeout"`
 	Type                   string      `json:"type"`
 	User                   string      `json:"user"`
+	UserProvidedName       string      `json:"user_provided_name"`
 	UserWhoPerformedAction string      `json:"user_who_performed_action"`
 	Vhost                  string      `json:"vhost"`
 }

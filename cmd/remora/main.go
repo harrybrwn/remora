@@ -2,29 +2,32 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
-	"net"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/harrybrwn/config"
-	"github.com/harrybrwn/diktyo/cmd"
-	"github.com/harrybrwn/diktyo/frontier"
-	"github.com/harrybrwn/diktyo/internal/logging"
-	"github.com/harrybrwn/diktyo/internal/rabbitmq"
-	"github.com/harrybrwn/diktyo/internal/visitor"
-	"github.com/harrybrwn/diktyo/web"
+	"github.com/harrybrwn/remora/cmd"
+	"github.com/harrybrwn/remora/frontier"
+	"github.com/harrybrwn/remora/internal/logging"
+	"github.com/harrybrwn/remora/internal/visitor"
+	"github.com/harrybrwn/remora/web"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+//go:generate cp ../../LICENSE .
+
+//go:embed LICENSE
+var license []byte
 
 var (
 	log     = logrus.New()
@@ -39,12 +42,10 @@ var (
 
 func main() {
 	var (
-		err  error
-		conf cmd.Config
+		err error
+		cmd = NewCLIRoot()
 	)
 	godotenv.Load()
-	cmd := NewCLIRoot(&conf)
-	conf.Bind(cmd.PersistentFlags())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	err = cmd.ExecuteContext(ctx)
@@ -54,15 +55,18 @@ func main() {
 	}
 }
 
-func NewCLIRoot(conf *cmd.Config) *cobra.Command {
+func NewCLIRoot() *cobra.Command {
 	var (
 		configfile string
 		noColor    bool
+		conf       cmd.Config
 	)
 	c := &cobra.Command{
-		Use:   "remora",
-		Short: "The internet's symbiotic organism.",
-		Long:  "",
+		Use:           "remora",
+		Short:         "The internet's symbiotic organism.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Long:          "",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			// Parse the loglevel before reading the config file
 			var (
@@ -73,8 +77,7 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 			if conf.LogLevel != "" {
 				lvl = conf.GetLevel()
 			}
-			err = prerun(configfile, conf)
-			if err != nil {
+			if err = prerun(configfile, &conf); err != nil {
 				return err
 			}
 			// If logLevel has changed in the config file but not as a flag
@@ -86,18 +89,24 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 			return nil
 		},
 	}
-	c.PersistentFlags().StringVar(&conf.LogLevel, "loglevel", conf.LogLevel, "set log level")
-	c.PersistentFlags().StringVar(&configfile, "config", configfile, "use a different config file")
-	c.PersistentFlags().BoolVar(&noColor, "no-color", noColor, "disable output colors")
+	flags := c.PersistentFlags()
+	flags.StringVar(&conf.LogLevel, "loglevel", conf.LogLevel, "set log level")
+	flags.StringVarP(&configfile, "config", "c", configfile, "use a different config file")
+	flags.BoolVar(&noColor, "no-color", noColor, "disable output colors")
 
+	confcmd := config.NewConfigCommand()
+	config.SetDefaultCommandFlags(confcmd)
 	c.AddCommand(
-		newSpiderCmd(conf),
-		newPurgeCmd(conf),
-		newEnqueueCmd(conf),
-		newQueueCmd(conf),
-		newRedisCmd(conf),
+		newCrawlCmd(&conf),
+		newSpiderCmd(&conf),
+		newPurgeCmd(&conf),
+		newEnqueueCmd(&conf),
+		newQueueCmd(&conf),
+		newRedisCmd(&conf),
+		newDBCmd(&conf),
 		newHitCmd(),
-		config.NewConfigCommand(),
+		cmd.NewVersionCmd(),
+		confcmd,
 		&cobra.Command{
 			Use:   "list <url>",
 			Short: "List the urls on a page",
@@ -112,50 +121,14 @@ func NewCLIRoot(conf *cmd.Config) *cobra.Command {
 		},
 		&cobra.Command{
 			Use: "test", Hidden: true,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				r := &net.Resolver{
-					PreferGo: true,
-					Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-						d := net.Dialer{
-							Timeout: time.Millisecond * 10000,
-						}
-						return d.DialContext(ctx, network, "8.8.8.8:53")
-					},
-				}
-				t := time.Now()
-				ips, err := r.LookupHost(cmd.Context(), "www.google.com")
-				if err != nil {
-					return err
-				}
-				for _, ip := range ips {
-					fmt.Println(ip)
-				}
-				fmt.Println(time.Since(t))
-				return nil
-			},
+			RunE: func(cmd *cobra.Command, args []string) error { return nil },
 		},
-		&cobra.Command{
-			Use: "test-log", Hidden: true,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				var (
-					wg  sync.WaitGroup
-					n   = 30
-					log = log.WithField("test", time.Now())
-					fn  = []func(...interface{}){
-						log.Trace, log.Debug, log.Info, log.Warn, log.Error,
-					}
-					l = len(fn)
-				)
-				wg.Add(n)
-				for i := 0; i < n; i++ {
-					func(i int) { fn[i%l](i); wg.Done() }(i)
-				}
-				wg.Wait()
-				return nil
-			},
-		},
+		&cobra.Command{Use: "license", Run: func(cmd *cobra.Command, args []string) { fmt.Printf("%s\n", license) }},
 	)
+	c.SetOut(os.Stdout)
+	c.SetErr(os.Stderr)
 	c.SetUsageTemplate(config.IndentedCobraHelpTemplate)
+	conf.Bind(c.PersistentFlags())
 	return c
 }
 
@@ -173,10 +146,10 @@ func prerun(configfile string, conf *cmd.Config) error {
 		config.AddPath(dir)
 		config.AddFile(file)
 	}
+	config.AddUserConfigDir("remora")
 	config.AddFile("remora.yml")
 	config.AddFile("config.yml")
 	config.AddPath(".")
-	config.AddPath("/var/local/diktyo")
 	config.AddPath(DataDir)
 	config.SetType("yaml")
 	config.SetConfig(conf)
@@ -184,11 +157,18 @@ func prerun(configfile string, conf *cmd.Config) error {
 	if err != nil {
 		return errors.Wrap(err, "could not set config defaults")
 	}
-	if err = config.ReadConfig(); err != nil {
+
+	err = config.ReadConfig()
+	switch err {
+	case nil:
+		break
+	case config.ErrNoConfigFile:
+		log.WithFields(logrus.Fields{"error": err}).Warn("could not read config file")
+	default:
 		return errors.Wrap(err, "could not read config")
 	}
+
 	for _, path := range []string{
-		"/var/local/diktyo",
 		DataDir,
 	} {
 		if _, err = os.Stat(path); os.IsNotExist(err) {
@@ -203,7 +183,7 @@ func prerun(configfile string, conf *cmd.Config) error {
 
 func initLogger(nocolor bool, lvl logrus.Level) {
 	out := os.Stdout
-	maxlen := 135
+	maxlen := 125
 	if !logging.IsTerm(out) {
 		nocolor = true
 		maxlen = 1
@@ -217,7 +197,7 @@ func initLogger(nocolor bool, lvl logrus.Level) {
 		MaxMessageLength: maxlen,
 		NoColor:          nocolor,
 	})
-	logfile.Filename = "/var/local/diktyo/crawler.log"
+	logfile.Filename = filepath.Join(DataDir, "crawler.log")
 	log.AddHook(logging.NewLogFileHook(&logfile, &logrus.TextFormatter{
 		DisableColors:   true,
 		PadLevelText:    true,
@@ -230,21 +210,4 @@ func initLogger(nocolor bool, lvl logrus.Level) {
 	web.SetLogger(log)
 	visitor.SetLogger(log)
 	frontier.SetLogger(log)
-}
-
-func newQueueListCmdFunc(conf *cmd.Config) func(*cobra.Command, []string) error {
-	return func(cmd *cobra.Command, args []string) error {
-		ms := rabbitmq.ManagementServer{
-			Host: conf.MessageQueue.Host,
-			Port: conf.MessageQueue.Management.Port,
-		}
-		queues, err := ms.Queues()
-		if err != nil {
-			return err
-		}
-		for _, q := range queues {
-			fmt.Printf("%20s %s, %d\n", q.Name, q.State, q.Messages)
-		}
-		return nil
-	}
 }

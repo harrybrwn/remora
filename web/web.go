@@ -5,53 +5,131 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/xml"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/temoto/robotstxt"
+	"golang.org/x/net/html"
 )
 
-var (
-	ErrSkipURL = errors.New("skip url")
-
-	log = logrus.StandardLogger()
-)
-
-type Visitor interface {
-	// Filter is called after checking page depth
-	// and after checking for a repeated URL.
-	Filter(*PageRequest, *url.URL) error
-
-	// Visit is called after a page is fetched.
-	Visit(context.Context, *Page)
-
-	// LinkFound is called when a new link is
-	// found and popped off of the main queue
-	// and before any depth checking or repeat
-	// checking.
-	LinkFound(*url.URL)
-}
+var log = logrus.StandardLogger()
 
 func SetLogger(l *logrus.Logger) { log = l }
 func GetLogger() *logrus.Logger  { return log }
 
+type Fetcher interface {
+	Fetch(context.Context, *PageRequest) (*Page, error)
+}
+
+func NewFetcher(userAgent string) *pageFetcher {
+	return &pageFetcher{agent: userAgent}
+}
+
+type pageFetcher struct {
+	agent string
+}
+
+func (pf *pageFetcher) Fetch(ctx context.Context, req *PageRequest) (*Page, error) {
+	now := time.Now()
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		return nil, err
+	}
+	p := NewPage(u, req.Depth)
+	request := (&http.Request{
+		Method:     "GET",
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Host:       u.Host,
+		URL:        u,
+		Body:       http.NoBody,
+		GetBody:    defaultGetBody,
+		Header: http.Header{
+			"User-Agent": {pf.agent},
+		},
+	}).WithContext(ctx)
+	resp, err := HttpClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	p.ResponseTime = time.Since(now)
+	p.Response = resp // TODO This will use lots of memory...
+	if resp.StatusCode == http.StatusTooManyRequests {
+		p.RetryAfter = getRetryTime(resp.Header)
+		fields := logHeader(resp.Header)
+		log.WithFields(fields).Warn(resp.Status + " " + u.String())
+	}
+
+	p.Status = resp.StatusCode
+	p.ContentType = getContentType(resp)
+	p.Redirected = wasRedirected(resp)
+	if p.Redirected {
+		p.RedirectedFrom = p.URL
+		p.URL = resp.Request.URL
+	}
+	var (
+		buf  bytes.Buffer
+		hash = fnv.New128()
+	)
+	_, err = io.Copy(&buf, io.TeeReader(resp.Body, hash))
+	if err != nil {
+		return nil, errors.Wrap(err, "could not read http response body")
+	}
+	copy(p.Hash[:], hash.Sum(nil))
+	resp.Body.Close()
+
+	root, err := html.ParseWithOptions(&buf)
+	if err != nil {
+		p.IsHTML = false
+		return p, nil
+	}
+	p.IsHTML = true
+	doc := goquery.NewDocumentFromNode(root)
+	p.Doc = doc
+	p.Encoding = getCharset(doc)
+	var e error
+	p.Links, e = getLinks(doc, p.URL)
+	if e != nil && err == nil {
+		err = e
+	}
+	switch p.ContentType {
+	case
+		"application/zip",
+		"application/x-mobipocket-ebook",
+		"application/pdf",
+		"application/epub+zip":
+		// TODO handle these
+		break
+	case "text/html", "text/plain":
+		p.Words, e = Keywords(doc)
+		if e != nil && err == nil {
+			err = e
+		}
+	}
+	return p, err
+}
+
 func GetRobotsTxT(host string) (*robotstxt.RobotsData, error) {
 	req := &http.Request{
-		Method: "GET",
-		Proto:  "HTTP/1.1",
-		Host:   host,
+		Method:     "GET",
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Host:       host,
 		URL: &url.URL{
 			Scheme: "https",
 			Host:   host,
 			Path:   "/robots.txt",
 		},
-		Header: http.Header{
-			"Pragma": {"No-Cache"},
-		},
+		Header:  http.Header{},
 		Body:    http.NoBody,
 		GetBody: defaultGetBody,
 	}
@@ -93,7 +171,7 @@ type NoOpVisitor struct{}
 
 func (v *NoOpVisitor) Filter(*PageRequest, *url.URL) error { return nil }
 func (v *NoOpVisitor) Visit(context.Context, *Page)        {}
-func (v *NoOpVisitor) LinkFound(*url.URL)                  {}
+func (v *NoOpVisitor) LinkFound(*url.URL) error            { return nil }
 
 type SitemapIndex struct {
 	XMLName xml.Name `xml:"sitemapindex"`

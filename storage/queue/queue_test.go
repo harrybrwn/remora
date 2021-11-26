@@ -55,7 +55,7 @@ func q(t *testing.T) *queue {
 		t.Fatal(err)
 		return nil
 	}
-	return New(db, []byte{}).(*queue)
+	return New(db, []byte{})
 }
 
 func rm(q *queue) error {

@@ -1,24 +1,20 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"hash/fnv"
-	"net/http"
-	"net/url"
 	"os"
-	"runtime"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/go-redis/redis"
-	"github.com/harrybrwn/diktyo/cmd"
-	"github.com/harrybrwn/diktyo/frontier"
-	"github.com/harrybrwn/diktyo/internal/rabbitmq"
-	"github.com/harrybrwn/diktyo/web"
+	"github.com/harrybrwn/remora/cmd"
+	"github.com/harrybrwn/remora/internal/rabbitmq"
+	"github.com/harrybrwn/remora/web"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/streadway/amqp"
 )
@@ -129,40 +125,11 @@ func newEnqueueCmd(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func gatherSitemap(ctx context.Context, host string, ch chan string, wg *sync.WaitGroup) error {
-	defer wg.Done()
-	robs, err := web.GetRobotsTxT(host)
-	if err != nil {
-		log.WithError(err).Warn("could not get robots.txt")
-		return err
-	}
-	for _, sitemapURL := range robs.Sitemaps {
-		wg.Add(1)
-		go func(l string) {
-			defer wg.Done()
-			sitemapindex, err := web.GetSitemap(l)
-			if err != nil {
-				log.WithError(err).WithField("url", l).Warn("could not get sitemap")
-				return
-			}
-			sitemapindex.FillContents(ctx, 3)
-			for _, sitemap := range sitemapindex.SitemapContents {
-				for _, u := range sitemap.URLS {
-					select {
-					case ch <- u.Loc:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}(sitemapURL)
-	}
-	return nil
-}
-
 func newRedisCmd(conf *cmd.Config) *cobra.Command {
 	newclient := func() (*redis.Client, error) {
-		client := redis.NewClient(conf.RedisOpts())
+		opts := conf.RedisOpts()
+		opts.ReadTimeout = time.Minute
+		client := redis.NewClient(opts)
 		if err := client.Ping().Err(); err != nil {
 			client.Close()
 			return nil, errors.Wrap(err, "could not ping redis server")
@@ -185,8 +152,8 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 
 	c.AddCommand(
 		&cobra.Command{
-			Use: "list", Aliases: []string{"l"},
-			SilenceUsage: true,
+			Use: "list", Short: "List all keys stored in the database",
+			Aliases: []string{"l"}, SilenceUsage: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				client, err := newclient()
 				if err != nil {
@@ -204,7 +171,7 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:  "get",
+			Use: "get", Short: "Get a value from the database",
 			Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				client, err := newclient()
@@ -221,7 +188,7 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:  "has",
+			Use: "has <key>", Short: "Test whether or not the database has a key",
 			Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				client, err := newclient()
@@ -235,7 +202,7 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use:  "put <key> <value>",
+			Use: "put <key> <value>", Short: "Add a value to the database",
 			Args: cobra.ExactArgs(2),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				cli, err := newclient()
@@ -247,8 +214,8 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			},
 		},
 		&cobra.Command{
-			Use: "delete", Aliases: []string{"del"},
-			Args: cobra.MinimumNArgs(1),
+			Use: "delete <key>", Short: "Remove a value from the database",
+			Aliases: []string{"del"}, Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				cli, err := newclient()
 				if err != nil {
@@ -268,50 +235,13 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func newHitCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "hit",
-		Short: "",
+		Short: "Send a head request.",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			req, err := http.NewRequest("HEAD", args[0], nil)
-			if err != nil {
-				return err
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-			var l int
-			for key := range resp.Header {
-				l = max(l, len(key))
-			}
-			for key, vals := range resp.Header {
-				fmt.Printf("%s%s%v\n", key, strings.Repeat(" ", l-len(key)+1), vals)
-			}
-			fmt.Println()
-
-			s := resp.Header.Get("Last-Modified")
-			if s != "" {
-				lastMod, err := time.Parse(time.RFC1123, s)
-				if err != nil {
-					return err
-				}
-				fmt.Println("last modified", time.Since(lastMod), "ago")
-			}
-			s = resp.Header.Get("Cache-Control")
-			if s != "" {
-				fmt.Println("Cache Control:", s)
-			}
-			return nil
+			return sendHead(args[0])
 		},
 	}
 	return c
@@ -331,7 +261,29 @@ func newQueueCmd(conf *cmd.Config) *cobra.Command {
 			if conn == nil {
 				return nil
 			}
-			return conn.Close()
+			if err = conn.Close(); err != nil {
+				return err
+			}
+			ms := rabbitmq.ManagementServer{
+				Host: conf.MessageQueue.Host,
+				Port: conf.MessageQueue.Management.Port,
+			}
+			overview, err := ms.Overview()
+			if err != nil {
+				return err
+			}
+			tot := overview.ObjectTotals
+			tab := tabwriter.NewWriter(os.Stdout, 1, 4, 3, ' ', tabwriter.StripEscape)
+			tab.Write([]byte("CONNECTIONS\tCHANNELS\tEXCHANGES\tQUEUES\tCONSUMERS\n"))
+			tab.Write([]byte(strings.Join([]string{
+				strconv.FormatInt(int64(tot.Connections), 10),
+				strconv.FormatInt(int64(tot.Channels), 10),
+				strconv.FormatInt(int64(tot.Exchanges), 10),
+				strconv.FormatInt(int64(tot.Queues), 10),
+				strconv.FormatInt(int64(tot.Consumers), 10),
+			}, "\t") + "\n"))
+			fmt.Println()
+			return tab.Flush()
 		},
 	}
 	c.AddCommand(
@@ -350,16 +302,58 @@ func newQueueCmd(conf *cmd.Config) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				tab := tabwriter.NewWriter(os.Stdout, 1, 4, 3, ' ', tabwriter.StripEscape)
+				tab.Write([]byte(strings.Join([]string{
+					"NAME",
+					"NUMBER",
+					"DELIVER-RATE",
+				}, "\t") + "\n"))
 				for _, c := range channels {
-					fmt.Println(c.Name, c.Number, c.MessageStats.DeliverGetDetails.Rate)
+					tab.Write([]byte(strings.Join([]string{
+						c.Name,
+						strconv.FormatInt(int64(c.Number), 10),
+						strconv.FormatFloat(float64(c.MessageStats.DeliverDetails.Avg), 'f', -1, 64),
+					}, "\t") + "\n"))
 				}
-				return nil
+				return tab.Flush()
 			},
 		},
 		&cobra.Command{
-			Use: "peek", Short: "Peek at the front of a queue",
-			Args: cobra.MinimumNArgs(1),
+			Use: "connections", Short: "List rabbitmq connections",
+			Aliases: []string{"conn", "c"},
 			RunE: func(cmd *cobra.Command, args []string) error {
+				ms := rabbitmq.ManagementServer{
+					Host: conf.MessageQueue.Host,
+					Port: conf.MessageQueue.Management.Port,
+				}
+				tab := tabwriter.NewWriter(os.Stdout, 1, 4, 3, ' ', tabwriter.StripEscape)
+				conns, err := ms.Connections()
+				if err != nil {
+					return err
+				}
+				tab.Write([]byte(strings.Join([]string{
+					"NAME",
+					"STATE",
+					"PEERHOST",
+					// "CONNECTED-AT",
+					"PROTOCOL",
+					"RECV-CNT",
+				}, "\t") + "\n"))
+				for _, c := range conns {
+					tab.Write([]byte(strings.Join([]string{
+						c.Name,
+						c.State,
+						c.PeerHost,
+						// time.Unix(0, c.ConnectedAt).String(),
+						c.Protocol,
+						strconv.FormatInt(int64(c.RecvCnt), 10),
+					}, "\t") + "\n"))
+				}
+				err = tab.Flush()
+				if err != nil {
+					return err
+				}
+				fmt.Printf("connections: %d\n", len(conns))
 				return nil
 			},
 		},
@@ -367,171 +361,25 @@ func newQueueCmd(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func purgeRedis(conf *cmd.Config, args []string) error {
-	c := redis.NewClient(conf.RedisOpts())
-	if err := c.Ping().Err(); err != nil {
-		return err
-	}
-	if len(args) == 0 {
-		return c.FlushDB().Err()
-	}
-	return c.Del(args...).Err()
-}
-
-func purgeQueues(ms rabbitmq.ManagementServer, conf cmd.MessageQueueConfig, del bool) error {
-	queues, err := ms.Queues()
-	if err != nil {
-		return err
-	}
-	conn, err := amqp.Dial(conf.URI())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	ch, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer ch.Close()
-
-	var fn = func(name string) (int, error) { return ch.QueuePurge(name, false) }
-	if del {
-		fn = func(name string) (int, error) { return ch.QueueDelete(name, false, false, false) }
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(len(queues))
-	for _, queue := range queues {
-		go func(q rabbitmq.Queue) {
-			defer wg.Done()
-			n, err := fn(q.Name)
-			if err != nil {
-				log.WithError(err).WithField("name", q.Name).Error("could not purge queue")
-				return
+func newDBCmd(conf *cmd.Config) *cobra.Command {
+	return &cobra.Command{
+		Use: "psql [psql arguments...]", Short: "Run psql using the data from the config",
+		// DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			db := conf.DB
+			arguments := []string{
+				"-h", db.Host,
+				"-p", strconv.Itoa(db.Port),
+				db.Name, db.User,
 			}
-			log.Infof("purged queue %s having %d messages", q.Name, n)
-		}(queue)
-	}
-	wg.Wait()
-	return nil
-}
-
-func enqueue(ctx context.Context, conf *cmd.MessageQueueConfig, seeds <-chan string) error {
-	var wg sync.WaitGroup
-	conn, err := amqp.Dial(conf.URI())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	ch, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer ch.Close()
-
-	err = frontier.DeclarePageExchange(ch)
-	if err != nil {
-		log.WithError(err).Error("could not declare exchange")
-		return err
-	}
-
-	front := frontier.Frontier{
-		Exchange: frontier.Exchange{
-			Name:    frontier.PageExchangeName,
-			Kind:    "topic",
-			Durable: true,
+			arguments = append(arguments, args...)
+			c := exec.Command("psql", arguments...)
+			c.Stdout = cmd.OutOrStdout()
+			c.Stderr = cmd.ErrOrStderr()
+			c.Stdin = os.Stdin
+			return c.Run()
 		},
 	}
-	err = front.Connect(ctx, frontier.Connect{Host: conf.Host, Port: conf.Port})
-	if err != nil {
-		return err
-	}
-	defer front.Close()
-	pub, err := front.Publisher()
-	if err != nil {
-		return err
-	}
-
-	spinCtx, cancelSpinner := context.WithCancel(ctx)
-	go func() {
-		var (
-			i uint64
-			c byte
-		)
-		for {
-			select {
-			case <-spinCtx.Done():
-				return
-			default:
-			}
-			switch i % 4 {
-			case 0:
-				c = '\\'
-			case 1:
-				c = '|'
-			case 2:
-				c = '/'
-			case 3:
-				c = '-'
-			}
-			fmt.Printf("\r%c", c)
-			time.Sleep(time.Millisecond * 50)
-			i++
-		}
-	}()
-
-	n := 0
-	for {
-		select {
-		case <-ctx.Done():
-			cancelSpinner()
-			return nil
-		case seed, ok := <-seeds:
-			if !ok {
-				goto done
-			}
-			wg.Add(1)
-			req := web.ParsePageRequest(seed, 0)
-			n++
-			go func() {
-				defer wg.Done()
-				u, err := url.Parse(req.URL)
-				if err != nil {
-					log.WithError(err).Error("could not parse seed url")
-					return
-				}
-
-				hash := fnv.New128()
-				// io.WriteString(hash, u.Host)
-				// rawreq, err := proto.Marshal(req)
-				// if err != nil {
-				// 	log.WithError(err)
-				// 	return
-				// }
-				// msg := amqp.Publishing{
-				// 	Body:         rawreq,
-				// 	DeliveryMode: amqp.Persistent,
-				// 	ContentType:  "application/vnd.google.protobuf",
-				// 	Type:         frontier.PageRequest.String(),
-				// 	Priority:     0,
-				// }
-				// key := fmt.Sprintf("%x.%s", hash.Sum(nil)[:2], u.Host)
-				// err = pub.Publish(key, msg)
-
-				err = publish(pub, hash, u.Host, req)
-				if err != nil {
-					log.WithError(err).Error("could not publish url request")
-					return
-				}
-			}()
-		}
-	}
-done:
-	wg.Wait()
-	cancelSpinner()
-	fmt.Print("\r")
-	log.Infof("queued %d pages", n)
-	return nil
 }
 
 func runListCmd(cmd *cobra.Command, args []string) error {
@@ -561,24 +409,6 @@ func runKeywordsCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func getMemStats() *runtime.MemStats {
-	var s runtime.MemStats
-	runtime.ReadMemStats(&s)
-	return &s
-}
-
 func toMB(bytes uint64) float64 {
 	return float64(bytes) / 1024.0 / 1024.0
-}
-
-func setLogLevelRunFunc(_ *cobra.Command, args []string) error {
-	if len(args) < 1 {
-		return errors.New("no level given")
-	}
-	lvl, err := logrus.ParseLevel(args[0])
-	if err != nil {
-		return err
-	}
-	log.SetLevel(lvl)
-	return nil
 }

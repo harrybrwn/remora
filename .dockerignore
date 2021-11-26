@@ -1,7 +1,8 @@
 # Misc
-/.git/
+#/.git/
 /Dockerfile
 /Dockerfile*
+**/node_modules/
 
 # Notes
 /TODO
@@ -14,28 +15,24 @@
 
 # Bin
 /bin/
-/remora
-/deinopis
 
 # Scripts
-/scripts/
-/cmd/docker/
-/cmd/deploy/
-/Makefile
+/scripts/buildx.sh
+/scripts/config.sh
+/scripts/list_imports.sh
+/scripts/logs.sh
+/scripts/redis.sh
+/scripts/resetdb.sh
 /psql
-/test
-**/*.sh
 **/*.sql
 
 # Tests
-**/*_test.go
-/web/testdata/
 /crawl-output/
+/test/
 
 # Deployment Code
-deployment.yml
-/cmd/deploy
 /cmd/docker
+deployment.yml
 
 # Local Config
 /.vscode/
@@ -45,5 +42,4 @@ deployment.yml
 /.env
 /config.yml
 /docker-compose.yml
-/deployment.yml
 /docker-bake*

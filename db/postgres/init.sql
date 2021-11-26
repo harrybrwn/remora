@@ -44,12 +44,12 @@ CREATE TABLE page (
   UNIQUE (url)
 );
 
-CREATE INDEX keyword_idx ON page USING GIST (keywords);
+CREATE INDEX keyword_idx ON page USING GIN (keywords);
 
 CREATE TABLE edge (
   parent_id bytea,
-  child_id bytea,
-  child  url,
+  child_id  bytea,
+  child     url,
   UNIQUE(parent_id, child_id)
 );
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -13,14 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis"
-	"github.com/harrybrwn/diktyo/cmd"
-	"github.com/harrybrwn/diktyo/db"
-	"github.com/harrybrwn/diktyo/event"
-	"github.com/harrybrwn/diktyo/frontier"
-	"github.com/harrybrwn/diktyo/internal/visitor"
-	"github.com/harrybrwn/diktyo/storage"
-	"github.com/harrybrwn/diktyo/web"
+	"github.com/harrybrwn/remora/cmd"
+	"github.com/harrybrwn/remora/event"
+	"github.com/harrybrwn/remora/frontier"
+	"github.com/harrybrwn/remora/internal/visitor"
+	"github.com/harrybrwn/remora/storage"
+	"github.com/harrybrwn/remora/web"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -43,23 +40,88 @@ func connectConfig(conf *cmd.Config) frontier.Connect {
 		Port: conf.MessageQueue.Port,
 		Config: &amqp.Config{
 			Locale:    "en_US",
-			Heartbeat: time.Minute * 2,
+			Heartbeat: time.Minute * 5,
 			Dial:      amqp.DefaultDial(30 * time.Second),
 		},
 	}
 }
 
+func newCrawlCmd(conf *cmd.Config) *cobra.Command {
+	var (
+		out   string
+		sleep = time.Second * 1
+	)
+	c := cobra.Command{
+		Use:   "crawl <url>",
+		Short: "Small web crawler for local (non-distributed) crawls only",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			web.UserAgent = "Remora"
+			u, err := url.Parse(args[0])
+			if err != nil {
+				return err
+			}
+			if u.Host == "" || u.Scheme == "" {
+				return fmt.Errorf("bad url: %q", u.String())
+			}
+			var vis web.Visitor
+			if out == "" {
+				vis = &logVisitor{}
+			} else {
+				vis = visitor.NewFS(out, u.Host)
+				if err = os.Mkdir(out, 0777); !os.IsExist(err) && err != nil {
+					return err
+				}
+			}
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+			bus := event.NewChannelBus()
+			spider := NewSpider(
+				vis,
+				storage.NewInMemoryURLSet(),
+				bus,
+				withhost(u.Host),
+				prefetch(1),
+				wait(sleep),
+				WithFetcher(web.NewFetcher(conf.UserAgent)),
+			)
+			go spider.start(ctx)
+			go func() {
+				time.Sleep(sleep * 2)
+				r := web.NewPageRequest(u, 0)
+				err = publish(bus, fnv.New128(), u.Host, r)
+				if err != nil {
+					fmt.Println(err)
+					cancel()
+					return
+				}
+				log.Infof("%s sent", u)
+			}()
+			go periodicMemLogs(ctx, sleep*10)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	flags := c.Flags()
+	flags.StringVarP(&out, "output", "o",
+		out, "collect the crawl into an output directory")
+	flags.DurationVarP(&sleep, "sleep", "s",
+		sleep, "sleep time between page fetches")
+	return &c
+}
+
 func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 	var (
 		hosts    []string
-		nop      bool
 		preFetch int
 		sleep    time.Duration
 		local    bool // TODO make this change the initial configuration
 	)
 	c := &cobra.Command{
-		Use: "spider", Short: "Start a spider",
+		Use:   "spider <hostname(s)...>",
+		Short: "Start a spider",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			web.UserAgent = "Remora"
 			ctx, stop := signal.NotifyContext(
 				cmd.Context(),
 				os.Interrupt,
@@ -76,7 +138,6 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 			if cmd.Flags().Lookup("sleep").Changed {
 				conf.Sleep = sleep
 			}
-			web.HttpClient.Timeout = time.Minute
 
 			db, redis, err := getDataStores(conf)
 			if err != nil {
@@ -88,19 +149,18 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 				redis.Close()
 				log.Info("remote connections closed")
 			}()
+			vis, err := visitor.New(db, redis)
+			if err != nil {
+				return err
+			}
+			defer vis.Close()
 			var (
 				spiders = make([]*spider, len(hosts))
-				vis     web.Visitor
-				front   = frontier.Frontier{RetryLimit: 30, Exchange: exchange}
-			)
-			if nop {
-				vis = &web.NoOpVisitor{}
-				if err = db.Close(); err != nil {
-					log.WithError(err).Warn("couldn't close database")
+				front   = frontier.Frontier{
+					RetryLimit: 30,
+					Exchange:   exchange,
 				}
-			} else {
-				vis = visitor.New(db, redis)
-			}
+			)
 			err = front.Connect(ctx, connectConfig(conf))
 			if err != nil {
 				return errors.Wrap(err, "could not connect to frontier")
@@ -110,27 +170,29 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 				log.Info("spider: message queue connection closed")
 				stop()
 			}()
+			opts := []spiderOpt{
+				WithFetcher(web.NewFetcher(conf.UserAgent)),
+				prefetch(conf.MessageQueue.Prefetch),
+				limit(conf.Depth),
+			}
 
 			for i, host := range hosts {
-				spiders[i] = NewSpider(
-					vis,
-					storage.NewRedisURLSet(redis),
-					&front,
-					prefetch(conf.MessageQueue.Prefetch),
-					limit(conf.Depth),
-					wait(getWait(host, conf, cmd)),
-					withhost(host),
-				)
+				spiders[i] = &spider{
+					Visitor: vis,
+					URLSet:  storage.NewRedisURLSet(redis),
+					Bus:     &front,
+				}
+				options := append(opts, wait(getWait(host, conf, cmd)), withhost(host))
+				spiders[i].Init(options...)
 			}
 			for _, sp := range spiders {
 				go sp.start(ctx)
 			}
-			go periodicMemLogs(ctx, time.Second*15)
+			go periodicMemLogs(ctx, time.Minute)
 			<-ctx.Done()
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&nop, "nop", nop, "no operation when visiting a page")
 	c.Flags().StringArrayVar(&hosts, "host",
 		hosts, "host of website being crawled")
 	c.Flags().DurationVar(&sleep, "sleep", sleep, "")
@@ -142,43 +204,30 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func getDataStores(conf *cmd.Config) (d *sql.DB, r *redis.Client, err error) {
-	d, err = db.New(&conf.DB)
-	if err != nil {
-		err = errors.Wrap(err, "could not connect to sql database")
-		return
-	}
-	r = redis.NewClient(conf.RedisOpts())
-	if err = r.Ping().Err(); err != nil {
-		d.Close()
-		err = errors.Wrap(err, "could not ping redis server")
-		return
-	}
-	return
-}
-
 func NewSpider(
 	visitor web.Visitor,
 	urlset storage.URLSet,
 	bus event.Bus,
 	opts ...func(*spider),
 ) *spider {
-	s := spider{
-		Visitor: visitor,
-		URLSet:  urlset,
-		Bus:     bus,
-	}
+	s := spider{Visitor: visitor, URLSet: urlset, Bus: bus}
 	for _, o := range opts {
 		o(&s)
 	}
 	return &s
 }
 
-func prefetch(n int) func(*spider)       { return func(s *spider) { s.Prefetch = n } }
-func limit(n uint) func(*spider)         { return func(s *spider) { s.Limit = n } }
-func wait(d time.Duration) func(*spider) { return func(s *spider) { s.Wait = d } }
-func withhost(h string) func(*spider)    { return func(s *spider) { s.Host = h } }
-func WithHash(h hash.Hash) func(*spider) { return func(s *spider) { s.hash = h } }
+type spiderOpt func(*spider)
+
+func prefetch(n int) func(*spider)            { return func(s *spider) { s.Prefetch = n } }
+func limit(n uint) func(*spider)              { return func(s *spider) { s.Limit = n } }
+func wait(d time.Duration) func(*spider)      { return func(s *spider) { s.Wait = d } }
+func withhost(h string) func(*spider)         { return func(s *spider) { s.Host = h } }
+func WithHash(h hash.Hash) func(*spider)      { return func(s *spider) { s.hash = h } }
+func WithFetcher(f web.Fetcher) func(*spider) { return func(s *spider) { s.Fetcher = f } }
+func WithVisitor(v web.Visitor) spiderOpt     { return func(s *spider) { s.Visitor = v } }
+func WithURLSet(u storage.URLSet) spiderOpt   { return func(s *spider) { s.URLSet = u } }
+func WIthBus(b event.Bus) spiderOpt           { return func(s *spider) { s.Bus = b } }
 
 type spider struct {
 	// Settings
@@ -190,6 +239,7 @@ type spider struct {
 	Visitor web.Visitor
 	URLSet  storage.URLSet
 	Bus     event.Bus
+	Fetcher web.Fetcher
 
 	sleep  chan time.Duration
 	robots *robotstxt.RobotsData
@@ -197,6 +247,13 @@ type spider struct {
 	hash   hash.Hash
 }
 
+func (s *spider) Init(opts ...spiderOpt) {
+	for _, o := range opts {
+		o(s)
+	}
+}
+
+// Initialize with defaults
 func (s *spider) init() {
 	s.sleep = make(chan time.Duration)
 	if s.Host == "" {
@@ -210,6 +267,9 @@ func (s *spider) init() {
 	if s.Bus == nil {
 		log.Warn("spider has no event bus")
 		s.Bus = &noOpEventBus{ch: make(chan amqp.Delivery)}
+	}
+	if s.Fetcher == nil {
+		s.Fetcher = web.NewFetcher("Remora")
 	}
 	if s.robots == nil {
 		s.robots = web.AllowAll()
@@ -227,6 +287,9 @@ func (s *spider) init() {
 }
 
 func (s *spider) start(ctx context.Context) (err error) {
+	if s.Host == "" {
+		return errors.New("no hostname to crawl")
+	}
 	s.robots, err = web.GetRobotsTxT(s.Host)
 	if err != nil {
 		log.WithError(err).Error("could not get robots.txt")
@@ -235,9 +298,7 @@ func (s *spider) start(ctx context.Context) (err error) {
 	s.init()
 
 	log.WithFields(logrus.Fields{
-		"wait": s.Wait,
-		"host": s.Host,
-	}).Info("starting spider")
+		"wait": s.Wait, "host": s.Host}).Info("starting spider")
 	publisher, err := s.Bus.Publisher(
 		event.PublishWithContext(ctx),
 	)
@@ -245,20 +306,23 @@ func (s *spider) start(ctx context.Context) (err error) {
 		log.WithError(err).Error("could not create publisher")
 		return err
 	}
+
 	consumer, err := s.Bus.Consumer(
 		s.Host,
 		event.ConsumeWithContext(ctx),
-		frontier.WithAutoAck(false),
-		frontier.WithPrefetch(s.Prefetch),
+		event.WithPrefetch(s.Prefetch),
+		event.WithKeys(s.hostHashKey()),
+		frontier.WithAutoAck(false), // for rabbitmq message busses
 	)
-	if err == frontier.ErrWrongConsumerType {
+	// Catch errors with options
+	if errors.Is(err, event.ErrWrongConsumerType) {
 		log.WithError(err).Warn("could not configure consumer correctly")
 	} else if err != nil {
 		return err
 	}
 	defer consumer.Close()
 
-	deliveries, err := consumer.Consume(s.Host, fmt.Sprintf("*.%s", s.Host))
+	deliveries, err := consumer.Consume()
 	if err != nil {
 		return err
 	}
@@ -293,13 +357,10 @@ func (s *spider) start(ctx context.Context) (err error) {
 				continue
 			}
 			log.WithFields(logrus.Fields{
-				"key":      msg.RoutingKey,
-				"tag":      msg.DeliveryTag,
-				"exchange": msg.Exchange,
-				"type":     msg.Type,
-				"consumer": msg.ConsumerTag,
-				"depth":    req.Depth,
-				"url":      req.URL,
+				"key": msg.RoutingKey, "tag": msg.DeliveryTag,
+				"exchange": msg.Exchange, "type": msg.Type,
+				"consumer": msg.ConsumerTag, "depth": req.Depth,
+				"url": req.URL,
 			}).Trace("request")
 			go func() {
 				err = s.handle(ctx, &req, publisher)
@@ -322,10 +383,12 @@ func (s *spider) handle(
 ) error {
 	var (
 		start = time.Now()
-		page  = web.NewPageFromString(req.URL, req.Depth)
+		page  *web.Page
+		err   error
 	)
+	page = web.NewPageFromString(req.URL, req.Depth)
 	if page == nil {
-		err := errors.New("could not parse page request url")
+		err = errors.New("could not parse page request url")
 		log.WithFields(logrus.Fields{
 			"url":   req.URL,
 			"error": err,
@@ -335,16 +398,10 @@ func (s *spider) handle(
 	}
 	s.Visitor.LinkFound(page.URL)
 
-	s.mu.Lock()
-	ok := s.robots.TestAgent(page.URL.Path, "*")
-	s.mu.Unlock()
-	if !ok {
-		log.WithField("url", req.URL).Trace("found in robots.txt")
-		go func() { s.sleep <- s.Wait }()
-		return nil
-	}
-	if s.URLSet.Has(page.URL) {
-		log.WithField("url", req.URL).Trace("already seen")
+	if s.inRobotsTxt(page.URL.Path) || s.URLSet.Has(page.URL) {
+		log.WithField(
+			"url", req.URL,
+		).Trace("already seen or found in robots.txt")
 		go func() { s.sleep <- s.Wait }()
 		return nil
 	}
@@ -352,7 +409,7 @@ func (s *spider) handle(
 	// Assume that if handleRequest is called then it made a
 	// request to the web server and so we need to wait for politness.
 	fetchCtx, cancel := context.WithTimeout(ctx, time.Minute)
-	err := page.FetchCtx(fetchCtx)
+	page, err = s.Fetcher.Fetch(fetchCtx, req)
 	if err != nil {
 		log.WithError(err).Error("could not fetch page")
 		cancel()
@@ -363,20 +420,16 @@ func (s *spider) handle(
 	go func() { s.sleep <- time.Since(start) }()
 
 	if page.Redirected {
-		s.mu.Lock()
-		ok = s.robots.TestAgent(page.URL.Path, "*")
-		s.mu.Unlock()
-		if ok || s.URLSet.Has(page.URL) {
+		if s.inRobotsTxt(page.URL.Path) || s.URLSet.Has(page.URL) {
 			return nil
 		}
 	}
 
+	s.Visitor.Visit(ctx, page)
 	err = s.publishLinks(ctx, pub, page)
 	if err != nil {
 		log.WithError(err).Error("failed to publish page")
 	}
-
-	s.Visitor.Visit(ctx, page)
 
 	err = s.URLSet.Put(page.URL)
 	if err != nil {
@@ -388,12 +441,25 @@ func (s *spider) handle(
 		err = s.URLSet.Put(page.RedirectedFrom)
 		if err != nil {
 			log.WithFields(logrus.Fields{
-				"error": err,
-				"url":   page.URL,
+				"error": err, "url": page.URL,
 			}).Warn("could mark redirected url as seen")
 		}
 	}
 	return nil
+}
+
+func (s *spider) inRobotsTxt(path string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, agent := range []string{
+		"*",
+		web.UserAgent,
+	} {
+		if !s.robots.TestAgent(path, agent) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *spider) publishLinks(
@@ -403,7 +469,7 @@ func (s *spider) publishLinks(
 ) error {
 	var (
 		err      error
-		ok       bool
+		done     = ctx.Done()
 		haslinks = len(page.Links) > 0
 	)
 
@@ -412,77 +478,52 @@ func (s *spider) publishLinks(
 	// going to exceed the depth limit then they will be
 	// discarded in the future so we should not push them
 	// to the queue now.
-	if haslinks && (s.Limit == 0 || page.Depth < uint32(s.Limit)) {
-		visited := s.URLSet.HasMulti(page.Links)
-		done := ctx.Done()
-		for i, l := range page.Links {
-			select {
-			case <-done:
-				return nil
-			default:
-			}
-			if l.Host == s.Host {
-				s.mu.Lock()
-				ok = s.robots.TestAgent(l.Path, "*")
-				s.mu.Unlock()
-				if !ok {
-					continue
-				}
-			}
-			if visited[i] {
-				continue
-			}
-			switch l.Scheme {
-			case
-				"javascript", // "javascript:print();" or "javascript:void(0);" links
-				"mailto",     // skip email addresses
-				"tel",        // skip phone numbers
-				"":
-				continue
-			default:
-			}
+	if !haslinks {
+		return nil
+	}
+	if s.Limit != 0 && page.Depth >= uint32(s.Limit) {
+		return nil
+	}
 
-			r := web.NewPageRequest(l, page.Depth+1)
+	visited := s.URLSet.HasMulti(page.Links)
+	for i, l := range page.Links {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		if l.Host == s.Host && s.inRobotsTxt(l.Path) {
+			continue
+		}
+		if visited[i] {
+			continue
+		}
+		switch l.Scheme {
+		case
+			"javascript", // "javascript:print();" or "javascript:void(0);" links
+			"mailto",     // skip email addresses
+			"tel",        // skip phone numbers
+			"":
+			continue
+		default:
+		}
 
-			select {
-			case <-done:
-				return nil
-			default:
-			}
-			err = publish(pub, s.hash, l.Host, r)
-			if err != nil {
-				log.WithError(err).Error("could not publish message")
-				continue
-			}
+		r := web.NewPageRequest(l, page.Depth+1)
+		err = publish(pub, s.hash, l.Host, r)
+		if err != nil && !errors.Is(err, event.ErrNoQueue) {
+			log.WithError(err).Error("could not publish message")
+			continue
 		}
 	}
 	return nil
 }
 
-func getWait(
-	host string,
-	conf *cmd.Config,
-	cmd *cobra.Command,
-) time.Duration {
-	var tm time.Duration
-	f := cmd.Flags().Lookup("sleep")
-	if f.Changed {
-		return conf.Sleep
-	}
-	t, ok := conf.WaitTimes[host]
-	if ok {
-		var err error
-		tm, err = time.ParseDuration(t)
-		if err != nil {
-			tm = conf.Sleep
-		}
-	} else {
-		tm = conf.Sleep
-	}
-	if tm == 0 {
-		tm = 1
-	}
-	return tm
+func (s *spider) hostHashKey() string {
+	s.hash.Reset()
+	s.hash.Write([]byte(s.Host))
+	key := fmt.Sprintf("%x.%s", s.hash.Sum(nil)[:2], s.Host)
+	s.hash.Reset()
+	return key
 }
 
 type noOpURLSet struct{}
@@ -513,3 +554,17 @@ func (b *noOpEventBus) Consume(...string) (<-chan amqp.Delivery, error) {
 func (b *noOpEventBus) Publisher(...event.PublisherOpt) (event.Publisher, error) { return b, nil }
 func (b *noOpEventBus) Publish(string, amqp.Publishing) error                    { return nil }
 func (b *noOpEventBus) WithOpt(...event.ConsumerOpt) error                       { return nil }
+
+type logVisitor struct{}
+
+func (*logVisitor) LinkFound(u *url.URL) error {
+	log.WithField("stage", "link-found").Debug(u)
+	return nil
+}
+func (*logVisitor) Filter(_ *web.PageRequest, u *url.URL) error {
+	log.WithField("stage", "filter").Info(u)
+	return nil
+}
+func (*logVisitor) Visit(_ context.Context, p *web.Page) { log.WithField("stage", "visit").Info(p.URL) }
+
+var _ web.Visitor = (*logVisitor)(nil)

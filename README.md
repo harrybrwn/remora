@@ -1,6 +1,11 @@
-# diktyo
+# Remora
 
-Diktyo means network in Greek.
+A Remora is a type of fish that has a symbiotic relationship with sharks or
+other large fish where they will attach themselves to the side of the host shark
+and will remove dead skin and parasites. This is an equally beneficial
+relationship because the remora gains protection by clinging to the shark. This
+relationship is analogous to the relationship between web crawlers and the web
+as a whole.
 
 ## Configuration
 
@@ -62,11 +67,14 @@ Create a `deployment.yml` configuration file and then run the deploy program in
 Here is an example of a `deployment.yml` config.
 
 ```yaml
+# Volumes for all instances
+volumes: ["remora-config:/var/local/remora"]
+
 # Instances for each host
 hosts:
   - host: 10.0.0.1
     image: remora:0.1
-    volumes: ["remora-config:/var/local/diktyo"]
+    volumes: ["/usr/local/remora-datastore:/remora-datastore"]
     instances:
       - name: wiki,
         command:
@@ -81,14 +89,12 @@ hosts:
   - host: 10.0.0.2
     image: remora:0.1
     command: ["spider", "--host", "en.wikipedia.org"]
-    volumes: ["remora-config:/var/local/diktyo"]
     instances:
       - { name: wiki,   command: ["spider", "--host", "en.wikipedia.org"] }
       - { name: acm,    command: ["spider", "--host", "technews.acm.org", "--host", "www.acm.org"]    }
       - { name: quotes, command: ["spider", "--host", "quotes.toscrape.com"] }
   - host: 10.0.0.3
     image: remora:0.1
-    volumes: ["remora-config:/var/local/diktyo"]
     instances:
       - { name: wiki,   command: ["spider", "--host", "en.wikipedia.org"] }
       - { name: npr,    command: ["spider", "--host", "www.npr.org"]           }
@@ -101,8 +107,8 @@ build:
 
 # Additional build targets are listed here
 builds:
-  - host: unix:///var/run/docker.sock # build for local machine also
-  - host: 10.0.0.201
+  - host: unix:///var/run/docker.sock # build on local machine
+  - host: 10.0.0.201 # build on some remote machine
 ```
 
 Once your configuration is done you can run this command to start the crawlers.
@@ -126,3 +132,25 @@ remora enqueue [seed urls...]
 For the example deployment configuration above a good seed is
 <https://en.wikipedia.org/wiki/Main_Page> but you can add whatever url you like
 and as many as you like with the `remora enqueue` command.
+
+## Building
+
+Install the [protocol buffer compiler](https://grpc.io/docs/protoc-installation/).
+
+Then Install the two go extensions for protoc.
+
+```sh
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
+```
+
+And finally, compile either by hand or with make.
+
+```
+go build ./cmd/remora
+go build -o ./bin/deploy ./cmd/deploy
+```
+
+```
+make
+```

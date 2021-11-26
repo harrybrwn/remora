@@ -2,7 +2,6 @@ package web
 
 import (
 	"bytes"
-	"context"
 	_ "embed"
 	"fmt"
 	"html/template"
@@ -11,37 +10,118 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func Test(t *testing.T) {
-	var buf, b bytes.Buffer
-	buf.WriteString("hello")
-	io.Copy(os.Stdout, &buf)
-	io.Copy(os.Stdout, io.TeeReader(&buf, &b))
-	s := buf.String()
-	println()
-	fmt.Println(len(s))
-	p := NewPageFromString("https://en.wikipedia.org/", 0)
-	p.Fetch()
-	fmt.Println(p.Hash)
+}
+
+func TestParseCacheControl(t *testing.T) {
+	for _, tst := range []struct {
+		s string
+		Control
+	}{
+		{
+			"max-age=3600, s-max-age=600, public, must-revalidate",
+			Control{
+				Scope:          public,
+				MaxAge:         time.Second * 3600,
+				SharedMaxAge:   time.Second * 600,
+				MustRevalidate: true,
+			},
+		},
+	} {
+		ctrl, err := parseCacheControl(tst.s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ctrl.MaxAge != tst.MaxAge {
+			t.Errorf("wrong max age: want %v, got %v", tst.MaxAge, ctrl.MaxAge)
+		}
+		if ctrl.SharedMaxAge != tst.SharedMaxAge {
+			t.Errorf("wrong shared max age: want %v, got %v", tst.SharedMaxAge, ctrl.MaxAge)
+		}
+		if ctrl.Scope != tst.Scope {
+			t.Errorf("expected scope %v, got %v", tst.Scope, ctrl.Scope)
+		}
+		if ctrl.MustRevalidate != tst.MustRevalidate {
+			t.Errorf("different must-validate")
+		}
+		if ctrl.NoTransform != tst.NoTransform {
+			t.Errorf("different 'no-transform': got %v, want %v", ctrl.NoTransform, tst.NoTransform)
+		}
+		if ctrl.OnlyIfCached != tst.OnlyIfCached {
+			t.Errorf("different 'only-if-cached': got %v, want %v", ctrl.OnlyIfCached, tst.OnlyIfCached)
+		}
+	}
+}
+
+func sitemapHandler(baseurl string) http.HandlerFunc {
+	data := struct {
+		URL string
+	}{
+		URL: baseurl,
+	}
+	handler := func(rw http.ResponseWriter, r *http.Request) {
+		maindata := `
+<?xml version='1.0' encoding='UTF-8'?>
+	<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9 http://www.sitemaps.org/schemas/sitemap/0.9/sitemapindex.xsd">
+	<sitemap>
+		<loc>{{.URL}}/sitemap-latest.xml</loc>
+		<lastmod>2021-08-05T07:35-04:00</lastmod>
+	</sitemap>
+</sitemapindex>`
+		if r.URL.Path == "/sitemap.xml" {
+			tmpl, err := template.New("").Parse(maindata)
+			if err != nil {
+				panic(err)
+			}
+			err = tmpl.Execute(rw, data)
+			if err != nil {
+				panic(err)
+			}
+			return
+		} else if r.URL.Path == "sitemap-latest.xml" {
+			blob := `
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9 http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">
+	<url>
+		<loc>{{.URL}}/some-page</loc><lastmod>2021-07-09</lastmod>
+	</url>`
+			tmpl, err := template.New("").Parse(blob)
+			if err != nil {
+				panic(err)
+			}
+			err = tmpl.Execute(rw, data)
+			if err != nil {
+				panic(err)
+			}
+			return
+		}
+	}
+	return handler
+
 }
 
 func TestSitemap(t *testing.T) {
-	t.Skip()
-	s := "https://www.npr.org/live-updates/sitemap.xml"
+	// s := "https://www.npr.org/live-updates/sitemap.xml"
 	// s = "https://www.goodreads.com/siteindex.author.xml"
+	l := newLocalListener()
+	h := sitemapHandler(fmt.Sprintf("http://%s", l.Addr()))
+	srv := newserver(l, h)
+	srv.Start()
+	HttpClient = srv.Client()
+	s := srv.URL + "/sitemap.xml"
 	sm, err := GetSitemap(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sm.SitemapContents) == 0 {
-		sm.FillContents(context.Background(), 500)
+	if sm == nil {
+		t.Fatal("got nil sitempa")
 	}
-	fmt.Printf("%+v\n", sm)
+	// TODO call sm.FillContents(context.Background(), 1)
 }
 
 func TestURLKey(t *testing.T) {
@@ -58,7 +138,7 @@ func TestURLKey(t *testing.T) {
 }
 
 func TestFetch(t *testing.T) {
-	t.Skip()
+	// t.Skip()
 	t.Run("Fetch en.wikipedia", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(testHTTPHandler))
 		defer srv.Close()

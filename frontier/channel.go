@@ -65,7 +65,7 @@ func (c *channel) Close() error {
 
 func (c *channel) handleReload() {
 	defer log.Debug("channel: ending channel reloads")
-	c.reloadChannel() // initial channel
+	c.reloadChannel(false) // initial channel
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -79,7 +79,7 @@ func (c *channel) handleReload() {
 			return
 		case <-c.notifyClosed:
 			atomic.StoreInt32(&c.open, 0)
-			c.reloadChannel()
+			c.reloadChannel(false)
 		case _, ok := <-c.reload:
 			log.Debug("channel: received on reload channel")
 			if !ok {
@@ -87,12 +87,12 @@ func (c *channel) handleReload() {
 				return
 			}
 			atomic.StoreInt32(&c.open, 0)
-			c.reloadChannel()
+			c.reloadChannel(true)
 		}
 	}
 }
 
-func (c *channel) reloadChannel() {
+func (c *channel) reloadChannel(closeold bool) {
 	log.Debug("channel: reloading channel")
 	defer log.Info("channel: channel reloaded")
 	atomic.StoreInt32(&c.open, 0)
@@ -106,22 +106,14 @@ func (c *channel) reloadChannel() {
 		return
 	}
 
-	// TODO this is horrible, plz help me
-	var closeOld bool
-	select {
-	case <-c.notifyClosed:
-		closeOld = false
-	default:
-		closeOld = true
-	}
-
-	if c.ch != nil && closeOld {
+	if c.ch != nil && closeold {
 		// Close old channel in case its still open.
 		err := c.ch.Close()
 		if err != nil {
 			log.WithError(err).Error("channel: could not close old channel")
 		}
 	}
+
 	err = c.moveChannel(ch)
 	if err != nil {
 		log.WithError(err).Error("could not set inner channel")
@@ -172,7 +164,7 @@ func (c *channel) Consume(
 	var deliveries = make(chan amqp.Delivery)
 	go func() {
 		defer close(deliveries)
-		defer log.Debug("channel: consumer done with re-tries")
+		defer log.Debug("channel: consumer stopping with re-tries")
 		for {
 			var (
 				ch  <-chan amqp.Delivery
@@ -184,9 +176,7 @@ func (c *channel) Consume(
 				return
 			default:
 			}
-			log.Debug("channel: consumer is waiting for channel reload")
 			c.wait()
-			log.Debug("channel: consumer getting deliveries inner channel")
 			ch, err = c.ch.Consume(
 				queue,
 				consumer,
@@ -219,10 +209,9 @@ func (c *channel) Consume(
 						log.Debug("channel: consumer inner channel closed")
 						goto NextConsumer
 					}
-					// deliveries <- msg
 					select {
 					case deliveries <- msg:
-						// TODO msg.Ack(false)
+						// TODO consider calling msg.Ack(false) here
 					case <-c.ctx.Done():
 						return
 					case <-c.notifyCancel:

@@ -2,15 +2,15 @@ package frontier
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/harrybrwn/diktyo/event"
-	"github.com/harrybrwn/diktyo/web"
+	"github.com/harrybrwn/remora/event"
+	"github.com/harrybrwn/remora/web"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 	"google.golang.org/protobuf/proto"
@@ -48,14 +48,12 @@ type Frontier struct {
 	Exchange   Exchange
 	RetryLimit int
 
-	config Connect
-
 	conn       *amqp.Connection
 	connClosed chan *amqp.Error
 	mu         sync.Mutex
-	connected  *sync.Cond
-	done       chan struct{}
+	cond       *sync.Cond
 	ready      int32
+	done       chan struct{}
 
 	reconnectAfter  *time.Ticker
 	reloadListeners []reloadable
@@ -84,9 +82,11 @@ func (f *Frontier) Close() error {
 	// so that any other objects that depend on knowing when
 	// the session is closed are also notified before the
 	// underlying connection is terminated
-	close(f.done)
 	f.reconnectAfter.Stop()
 	f.cancel()
+	if f.conn == nil {
+		return nil
+	}
 	return f.conn.Close()
 }
 
@@ -94,25 +94,28 @@ func (f *Frontier) WithContext(ctx context.Context) {
 	f.ctx, f.cancel = context.WithCancel(ctx)
 }
 
-func (f *Frontier) Connect(ctx context.Context, c Connect) error {
-	f.connected = sync.NewCond(&f.mu)
+func (f *Frontier) Connect(ctx context.Context, c Connect) (err error) {
+	if f.ready != 0 {
+		return errors.New("already connected")
+	}
+	f.cond = sync.NewCond(&f.mu)
 	f.done = make(chan struct{})
-	f.config = c
 	f.reconnectAfter = time.NewTicker(ReconnectDelay)
 	f.reloadListeners = make([]reloadable, 0)
 	f.WithContext(ctx)
-	f.connected.L.Lock()
-	defer f.connected.L.Unlock()
-	go f.handleReconnect()
+	f.cond.L.Lock()
+	defer f.cond.L.Unlock()
+	go f.handleReconnect(c)
 	for f.ready == 0 {
-		f.connected.Wait()
+		f.cond.Wait()
 	}
-	return nil
+	return f.ctx.Err()
 }
 
 func (f *Frontier) connect(c Connect) error {
-	f.connected.L.Lock()
-	defer f.connected.L.Unlock()
+	f.cond.L.Lock()
+	defer f.cond.L.Unlock()
+	atomic.StoreInt32(&f.ready, 0)
 	var (
 		conn *amqp.Connection
 		err  error
@@ -124,44 +127,59 @@ func (f *Frontier) connect(c Connect) error {
 		conn, err = amqp.Dial(uri)
 	}
 	if err != nil {
-		log.WithError(err).Error("frontier: could not connect to message queue")
 		return err
 	}
 	log.Debug("frontier: connection established")
 	f.conn = conn
 	f.connClosed = f.conn.NotifyClose(make(chan *amqp.Error))
 	atomic.StoreInt32(&f.ready, 1)
-	f.connected.Broadcast()
+	f.cond.Broadcast()
 	return nil
 }
 
-func (f *Frontier) handleReconnect() {
+func (f *Frontier) handleReconnect(config Connect) {
 	var retries int
+	stop := func() {
+		f.cond.L.Lock()
+		atomic.StoreInt32(&f.ready, 1)
+		f.cond.Broadcast()
+		f.cond.L.Unlock()
+	}
 	for {
-		atomic.StoreInt32(&f.ready, 0)
-		f.reconnectAfter.Reset(ReconnectDelay)
-		err := f.connect(f.config)
+		err := f.connect(config)
 		if err != nil {
-			log.WithError(err).Warn("reconnect failed")
+			log.WithFields(logrus.Fields{
+				"max-retries": f.RetryLimit,
+				"retries":     retries,
+				"error":       err,
+			}).Warn("frontier: connect failed")
 			select {
 			case <-f.ctx.Done():
+				log.Debug("frontier: context cancelled during dial retry loop")
+				stop()
 				return
 			case <-f.done:
 				log.Debug("frontier: done signal received")
 				return
 			case <-f.reconnectAfter.C:
 				log.Debug("frontier: reconnecting...")
-				retries++
 			}
 			if retries > f.RetryLimit {
-				close(f.done)
+				// Limit reached stopping the world
 				f.cancel()
+				stop()
 				return
 			}
+			retries++
 			continue
 		}
+		retries = 0 // reset the count after succesful connection
+
 		// block forever until done or closed
 		select {
+		case <-f.ctx.Done():
+			log.Debug("frontier: context cancelled")
+			return
 		case <-f.done:
 			log.Debug("frontier: done signal received")
 			return
@@ -190,13 +208,13 @@ func (f *Frontier) reload() error {
 	// reload all listeners and collect the closed ones
 	for i, reload := range f.reloadListeners {
 		err = reload.Reload()
-		closed[i] = err != nil
+		closed[i] = err == context.Canceled || err == context.DeadlineExceeded
 	}
 	// remove all listeners that have been closed
 	for i := 0; i <= l; {
 		if closed[i] {
-			f.reloadListeners[i] = f.reloadListeners[l]
-			f.reloadListeners = f.reloadListeners[:l]
+			f.reloadListeners[i] = f.reloadListeners[l] // swap
+			f.reloadListeners = f.reloadListeners[:l]   // remove
 			l--
 		} else {
 			i++
@@ -208,11 +226,17 @@ func (f *Frontier) reload() error {
 // Used for creating channels but waiting for a
 // connection to be ready.
 func (f *Frontier) Channel() (*amqp.Channel, error) {
-	f.connected.L.Lock()
-	defer f.connected.L.Unlock()
+	f.cond.L.Lock()
+	defer f.cond.L.Unlock()
+
+	select {
+	case <-f.ctx.Done():
+		return nil, f.ctx.Err()
+	default:
+	}
 	for f.ready == 0 {
-		log.Debug("frontier: wating for connection to create channel")
-		f.connected.Wait()
+		log.Debug("frontier: wating for connection to create a channel")
+		f.cond.Wait()
 	}
 	return f.conn.Channel()
 }
@@ -239,7 +263,8 @@ func (f *Frontier) Consumer(queue string, opts ...event.ConsumerOpt) (event.Cons
 		c.ch.Close()
 		return nil, err
 	}
-	_, err = c.ch.QueueDeclare(queue, true, false, false, false, nil)
+	args := amqp.Table{"x-queue-mode": "lazy"}
+	_, err = c.ch.QueueDeclare(queue, true, false, false, false, args)
 	if err != nil {
 		c.ch.Close()
 		return nil, err
@@ -310,42 +335,14 @@ type consumer struct {
 	name    string
 }
 
-var ErrWrongConsumerType = errors.New("wrong consumer type")
-
 func WithAutoAck(auto bool) event.ConsumerOpt {
 	return func(c event.Consumer) error {
 		co, ok := c.(*consumer)
 		if !ok {
-			return ErrWrongConsumerType
+			return errors.Wrap(event.ErrWrongConsumerType, "could not set auto-ack")
 		}
 		co.autoAck = auto
 		return nil
-	}
-}
-
-type qos interface {
-	Qos(prefetchCount int, prefetchSize int, global bool) error
-}
-
-type prefetchable interface {
-	WithPrefetch(int)
-}
-
-func WithPrefetch(n int) event.ConsumerOpt {
-	return func(c event.Consumer) error {
-		switch v := c.(type) {
-		case qos:
-			return v.Qos(n, 0, false)
-		case prefetchable:
-			v.WithPrefetch(n)
-			return nil
-		case interface{ WithPrefetch(int) error }:
-			return v.WithPrefetch(n)
-		case interface{ Qos(int) error }:
-			return v.Qos(n)
-		default:
-			return ErrWrongConsumerType
-		}
 	}
 }
 
@@ -353,7 +350,7 @@ func WithName(name string) event.ConsumerOpt {
 	return func(c event.Consumer) error {
 		co, ok := c.(*consumer)
 		if !ok {
-			return errors.New("wrong consumer type")
+			return errors.Wrap(event.ErrWrongConsumerType, "could not set consumer name")
 		}
 		co.name = name
 		return nil
@@ -364,7 +361,8 @@ func WithKeys(keys ...string) event.ConsumerOpt {
 	return func(c event.Consumer) error {
 		co, ok := c.(*consumer)
 		if !ok {
-			return errors.New("wrong consumer type")
+			// Default to the more generic version in the event package
+			return event.WithKeys(keys...)(c)
 		}
 		if co.queue == "" {
 			return errors.New("consumer queue not set")
@@ -377,7 +375,7 @@ func OnCancel(ch chan string) event.ConsumerOpt {
 	return func(c event.Consumer) error {
 		co, ok := c.(*consumer)
 		if !ok {
-			return errors.New("wrong consumer type")
+			return event.ErrWrongConsumerType
 		}
 		co.ch.NotifyCancel(ch)
 		return nil
@@ -388,7 +386,7 @@ func OnClose(ch chan *amqp.Error) event.ConsumerOpt {
 	return func(c event.Consumer) error {
 		co, ok := c.(*consumer)
 		if !ok {
-			return errors.New("wrong consumer type")
+			return event.ErrWrongConsumerType
 		}
 		co.ch.NotifyClose(ch)
 		return nil
@@ -403,6 +401,10 @@ func (c *consumer) WithOpt(opts ...event.ConsumerOpt) error {
 		}
 	}
 	return err
+}
+
+func (c *consumer) BindKeys(keys ...string) error {
+	return bindKeys(c, keys)
 }
 
 func (c *consumer) Consume(keys ...string) (<-chan amqp.Delivery, error) {
@@ -439,30 +441,6 @@ func bindKeys(c *consumer, keys []string) error {
 
 const PageExchangeName = "page_topic"
 
-func DeclarePageExchange(ch *amqp.Channel) error {
-	return ch.ExchangeDeclare(
-		PageExchangeName,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-}
-
-func DeclareHostQueue(ch *amqp.Channel, host string) (amqp.Queue, error) {
-	return ch.QueueDeclare(
-		// fmt.Sprintf("spider.%s", host), // TODO add this
-		host,
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no wait
-		nil,   // arguments
-	)
-}
-
 type MessageType int
 
 const (
@@ -493,19 +471,6 @@ func SetPageReqAsMessageBody(req *web.PageRequest, msg *amqp.Publishing) error {
 	msg.Type = PageRequest.String()
 	msg.ContentType = "application/vnd.google.protobuf"
 	return nil
-}
-
-func PushRequestToHost(ch *amqp.Channel, req *web.PageRequest, name string) error {
-	msg := amqp.Publishing{
-		DeliveryMode: amqp.Persistent,
-		ContentType:  "application/vnd.google.protobuf",
-		Priority:     0,
-	}
-	err := SetPageReqAsMessageBody(req, &msg)
-	if err != nil {
-		return err
-	}
-	return ch.Publish("", name, false, false, msg)
 }
 
 func uri(c Connect) string {

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/harrybrwn/diktyo/event"
-	"github.com/harrybrwn/diktyo/internal/visitor"
-	"github.com/harrybrwn/diktyo/storage"
-	"github.com/harrybrwn/diktyo/web"
+	"github.com/harrybrwn/remora/event"
+	"github.com/harrybrwn/remora/internal/visitor"
+	"github.com/harrybrwn/remora/storage"
+	"github.com/harrybrwn/remora/web"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 	"google.golang.org/protobuf/proto"
@@ -66,7 +66,7 @@ type vis struct{}
 
 func (*vis) Filter(*web.PageRequest, *url.URL) error { return nil }
 func (*vis) Visit(_ context.Context, p *web.Page)    { log.Infof("visit %s", p.URL.String()) }
-func (*vis) LinkFound(*url.URL)                      {}
+func (*vis) LinkFound(*url.URL) error                { return nil }
 
 func TestSpider(t *testing.T) {
 	log.SetLevel(logrus.TraceLevel)

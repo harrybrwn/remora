@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/go-redis/redis"
-	"github.com/harrybrwn/diktyo/internal"
-	"github.com/harrybrwn/diktyo/storage"
-	"github.com/harrybrwn/diktyo/web"
+	"github.com/harrybrwn/remora/internal"
+	"github.com/harrybrwn/remora/storage"
+	"github.com/harrybrwn/remora/web"
 	"github.com/lib/pq" // database driver
 	"github.com/sirupsen/logrus"
 )
@@ -47,13 +47,17 @@ func init() {
 
 func SetLogger(l *logrus.Logger) { log = l }
 
-func New(db *sql.DB, redis storage.Redis) *Visitor {
-	return &Visitor{
-		db:     db,
-		hashes: hashSet{redis},
-		Hosts:  make(map[string]struct{}),
-		// hashes: make(map[[16]byte]struct{}),
+func New(db *sql.DB, redis storage.Redis) (*Visitor, error) {
+	page, err := db.Prepare(insertPageSQL)
+	if err != nil {
+		return nil, err
 	}
+	return &Visitor{
+		db:             db,
+		hashes:         hashSet{redis},
+		Hosts:          make(map[string]struct{}),
+		insertPageStmt: page,
+	}, nil
 }
 
 func AddHost(v web.Visitor, host ...string) {
@@ -76,16 +80,25 @@ func AddHosts(v web.Visitor, hosts []string) {
 }
 
 type Visitor struct {
-	db      *sql.DB
-	Hosts   map[string]struct{}
-	hashes  hashSet
-	Visited int64
+	db             *sql.DB
+	Hosts          map[string]struct{}
+	hashes         hashSet
+	Visited        int64
+	insertPageStmt *sql.Stmt
 }
 
 type stats struct {
 	page    time.Duration
 	edge    time.Duration
 	edgeDel time.Duration
+}
+
+func (v *Visitor) Close() error {
+	err := v.insertPageStmt.Close()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (v *Visitor) Filter(p *web.PageRequest, u *url.URL) error {
@@ -99,7 +112,7 @@ func (v *Visitor) Filter(p *web.PageRequest, u *url.URL) error {
 	return nil
 }
 
-func (v *Visitor) LinkFound(u *url.URL) {}
+func (v *Visitor) LinkFound(u *url.URL) error { return nil }
 
 func (v *Visitor) Visit(ctx context.Context, page *web.Page) {
 	select {
@@ -245,6 +258,7 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 		defer wg.Done()
 		err = insertPage(ctx, tx, id, page)
 		if err != nil {
+			log.WithError(err).Error("could not insert page")
 			return
 		}
 		stats.page = time.Since(a)
@@ -253,6 +267,7 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 		defer wg.Done()
 		err = insertEdges(ctx, tx, h, id, page, &stats)
 		if err != nil {
+			log.WithError(err).Error("could not insert edges")
 			return
 		}
 	}()
@@ -309,7 +324,7 @@ func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page
 		page.ResponseTime.String(),
 		ipv4,
 		ipv6,
-		page.Title,
+		page.Title(),
 		strings.ToValidUTF8(strings.Join(page.Words, " "), ""),
 		page.Encoding,
 	)
@@ -444,4 +459,134 @@ func (h *hashSet) has(b [16]byte) bool {
 
 func (h *hashSet) put(b [16]byte) error {
 	return h.r.Set(hex.EncodeToString(b[:]), 2, 0).Err()
+}
+
+var stopwords = map[string]struct{}{
+	"i":          {},
+	"me":         {},
+	"my":         {},
+	"myself":     {},
+	"we":         {},
+	"our":        {},
+	"ours":       {},
+	"ourselves":  {},
+	"you":        {},
+	"your":       {},
+	"yours":      {},
+	"yourself":   {},
+	"yourselves": {},
+	"he":         {},
+	"him":        {},
+	"his":        {},
+	"himself":    {},
+	"she":        {},
+	"her":        {},
+	"hers":       {},
+	"herself":    {},
+	"it":         {},
+	"its":        {},
+	"itself":     {},
+	"they":       {},
+	"them":       {},
+	"their":      {},
+	"theirs":     {},
+	"themselves": {},
+	"what":       {},
+	"which":      {},
+	"who":        {},
+	"whom":       {},
+	"this":       {},
+	"that":       {},
+	"these":      {},
+	"those":      {},
+	"am":         {},
+	"is":         {},
+	"are":        {},
+	"was":        {},
+	"were":       {},
+	"be":         {},
+	"been":       {},
+	"being":      {},
+	"have":       {},
+	"has":        {},
+	"had":        {},
+	"having":     {},
+	"do":         {},
+	"does":       {},
+	"did":        {},
+	"doing":      {},
+	"a":          {},
+	"an":         {},
+	"the":        {},
+	"and":        {},
+	"but":        {},
+	"if":         {},
+	"or":         {},
+	"because":    {},
+	"as":         {},
+	"until":      {},
+	"while":      {},
+	"of":         {},
+	"at":         {},
+	"by":         {},
+	"for":        {},
+	"with":       {},
+	"about":      {},
+	"against":    {},
+	"between":    {},
+	"into":       {},
+	"through":    {},
+	"during":     {},
+	"before":     {},
+	"after":      {},
+	"above":      {},
+	"below":      {},
+	"to":         {},
+	"from":       {},
+	"up":         {},
+	"down":       {},
+	"in":         {},
+	"out":        {},
+	"on":         {},
+	"off":        {},
+	"over":       {},
+	"under":      {},
+	"again":      {},
+	"further":    {},
+	"then":       {},
+	"once":       {},
+	"here":       {},
+	"there":      {},
+	"when":       {},
+	"where":      {},
+	"why":        {},
+	"how":        {},
+	"all":        {},
+	"any":        {},
+	"both":       {},
+	"each":       {},
+	"few":        {},
+	"more":       {},
+	"most":       {},
+	"other":      {},
+	"some":       {},
+	"such":       {},
+	"no":         {},
+	"nor":        {},
+	"not":        {},
+	"only":       {},
+	"own":        {},
+	"same":       {},
+	"so":         {},
+	"than":       {},
+	"too":        {},
+	"very":       {},
+	"s":          {},
+	"t":          {},
+	"can":        {},
+	"will":       {},
+	"just":       {},
+	"don":        {},
+	"should":     {},
+	"now":        {},
 }

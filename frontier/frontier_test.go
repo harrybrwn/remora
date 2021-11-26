@@ -7,10 +7,11 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/harrybrwn/diktyo/event"
+	"github.com/harrybrwn/remora/event"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 )
@@ -20,6 +21,7 @@ const (
 
 	exchange  = "logs"
 	consumers = 5
+	level     = logrus.ErrorLevel
 )
 
 var testexchange = Exchange{
@@ -29,228 +31,46 @@ var testexchange = Exchange{
 	AutoDelete: false,
 }
 
-// var (
-// 	_ EventBus  = (*Frontier)(nil)
-// 	_ Consumer  = (*consumer)(nil)
-// 	_ Publisher = (*publisher)(nil)
-// )
-
 func Test(t *testing.T) {}
 
-func TestChannelReload(t *testing.T) {
-	log.SetLevel(logrus.TraceLevel)
-	conn, err := amqp.DialConfig(
-		uri(Connect{Host: "localhost", Port: 5672}),
-		amqp.Config{Heartbeat: 10 * time.Second, Locale: "en_US"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	var (
-		connClose   = make(chan *amqp.Error)
-		connBlocked = make(chan amqp.Blocking)
-	)
-	conn.NotifyClose(connClose)
-	conn.NotifyBlocked(connBlocked)
-	publisher, err := conn.Channel()
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	ch := &channel{
-		conn:     conn,
-		conndone: done,
-	}
-	initChannel(context.TODO(), ch)
-
-	publisher.QueueDeclare("q", true, false, false, false, nil)
-	delivery, err := ch.Consume("q", "", true, false, false, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		<-time.After(time.Second * 2)
-		ch.ch.Close()
-		println("closed inner channel")
-
-		<-time.After(time.Second * 2)
-		ch.Reload()
-	}()
-
-	const messages = 20
-	go func() {
-		for i := 0; i < messages; i++ {
-			err := publisher.Publish("", "q", false, false, amqp.Publishing{
-				Body:         []byte(fmt.Sprintf("message %d", i)),
-				DeliveryMode: amqp.Transient,
-			})
-			if err != nil {
-				t.Error(err)
-			}
-			time.Sleep(time.Millisecond * 500)
-		}
-		ch.Close()
-		publisher.QueueDelete("q", false, false, false)
-		publisher.Close()
-	}()
-
-	count := 0
-Loop:
-	for {
-		select {
-		case msg, ok := <-delivery:
-			if !ok {
-				break Loop
-			}
-			fmt.Printf("msg: %s\n", msg.Body)
-			count++
-		case err := <-connClose:
-			fmt.Println("connection closed:", err)
-			break Loop
-		case blocked := <-connBlocked:
-			fmt.Println("connection blocked:", blocked)
-			break Loop
-		}
-	}
-	if count != messages {
-		t.Errorf("wrong number of messages received: got %d, want %d", count, messages)
-	}
-}
-
-var (
-	mu     sync.Mutex
-	queues = 0
-)
-
-func consume(t *testing.T, ch *amqp.Channel, exchange string, keys ...string) {
-	mu.Lock()
-	id := queues
-	queues++
-	mu.Unlock()
-
-	q, err := ch.QueueDeclare(
-		// fmt.Sprintf("%s.%s", queuename, key),
-		fmt.Sprintf("%s-%d", queuename, id),
-		// queuename,
-		true,  // durable
-		true,  // autodelete
-		false, // exclusive - delete when the connection that declared it closes
-		false, // no wait
-		nil,
-	)
-	if err != nil {
-		t.Errorf("could not delare queue: %v", err)
-		mu.Unlock()
-		return
-	}
-	err = exchangeDeclare(ch)
-	if err != nil {
-		t.Errorf("could not declare exchange: %v", err)
-		return
-	}
-	for _, key := range keys {
-		if err = ch.QueueBind(
-			q.Name,
-			key,
-			exchange,
-			false,
-			nil,
-		); err != nil {
-			t.Error(err)
-		}
-	}
-
-	fmt.Printf("bound keys %v to queue %q\n", keys, q.Name)
-	err = ch.Qos(1, 0, false)
-	if err != nil {
-		t.Error(err)
-	}
-	delivery, err := ch.Consume(
-		q.Name,
-		"",
-		true,  // auto ack
-		false, // exclusive
-		false, // no local
-		false, // no wait
-		nil,
-	)
-	if err != nil {
-		t.Errorf("could not start consumer: %v", err)
-		return
-	}
-	for msg := range delivery {
-		fmt.Printf("[%v %q %q] %v %v => %s\n", keys[0], msg.Exchange, msg.RoutingKey, msg.ConsumerTag, msg.DeliveryTag, msg.Body)
-		// time.Sleep(time.Second * 2)
-	}
-}
-
-func exchangeDeclare(ch *amqp.Channel) error {
-	// e := Exchange{
-	// 	Name:       exchange,
-	// 	Kind:       DefaultExchangeKind,
-	// 	Durable:    true,
-	// 	AutoDelete: true,
-	// }
-	// return e.declare(ch)
-	return testexchange.declare(ch)
-}
-
-func TestConsumerPlain(t *testing.T) {
-	// This is a consumer that does not use the frontier abstractions
-	// for creating consumers.
-	t.Skip()
-	signals := make(chan os.Signal, 5)
-	signal.Notify(signals, os.Interrupt)
+func TestConnectionRetry(t *testing.T) {
+	t.Parallel()
+	log.SetLevel(level)
+	tmp := ReconnectDelay
+	defer func() { ReconnectDelay = tmp }()
+	ReconnectDelay = time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
-	var (
-		front = &Frontier{Exchange: Exchange{
-			Name: exchange, Durable: true, AutoDelete: true}}
-	)
-	err := front.Connect(ctx, Connect{Host: "localhost", Port: 5672})
-	if err != nil {
-		t.Fatal(err)
+	defer cancel()
+	front := Frontier{
+		Exchange:   Exchange{Name: exchange, Durable: true, AutoDelete: true},
+		RetryLimit: 2,
 	}
-
-	var channels [consumers]*amqp.Channel
-	for i := 0; i < consumers; i++ {
-		channels[i], err = front.conn.Channel()
-		if err != nil {
-			t.Error(err)
-			continue
-		}
-		// go consume(t, channels[i], exchange, fmt.Sprintf("log.testing.%d", i))
+	err := front.Connect(ctx, Connect{
+		Host: "localhost", Port: 3002}) // make sure this won't connect
+	if err == nil {
+		t.Error("should have gotten an error on connect")
 	}
-	<-signals
-
-	for _, ch := range channels {
-		if err = ch.Close(); err != nil {
-			t.Error(err)
-		}
-	}
-	cancel()
+	defer front.Close()
 }
 
 func TestConsumer(t *testing.T) {
 	t.Parallel()
-	logrus.SetLevel(logrus.DebugLevel)
+	log.SetLevel(level)
 	signals := make(chan os.Signal, 5)
 	signal.Notify(signals, os.Interrupt)
-	timeout := time.Second * 2
+	timeout := time.Second * 1
+	timeout = time.Millisecond * 250
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	var (
-		front = &Frontier{Exchange: testexchange}
+		front = &Frontier{Exchange: testexchange, RetryLimit: 5}
 	)
+	log.Info("connecting frontier")
 	err := front.Connect(ctx, Connect{Host: "localhost", Port: 5672})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer front.Close()
-
-	// go func() {
-	// 	time.Sleep(time.Second * 3)
-	// 	front.conn.Close()
-	// }()
+	log.Info("consumer frontier connected")
 
 	defer cancel()
 	c, err := front.Consumer(
@@ -262,35 +82,11 @@ func TestConsumer(t *testing.T) {
 	}
 	defer c.Close()
 
-	// deliveries, err := c.Consume("log.*.*")
-	// if err != nil {
-	// 	t.Fatal(err)
-	// }
-	// go func() {
-	// 	for {
-	// 		select {
-	// 		case <-ctx.Done():
-	// 			fmt.Println("context canceled")
-	// 			return
-	// 		case msg, ok := <-deliveries:
-	// 			if !ok {
-	// 				fmt.Println("deliveries channel closed")
-	// 				return
-	// 			}
-	// 			if msg.Body == nil {
-	// 				t.Error("got nil message body")
-	// 				return
-	// 			}
-	// 			fmt.Printf("[%q %q] %v %v => %s\n", msg.Exchange, msg.RoutingKey, msg.ConsumerTag, msg.DeliveryTag, msg.Body)
-	// 		}
-	// 	}
-	// }()
-
 	for i := 0; i < consumers; i++ {
 		c, err := front.Consumer(
 			queuename,
 			WithAutoAck(true),
-			WithPrefetch(5),
+			event.WithPrefetch(5),
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -316,15 +112,17 @@ func TestConsumer(t *testing.T) {
 
 func TestPublisher(t *testing.T) {
 	t.Parallel()
+	log.SetLevel(level)
 	var (
-		front = &Frontier{Exchange: testexchange}
-		wait  = time.Millisecond * 10
+		front = &Frontier{Exchange: testexchange, RetryLimit: 2}
+		wait  time.Duration
 	)
-	wait = time.Millisecond * 250
-	wait = time.Millisecond * 100
 	wait = time.Millisecond
+	timeout := time.Second * 2
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	err := front.Connect(
-		context.Background(),
+		ctx,
 		Connect{Host: "localhost", Port: 5672},
 	)
 	if err != nil {
@@ -356,10 +154,27 @@ func TestPublisher(t *testing.T) {
 			if err != nil {
 				t.Error(err)
 			}
-			// fmt.Println("msg", i, "published to", key)
 		case <-done:
 			return
 		}
+	}
+}
+
+func TestChannel_wait(t *testing.T) {
+	t.Parallel()
+	log.SetLevel(level)
+	var ch channel
+	ch.chOpen = sync.NewCond(&ch.mu)
+	ch.reload = make(chan struct{})
+	ch.ctx, ch.cancel = context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(time.Millisecond * 250)
+		atomic.CompareAndSwapInt32(&ch.open, ch.open, 1)
+		ch.chOpen.Signal()
+	}()
+	ch.wait()
+	if ch.open != 1 {
+		t.Error("expected the open flag to be 1")
 	}
 }
 

@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/go-redis/redis"
-	"github.com/harrybrwn/diktyo/db"
+	"github.com/harrybrwn/remora/db"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 )
 
@@ -28,7 +29,6 @@ type Config struct {
 	// defaults to the Sleep variable
 	WaitTimes map[string]string `yaml:"wait_times"`
 
-	// Profile  string `yaml:"profile" config:"profile"`
 	Profiles map[string]struct {
 		Seeds        []string `yaml:"seeds" config:"seeds"`
 		AllowedHosts []string `yaml:"allowed_hosts" config:"allowed_hosts"`
@@ -40,7 +40,8 @@ type Config struct {
 		Port     int    `yaml:"port"`
 		DB       int    `yaml:"db"`
 		Password string `yaml:"password"`
-	} `yaml:"visited_set" config:"visited_set"`
+	} `yaml:"visited_set" config:"visited_set,notflag"`
+	UserAgent string `yaml:"user_agent" config:"user_agent" default:"Remora"`
 }
 
 func (c *Config) Bind(flag *flag.FlagSet) {
@@ -58,8 +59,9 @@ func (c *Config) RedisOpts() *redis.Options {
 			c.VisitedSet.Host,
 			strconv.FormatInt(int64(c.VisitedSet.Port), 10),
 		),
-		DB:       c.VisitedSet.DB,
-		Password: c.VisitedSet.Password,
+		DB:          c.VisitedSet.DB,
+		Password:    c.VisitedSet.Password,
+		ReadTimeout: time.Second * 30,
 	}
 }
 
@@ -97,4 +99,33 @@ func (c *Config) GetLevel() logrus.Level {
 		return logrus.DebugLevel
 	}
 	return lvl
+}
+
+var (
+	version    = "dev"
+	date       string
+	commit     string
+	sourcehash string
+)
+
+func NewVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "version",
+		Short:   "Show the command version",
+		Aliases: []string{"v"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := cmd.Root()
+			if version == "dev" {
+				cmd.Printf("%s development version\n", root.Name())
+				return nil
+			}
+			cmd.Printf("%s version %s\n", root.Name(), version)
+			cmd.Printf("date:   %s\n", date)
+			cmd.Printf("commit: %s\n", commit)
+			if sourcehash != "" {
+				cmd.Printf("hash:   %s\n", sourcehash)
+			}
+			return nil
+		},
+	}
 }

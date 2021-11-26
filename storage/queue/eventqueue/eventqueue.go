@@ -5,8 +5,8 @@ import (
 	"sync"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/harrybrwn/diktyo/event"
-	"github.com/harrybrwn/diktyo/storage/queue"
+	"github.com/harrybrwn/remora/event"
+	"github.com/harrybrwn/remora/storage/queue"
 	"github.com/streadway/amqp"
 )
 
@@ -114,6 +114,17 @@ func (q *q) Consume(keys ...string) (<-chan amqp.Delivery, error) {
 		}
 	}()
 	return delivery, nil
+}
+
+func (q *q) BindKeys(keys ...string) error {
+	q.bus.mu.Lock()
+	for _, k := range keys {
+		if _, ok := q.bus.queues[k]; !ok {
+			q.bus.queues[k] = q.q
+		}
+	}
+	q.bus.mu.Unlock()
+	return nil
 }
 
 func (q *q) Ack(uint64, bool) error        { return nil }

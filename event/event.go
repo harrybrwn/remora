@@ -2,17 +2,23 @@ package event
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
 	"sync"
 
+	"github.com/pkg/errors"
 	"github.com/streadway/amqp"
 )
 
+var (
+	ErrNoQueue           = errors.New("queue does not exist")
+	ErrWrongConsumerType = errors.New("wrong consumer type")
+)
+
 type Event struct {
+	Tag      uint64
 	Priority uint8
 	Body     []byte
-	Tag      uint64
 }
 
 type ConsumerOpt func(Consumer) error
@@ -43,14 +49,55 @@ func PublishWithContext(ctx context.Context) PublisherOpt {
 	return func(p Publisher) error { return setContext(p, ctx) }
 }
 
+func WithKeys(keys ...string) ConsumerOpt {
+	return func(c Consumer) error {
+		switch v := c.(type) {
+		case interface{ BindKeys(...string) error }:
+			return v.BindKeys(keys...)
+		default:
+			return errors.New("could not bind keys")
+		}
+	}
+}
+
+type qos interface {
+	Qos(prefetchCount int, prefetchSize int, global bool) error
+}
+
+type prefetchable interface {
+	WithPrefetch(int)
+}
+
+func WithPrefetch(n int) ConsumerOpt {
+	return func(c Consumer) error {
+		switch v := c.(type) {
+		case qos:
+			return v.Qos(n, 0, false)
+		case prefetchable:
+			v.WithPrefetch(n)
+			return nil
+		case interface{ WithPrefetch(int) error }:
+			return v.WithPrefetch(n)
+		case interface{ Qos(int) error }:
+			return v.Qos(n)
+		default:
+			return errors.Wrap(ErrWrongConsumerType, "could not set prefetch")
+		}
+	}
+}
+
 type ContextSetter interface {
 	// TODO when generics are added, this should return itself
 	WithContext(context.Context)
 }
 
 func NewChannelBus() *ChannelBus {
+	return NewChannelBusContext(context.Background())
+}
+
+func NewChannelBusContext(ctx context.Context) *ChannelBus {
 	bus := ChannelBus{queues: make(map[string]*queue)}
-	bus.WithContext(context.Background())
+	bus.WithContext(ctx)
 	return &bus
 }
 
@@ -67,8 +114,11 @@ func (cb *ChannelBus) Consumer(key string, opts ...ConsumerOpt) (Consumer, error
 	defer cb.mu.Unlock()
 	q, ok := cb.queues[key]
 	if !ok {
-		q, err = newqueue(opts)
+		q, err = newqueue(cb.ctx, opts)
 		cb.queues[key] = q
+		for _, k := range q.keys {
+			cb.queues[k] = q
+		}
 	}
 	return q, err
 }
@@ -78,13 +128,14 @@ func (cb *ChannelBus) Publish(key string, msg amqp.Publishing) error {
 	q, ok := cb.queues[key]
 	cb.mu.Unlock()
 	if !ok {
-		return nil
+		return errors.Wrap(ErrNoQueue, fmt.Sprintf("queue %q not found", key))
 	}
 	select {
 	case q.pub <- msg:
+		return nil
 	case <-cb.ctx.Done():
+		return cb.ctx.Err()
 	}
-	return nil
 }
 
 func (cb *ChannelBus) PublishEvent(key string, msg Event) error {
@@ -95,7 +146,13 @@ func (cb *ChannelBus) PublishEvent(key string, msg Event) error {
 }
 
 func (cb *ChannelBus) Publisher(opts ...PublisherOpt) (Publisher, error) {
-	return cb, nil
+	var err, e error
+	for _, o := range opts {
+		if e = o(cb); e != nil && err == nil {
+			err = e
+		}
+	}
+	return cb, err
 }
 
 func (cb *ChannelBus) WithContext(ctx context.Context) {
@@ -104,11 +161,6 @@ func (cb *ChannelBus) WithContext(ctx context.Context) {
 
 func (cb *ChannelBus) Close() error {
 	cb.cancel()
-	cb.mu.Lock()
-	for _, q := range cb.queues {
-		q.Close()
-	}
-	cb.mu.Unlock()
 	return nil
 }
 
@@ -117,10 +169,12 @@ type queue struct {
 	con    chan amqp.Delivery
 	ctx    context.Context
 	cancel context.CancelFunc
+	keys   []string
 }
 
-func newqueue(opts []ConsumerOpt) (*queue, error) {
+func newqueue(ctx context.Context, opts []ConsumerOpt) (*queue, error) {
 	var q queue
+	q.WithContext(ctx)
 	err := q.WithOpt(opts...)
 	if q.pub == nil {
 		q.pub = make(chan amqp.Publishing)
@@ -134,7 +188,6 @@ func newqueue(opts []ConsumerOpt) (*queue, error) {
 func (q *queue) Close() error {
 	q.cancel()
 	close(q.pub)
-	close(q.con)
 	return nil
 }
 
@@ -152,19 +205,32 @@ func (q *queue) Qos(n int, _ int, _ bool) error {
 	return nil
 }
 
-func (q *queue) Consume(keys ...string) (<-chan amqp.Delivery, error) {
-	go q.start(q.ctx, q.con)
+func (q *queue) BindKeys(keys ...string) error {
+	q.keys = append(q.keys, keys...)
+	return nil
+}
+
+func (q *queue) Consume(...string) (<-chan amqp.Delivery, error) {
+	go start(q.ctx, q.con, q.pub)
 	return q.con, nil
 }
 
-func (q *queue) start(ctx context.Context, c chan amqp.Delivery) {
-	q.ctx, q.cancel = context.WithCancel(ctx)
+func start(
+	ctx context.Context,
+	con chan<- amqp.Delivery,
+	pub <-chan amqp.Publishing,
+) {
 	var count uint64 = 0
+	defer close(con)
 	for {
 		select {
-		case <-q.ctx.Done():
+		case <-ctx.Done():
 			return
-		case c <- pubToDelivery(<-q.pub, count):
+		case msg, ok := <-pub:
+			if !ok {
+				return
+			}
+			con <- pubToDelivery(msg, count)
 			count++
 		}
 	}

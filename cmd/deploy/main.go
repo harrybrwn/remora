@@ -1,40 +1,27 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"io/fs"
+	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
+	"text/tabwriter"
+	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/fatih/color"
 	"github.com/harrybrwn/config"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
-
-func buildFromInstance(in Instance) Build {
-	var b Build
-	if in.Build != nil {
-		b = *in.Build
-	}
-	if b.Host == "" {
-		b.Host = in.Host
-	}
-	if b.Image == "" {
-		b.Image = in.Image
-	}
-	b.setDefaults()
-	return b
-}
 
 func main() {
 	var (
@@ -42,22 +29,105 @@ func main() {
 		conf Config
 		ctx  = context.Background()
 	)
-	config.AddFile("deployment.yml")
-	config.AddPath(".")
-	config.SetType("yaml")
-	config.SetConfig(&conf)
-	err = config.ReadConfig()
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "could not read config file"))
-	}
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()
 
 	cli := NewCliRoot(&conf)
 	err = cli.ExecuteContext(ctx)
 	if err != nil {
-		log.Println(err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
+}
+
+func NewCliRoot(conf *Config) *cobra.Command {
+	var (
+		dk         = &docker{wg: new(sync.WaitGroup)}
+		test       = false
+		configfile = "./deployment.yml"
+	)
+	c := &cobra.Command{
+		Use:           "deploy",
+		Short:         "Container deployment tool for the web crawler",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			dir, file := filepath.Split(configfile)
+			if dir == "" {
+				dir = "."
+			}
+			config.AddPath(dir)
+			config.AddFile(file)
+			config.SetType("yaml")
+			config.SetConfig(conf)
+			err := config.ReadConfigFile()
+			if err != nil {
+				return err
+			}
+			conf.interpolate()
+			return nil
+		},
+	}
+	c.PersistentFlags().StringVarP(
+		&configfile, "config", "c",
+		configfile, "use a different config file")
+	c.PersistentFlags().BoolVar(&test, "test", test, "")
+	c.PersistentFlags().MarkHidden("test")
+
+	var listOpts types.ContainerListOptions
+	ps := &cobra.Command{
+		Use: "ps", Short: "Show all running containers",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if test {
+				docker := newMultiDocker(conf.HostConfigs())
+				tab := tabwriter.NewWriter(
+					os.Stdout, 1, 4, 3, ' ', tabwriter.StripEscape,
+				)
+				err := docker.Run(
+					cmd.Context(),
+					multiPSFunc(conf, tab, listOpts),
+				)
+				tab.Flush()
+				return err
+			}
+			commands, err := ps(conf.instances(args...), dk, listOpts.All)
+			return chain(err, run(cmd.Context(), dk, commands))
+		},
+	}
+	ps.Flags().BoolVarP(&listOpts.All, "all", "a", false, "")
+
+	c.AddCommand(
+		ps,
+		newLogsCmd(conf),
+		newListCmd(conf),
+		newUpCmd(conf),
+		newUploadCmd(conf),
+		newInstancesCmd(conf, "down", "Stop and remove all containers", down),
+		newInstancesCmd(conf, "stop", "Stop all the containers", stop),
+		&cobra.Command{
+			Use: "restart", Short: "Restart all the running containers",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				commands, err := restart(conf.instances(args...), dk)
+				return chain(err, run(cmd.Context(), dk, commands))
+			},
+		},
+		&cobra.Command{
+			Use: "build", Short: "Build all the images the deployment depends on",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				commands, err := build(conf.builds(args...), dk)
+				return chain(err, run(cmd.Context(), dk, commands))
+			},
+		},
+		&cobra.Command{
+			Use: "pull", Short: "Pull images to all hosts",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				commands, err := pull(conf.builds(args...), dk)
+				return chain(err, run(cmd.Context(), dk, commands))
+			},
+		},
+	)
+	c.SetOut(os.Stdout)
+	c.SetErr(os.Stderr)
+	return c
 }
 
 func run(ctx context.Context, dk *docker, commands []Command) error {
@@ -71,88 +141,11 @@ func run(ctx context.Context, dk *docker, commands []Command) error {
 	return nil
 }
 
-func NewCliRoot(conf *Config) *cobra.Command {
-	var (
-		dk     = &docker{wg: new(sync.WaitGroup)}
-		all    bool
-		follow bool
-	)
-	c := &cobra.Command{
-		Use:   "deploy",
-		Short: "Container deployment tool for the web crawler",
+func chain(e1, e2 error) error {
+	if e1 != nil {
+		return e1
 	}
-
-	ps := &cobra.Command{
-		Use: "ps", Short: "",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			conf.interpolate()
-			commands, err := ps(conf.instances(args...), dk, all)
-			if err != nil {
-				return err
-			}
-			for _, comm := range commands {
-				handle(comm.Run(cmd.Context()))
-			}
-			dk.Wait()
-			return nil
-		},
-	}
-	ps.Flags().BoolVarP(&all, "all", "a", false, "list stopped containers as well as other containers")
-
-	logs := &cobra.Command{
-		Use: "logs", Short: "Display container logging",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			conf.interpolate()
-			commands, err := logs(conf.instances(args...), dk, follow)
-			if err != nil {
-				return err
-			}
-			return run(cmd.Context(), dk, commands)
-		},
-	}
-	logs.Flags().BoolVarP(&follow, "follow", "f", follow, "follow the logs")
-
-	build := &cobra.Command{
-		Use: "build", Short: "Build all the images the deployment depends on",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			conf.interpolate()
-			builds := conf.builds(args...)
-			commands, err := build(builds, dk)
-			if err != nil {
-				return err
-			}
-			return run(cmd.Context(), dk, commands)
-		},
-	}
-
-	c.AddCommand(
-		ps,
-		logs,
-		// newLogsCmd(conf),
-		build,
-		newInstancesCmd(conf, "up", "Run all the containers", up),
-		newInstancesCmd(conf, "down", "Stop and remove all containers", down),
-		newInstancesCmd(conf, "stop", "Stop all the containers", stop),
-		&cobra.Command{
-			Use: "list",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				conf.interpolate()
-				instances := conf.instances(args...)
-				builds := conf.builds(args...)
-				fmt.Println("Instances:")
-				for _, in := range instances {
-					fmt.Println(" ", in.Host, in.Image, in.Name, in.Command)
-				}
-				fmt.Println("Builds:")
-				for _, b := range builds {
-					fmt.Println(" ", b.Host, b.Image, b.Dockerfile, b.Context)
-				}
-				fmt.Printf("%d instances, %d builds\n", len(instances), len(builds))
-				return nil
-			},
-		},
-	)
-	return c
+	return e2
 }
 
 func newInstancesCmd(conf *Config, use, short string, fn func([]Instance, *docker) ([]Command, error)) *cobra.Command {
@@ -162,15 +155,176 @@ func newInstancesCmd(conf *Config, use, short string, fn func([]Instance, *docke
 	return &cobra.Command{
 		Use: use, Short: short,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			conf.interpolate()
 			commands, err := fn(conf.instances(args...), dk)
-			if err != nil {
-				return err
-			}
-			return run(cmd.Context(), dk, commands)
+			return chain(err, run(cmd.Context(), dk, commands))
 		},
 	}
 }
+
+func newUpCmd(conf *Config) *cobra.Command {
+	var (
+		pull        bool
+		interactive bool
+		term        bool
+	)
+	dk := &docker{wg: new(sync.WaitGroup)}
+	c := &cobra.Command{
+		Use: "up [<name:host>...]", Short: "Run all the containers",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			commands, err := up(conf.instances(args...), dk, pull, interactive, term)
+			return chain(err, run(cmd.Context(), dk, commands))
+		},
+	}
+	flags := c.Flags()
+	flags.BoolVar(&pull, "pull", pull, "pull the image before running")
+	flags.BoolVarP(&interactive, "interactive", "i", interactive, "run container interactively")
+	flags.BoolVarP(&term, "term", "t", term, "run the container as a terminal")
+	return c
+}
+
+func newLogsCmd(conf *Config) *cobra.Command {
+	var opts = types.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+	}
+	c := cobra.Command{
+		Use: "logs", Short: "Display container logging",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			docker := newMultiDocker(conf.HostConfigs(Filters(args)...))
+			return containerLogs(cmd.Context(), docker, conf.instances(args...), opts)
+		},
+	}
+	flags := c.Flags()
+	flags.BoolVarP(&opts.Follow, "follow", "f", opts.Follow, "follow the logs")
+	flags.StringVar(&opts.Since, "since", opts.Since, "Show logs since timestamp (e.g. 2013-01-02T13:23:37Z) or relative (e.g. 42m for 42 minutes)")
+	return &c
+}
+
+func newListCmd(conf *Config) *cobra.Command {
+	var (
+		notrunc bool
+		trunc   = trunc
+	)
+	cmd := &cobra.Command{
+		Use: "list", Short: "List all containers and builds",
+		Aliases: []string{"ls"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			tab := tabwriter.NewWriter(os.Stdout, 1, 4, 3, ' ', tabwriter.StripEscape)
+			instances := conf.instances(args...)
+			builds := conf.builds(args...)
+			if notrunc {
+				trunc = func(s string, _ int) string { return s }
+			}
+			fmt.Println("Instances:")
+			row(tab, "", "HOST", "IMAGE", "NAME", "COMMAND", "VOLUMES")
+			for _, in := range instances {
+				row(tab,
+					"",
+					in.Host,
+					in.Image,
+					in.Name,
+					trunc(strings.Join(in.Command, " "), 35),
+					"["+fmt.Sprintf("%q", strings.Join(in.Volumes, ", "))+"]",
+				)
+			}
+			tab.Flush()
+			fmt.Println("Builds:")
+			row(tab, "", "HOST", "IMAGE", "DOCKERFILE", "CONTEXT")
+			for _, b := range builds {
+				row(tab, "", b.Host, b.Image, b.Dockerfile, b.Context)
+			}
+			tab.Flush()
+			fmt.Printf("%d instances, %d builds\n", len(instances), len(builds))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&notrunc, "no-trunc", notrunc, "disable string truncation")
+	return cmd
+}
+
+func trunc(s string, max int) string {
+	if len(s) > max {
+		return fmt.Sprintf("%s...", s[:max])
+	}
+	return s
+}
+
+func row(tab *tabwriter.Writer, row ...string) error {
+	_, err := tab.Write([]byte(strings.Join(row, "\t") + "\n"))
+	return err
+}
+
+func newUploadCmd(conf *Config) *cobra.Command {
+	var (
+		volume  string
+		filters []string
+	)
+	c := cobra.Command{
+		Use: "upload", Short: "Upload a file to a volume on all hosts",
+		Long: "Upload a file to a volume on all hosts\n\n" +
+			"This command will use the configuration file to upload any number of\n" +
+			"files to a remote docker container.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dk := conf.docker(filters...)
+			if len(args) == 0 && volume == "" {
+				for _, up := range conf.Uploads {
+					args = append(args, up.Files...)
+					volume = up.Volume
+				}
+			}
+			if volume == "" {
+				return errors.New("no volume name")
+			}
+			if len(args) == 0 {
+				return errors.New("no files to upload")
+			}
+
+			return dk.Run(cmd.Context(), func(ctx context.Context, conf *HostConfig, cli *client.Client) error {
+				files := make([]fs.File, 0, len(args))
+				for _, filename := range args {
+					cmd.Printf("uploading %q to %s \"%s:%[1]s\"\n", filename, conf.Host, volume)
+					f, err := os.OpenFile(filename, os.O_RDONLY, os.ModePerm)
+					if err != nil {
+						return err
+					}
+					stat, err := f.Stat()
+					if err != nil {
+						f.Close()
+						return err
+					}
+					var buf bytes.Buffer
+					if _, err = buf.ReadFrom(f); err != nil {
+						f.Close()
+						return err
+					}
+					f.Close()
+					files = append(files, &file{
+						r:    &buf,
+						stat: stat,
+					})
+				}
+				defer cmd.Printf("done uploading to %s\n", conf.Host)
+				return uploadFilesToVolume(ctx, cli, volume, files)
+			})
+		},
+	}
+	flags := c.Flags()
+	flags.StringVarP(&volume, "volume", "v", volume, "volume name")
+	flags.StringArrayVarP(&filters, "filter", "f", filters,
+		"filter out by <host:name> pairs")
+	return &c
+}
+
+type file struct {
+	r    io.Reader
+	stat os.FileInfo
+}
+
+func (f *file) Read(b []byte) (int, error) {
+	return f.r.Read(b)
+}
+func (f *file) Stat() (fs.FileInfo, error) { return f.stat, nil }
+func (f *file) Close() error               { return nil }
 
 func SplitVolume(v string) (src, dest string, err error) {
 	parts := strings.Split(v, ":")
@@ -189,7 +343,7 @@ func handle(err error) {
 	}
 }
 
-func up(inst []Instance, dk *docker) (commands []Command, err error) {
+func up(inst []Instance, dk *docker, pull bool, i, t bool) (commands []Command, err error) {
 	if len(inst) == 0 {
 		err = errors.New("no instances to deploy")
 		return
@@ -197,7 +351,18 @@ func up(inst []Instance, dk *docker) (commands []Command, err error) {
 	for _, in := range inst {
 		c := dk.Cmd().WithHost(in.Host).ContainerRun(
 			in.Image, in.Command,
-		).Hostname(fmt.Sprintf("%s-%s", in.Host, in.Name))
+		).Hostname(
+			fmt.Sprintf("%s-%s", in.Host, in.Name),
+		)
+		if i {
+			c = c.Interactive()
+		}
+		if t {
+			c = c.Term()
+		}
+		if pull {
+			c = c.Pull("always")
+		}
 		c = c.Restart(UnlessStopped)
 		for _, v := range in.Volumes {
 			src, dest, err := SplitVolume(v)
@@ -235,6 +400,14 @@ func build(builds []Build, dk *docker) (commands []Command, err error) {
 	return
 }
 
+func restart(inst []Instance, dk *docker) (commands []Command, err error) {
+	for _, in := range inst {
+		cmd := dk.Cmd().WithHost(in.Host).ContainerRestart(in.Name)
+		commands = append(commands, cmd)
+	}
+	return
+}
+
 func stop(inst []Instance, dk *docker) (commands []Command, err error) {
 	for _, in := range inst {
 		cmd := dk.Cmd().WithHost(in.Host).Stop(in.Name)
@@ -261,149 +434,99 @@ func ps(inst []Instance, dk *docker, all bool) (commands []Command, err error) {
 	return
 }
 
-func logs(inst []Instance, dk *docker, follow bool) (commands []Command, err error) {
-	for _, in := range inst {
-		cmd := dk.Cmd().WithHost(in.Host)
-		cmd.args = append(cmd.args, "container", "logs", in.Name)
-		if follow {
-			cmd.args = append(cmd.args, "-f")
+func multiPSFunc(conf *Config, tab *tabwriter.Writer, opts types.ContainerListOptions) runFunc {
+	var mu sync.Mutex
+	row(tab, "HOST", "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES")
+	return func(ctx context.Context, conf *HostConfig, cli *client.Client) error {
+		containers, err := cli.ContainerList(ctx, opts)
+		if err != nil {
+			return err
 		}
+		if len(containers) == 0 {
+			return nil
+		}
+		for _, container := range containers {
+			mu.Lock()
+			row(tab,
+				conf.Host,
+				container.ID[:12],
+				container.Image,
+				trunc(container.Command, 30),
+				time.Since(time.Unix(container.Created, 0)).String(),
+				container.Status,
+				fmt.Sprintf("%v", container.Ports),
+				strings.Join(container.Names, ", "),
+			)
+			mu.Unlock()
+		}
+		return err
+	}
+}
+
+func pull(builds []Build, dk *docker) (commands []Command, err error) {
+	for _, b := range builds {
+		cmd := dk.Cmd().WithHost(b.Host).ImagePull(b.Image)
 		commands = append(commands, cmd)
 	}
 	return
 }
 
-func newLogsCmd(conf *Config) *cobra.Command {
-	var (
-		flags = types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true}
-	)
-	c := &cobra.Command{
-		Use: "logs", Short: "Display logs for the running containers",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			conf.interpolate()
-			dk, err := conf.docker(args...)
-			if err != nil {
-				return err
+var (
+	fg = [...]color.Attribute{
+		color.FgRed,
+		color.FgGreen,
+		color.FgYellow,
+		color.FgBlue,
+		color.FgMagenta,
+		color.FgCyan,
+		color.FgWhite,
+		color.FgHiRed,
+		color.FgHiGreen,
+		color.FgHiYellow,
+		color.FgHiBlue,
+		color.FgHiMagenta,
+		color.FgHiCyan,
+	}
+)
+
+func newcolorset() *colorset {
+	return &colorset{
+		s: make(map[attrpair]struct{}),
+	}
+}
+
+type attrpair struct {
+	a, b color.Attribute
+}
+
+type colorset struct {
+	mu sync.Mutex
+	s  map[attrpair]struct{}
+}
+
+func (c *colorset) New() *color.Color {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	l := len(fg)
+	for i := 0; i < 20; i++ {
+		attr := fg[rand.Intn(l)]
+		pair := attrpair{
+			a: attr,
+		}
+		bold := rand.Intn(2) == 0
+		if bold {
+			pair.b = color.Bold
+		} else {
+			pair.b = color.Reset
+		}
+		_, ok := c.s[pair]
+		if !ok {
+			c.s[pair] = struct{}{}
+			if bold {
+				return color.New(pair.a, pair.b)
 			}
-			instmap := conf.HostInstances(Filters(args)...)
-			var wg sync.WaitGroup
-			err = dk.Run(func(host string, c *client.Client) error {
-				instances := instmap[host]
-				for _, in := range instances {
-					r, err := c.ContainerLogs(cmd.Context(), in.Name, flags)
-					if err != nil {
-						return err
-					}
-					wg.Add(1)
-					go func(r io.ReadCloser) {
-						defer r.Close()
-						defer wg.Done()
-						reader := &ctxReader{ctx: cmd.Context(), Reader: r}
-						_, err = io.Copy(os.Stdout, reader)
-						switch err {
-						case nil, io.EOF, context.Canceled:
-							return
-						default:
-							log.Println(err)
-							// continue
-						}
-					}(r)
-				}
-				return nil
-			})
-			wg.Wait()
-			return err
-		},
-	}
-	c.Flags().BoolVarP(&flags.Follow, "follow", "f", flags.Follow, "follow the container logs")
-	c.Flags().StringVar(&flags.Since, "since", flags.Since, "")
-	return c
-}
-
-type ctxReader struct {
-	io.Reader
-	ctx context.Context
-}
-
-func (r *ctxReader) Read(p []byte) (n int, err error) {
-	err = r.ctx.Err()
-	if err != nil {
-		return 0, err
-	}
-	return r.Reader.Read(p)
-}
-
-func hosts(conf *Config) []string {
-	m := make(map[string]struct{})
-	for _, h := range conf.Hosts {
-		if _, ok := m[h.Host]; !ok {
-			m[h.Host] = struct{}{}
+			return color.New(pair.a)
 		}
 	}
-	hosts := make([]string, 0, len(m))
-	for h := range m {
-		hosts = append(hosts, h)
-	}
-	return hosts
-}
-
-type volumeData struct {
-	io.Reader
-	Volume ConfigVolume
-}
-
-func uploadToVolume(ctx context.Context, dk *multiDocker, volumes []*volumeData) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	return dk.Run(func(host string, c *client.Client) error {
-		for _, vol := range volumes {
-			version, err := c.ServerVersion(ctx)
-			if err != nil {
-				return err
-			}
-			v, err := c.VolumeCreate(ctx, volume.VolumeCreateBody{
-				Name: vol.Volume.Name,
-			})
-			if err != nil {
-				return err
-			}
-
-			volume := fmt.Sprintf("%s:/data", v.Name)
-			container, err := c.ContainerCreate(
-				ctx,
-				&container.Config{
-					Image:   "busybox",
-					Volumes: map[string]struct{}{volume: {}},
-				},
-				&container.HostConfig{
-					Binds: []string{volume},
-					// AutoRemove: true,
-				},
-				&network.NetworkingConfig{},
-				&specs.Platform{
-					Architecture: version.Arch,
-					OS:           version.Os,
-					OSVersion:    version.KernelVersion,
-				},
-				"helper",
-			)
-			if err != nil {
-				return err
-			}
-			defer c.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{
-				RemoveVolumes: false,
-			})
-			err = c.CopyToContainer(
-				ctx,
-				container.ID,
-				"/data",
-				vol.Reader,
-				types.CopyToContainerOptions{},
-			)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return color.New(fg[rand.Intn(l)])
 }

@@ -1,8 +1,14 @@
-# Bin
+# Documents
+LICENSE
+
+# Build
 /bin/
-/diktyo
 /remora
 /deinopis
+node_modules/
+/frontend/node_modules/
+/frontend/dist/
+/cmd/remora/LICENSE
 
 # Testing
 /test
@@ -16,7 +22,6 @@
 /.vscode
 /config/
 /*env*
-/diktyo.yml
 /config.yml
 /remora.yml
 /deployment.yml
