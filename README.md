@@ -62,7 +62,7 @@ access the config file, which I usually do by creating a volume called
 `remora-config` on each machine and uploading the file to it.
 
 Create a `deployment.yml` configuration file and then run the deploy program in
-`./cmd/deploy`. 
+`./cmd/deploy`.
 
 Here is an example of a `deployment.yml` config.
 
@@ -144,9 +144,16 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
 ```
 
+Install mockgen
+
+```
+go install github.com/golang/mock/mockgen@latest
+```
+
 And finally, compile either by hand or with make.
 
 ```
+go generate ./...
 go build ./cmd/remora
 go build -o ./bin/deploy ./cmd/deploy
 ```

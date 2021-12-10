@@ -9,7 +9,6 @@
 *.md
 *.log
 *.dump
-/db/data/
 /papers/
 **/*.pdf
 
@@ -43,3 +42,7 @@ deployment.yml
 /config.yml
 /docker-compose.yml
 /docker-bake*
+
+# Data
+/db/data/
+/data

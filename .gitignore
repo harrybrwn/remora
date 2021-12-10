@@ -9,6 +9,7 @@ node_modules/
 /frontend/node_modules/
 /frontend/dist/
 /cmd/remora/LICENSE
+/internal/mock/
 
 # Testing
 /test
@@ -45,5 +46,6 @@ notes.*
 /db/data
 /_queue
 *.dump
+/data
 
 crawl-output

@@ -1,6 +1,7 @@
 version: "3.8"
 
 services:
+
   db:
     image: postgres:13.3-alpine
     container_name: remora-db
@@ -17,68 +18,74 @@ services:
       POSTGRES_DB: page_crawls
     restart: unless-stopped
     ports:
-      - target: 5432
-        published: 55432
-        protocol: tcp
-        mode: bridge
+      - "55432:5432"
     volumes:
       - ./db/postgres:/docker-entrypoint-initdb.d:ro
-      # - ./db/data:/var/lib/postgresql/data/
-    networks:
-      - backend
-
-  redis:
-    image: redis:6.2.4-alpine
-    container_name: visited-set
-    ports:
-      - 6379:6379
-    restart: unless-stopped
-    networks:
-      - backend
+      - ./data/postgres:/var/lib/postgresql/data/
 
   mq:
     image: rabbitmq:3-management-alpine
     container_name: remora-msgq
-    restart: unless-stopped
     # environment:
     #  RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
     ports:
-      - target: 5672
-        published: 5672
-        protocol: tcp
-        mode: bridge
-      - target: 15672
-        published: 15672
-        protocol: tcp
-        mode: bridge
-    # volumes:
-      # - ~/.docker-conf/rabbitmq/:/var/lib/rabbitmq/
-    networks:
-      - backend
+      - "5672:5672"
+      - "15672:15672"
+    restart: unless-stopped
+
+  visited:
+    image: redis:6.2.4-alpine
+    container_name: remora-visited-set
+    ports:
+      - 6379:6379
+    restart: unless-stopped
 
   crawler:
     image: remora:latest
     build:
       dockerfile: ./Dockerfile
       context: .
+      target: remora
     container_name: remora-crawler
-    command: ["help"]
+    network_mode: host
+    command: ["spider", "en.wikipedia.org"]
+    # Volume is overridden in prod
     volumes:
-      - remora-config:/var/local/remora
-    networks:
-      - backend
+      - ./config/config.yml:/var/local/remora/config.yml:ro
+
+  api:
+    image: remora-api:latest
+    build:
+      dockerfile: ./Dockerfile
+      context: .
+      target: api
+    command: ["-p", "8080"]
+    container_name: remora-api
+    network_mode: host
+    # Volume is overridden in prod
+    volumes:
+      - ./config/config.yml:/var/local/remora/config.yml:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
 
   search:
-   image: solr:8.9.0
-   container_name: remora-search
-   restart: unless-stopped
-   ports:
-     - "8983:8983"
+    image: solr:8.11.0
+    container_name: remora-search
+    restart: unless-stopped
+    ports:
+      - "8983:8983"
 
-networks:
-  backend:
-    driver: bridge
+  # dummy:
+  #   # image: nothing:latest
+  #   # build:
+  #     # dockerfile: docker/Dockerfile.nothing
+  #     # context: .
+  #   image: alpine:latest
+  #   command: ["tail", "-f", "/dev/null"]
+  #   volumes:
+  #     - remora-config:/var/local/remora
+  #     - ./config/config.yml:/var/local/remora/config.yml
 
 volumes:
-  remora-config:
-
+  remora-config: {}
