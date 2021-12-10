@@ -20,6 +20,7 @@ require (
 	github.com/harrybrwn/config v0.1.5-0.20210910011935-4c6674a26dd3
 	github.com/joho/godotenv v1.3.0
 	github.com/lib/pq v1.10.2
+	github.com/matryer/is v1.4.0
 	github.com/moby/term v0.0.0-20210619224110-3f7ff695adc6 // indirect
 	github.com/morikuni/aec v1.0.0 // indirect
 	github.com/onsi/ginkgo v1.16.4 // indirect
