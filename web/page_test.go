@@ -14,12 +14,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/matryer/is"
 )
 
 func Test(t *testing.T) {
 }
 
 func TestParseCacheControl(t *testing.T) {
+	is := is.New(t)
 	for _, tst := range []struct {
 		s string
 		Control
@@ -35,27 +38,13 @@ func TestParseCacheControl(t *testing.T) {
 		},
 	} {
 		ctrl, err := parseCacheControl(tst.s)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ctrl.MaxAge != tst.MaxAge {
-			t.Errorf("wrong max age: want %v, got %v", tst.MaxAge, ctrl.MaxAge)
-		}
-		if ctrl.SharedMaxAge != tst.SharedMaxAge {
-			t.Errorf("wrong shared max age: want %v, got %v", tst.SharedMaxAge, ctrl.MaxAge)
-		}
-		if ctrl.Scope != tst.Scope {
-			t.Errorf("expected scope %v, got %v", tst.Scope, ctrl.Scope)
-		}
-		if ctrl.MustRevalidate != tst.MustRevalidate {
-			t.Errorf("different must-validate")
-		}
-		if ctrl.NoTransform != tst.NoTransform {
-			t.Errorf("different 'no-transform': got %v, want %v", ctrl.NoTransform, tst.NoTransform)
-		}
-		if ctrl.OnlyIfCached != tst.OnlyIfCached {
-			t.Errorf("different 'only-if-cached': got %v, want %v", ctrl.OnlyIfCached, tst.OnlyIfCached)
-		}
+		is.NoErr(err)
+		is.Equal(ctrl.MaxAge, tst.MaxAge)
+		is.Equal(ctrl.SharedMaxAge, tst.SharedMaxAge)
+		is.Equal(ctrl.Scope, tst.Scope)
+		is.Equal(ctrl.MustRevalidate, tst.MustRevalidate)
+		is.Equal(ctrl.NoTransform, tst.NoTransform)
+		is.Equal(ctrl.OnlyIfCached, tst.OnlyIfCached)
 	}
 }
 
@@ -102,7 +91,6 @@ func sitemapHandler(baseurl string) http.HandlerFunc {
 		}
 	}
 	return handler
-
 }
 
 func TestSitemap(t *testing.T) {

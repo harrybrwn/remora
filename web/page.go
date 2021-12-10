@@ -20,7 +20,7 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
-//go:generate protoc -I.. -I../protobuf --go_out=paths=source_relative:./pb --go-grpc_out=paths=source_relative:./pb page.proto
+//go:generate protoc -I.. -I../protobuf --go_out=paths=source_relative:./webpb --go-grpc_out=paths=source_relative:./webpb page.proto
 
 var (
 	HttpClient = &http.Client{

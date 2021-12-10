@@ -1,10 +1,10 @@
 syntax = "proto3";
 
-package pb;
+package web;
 
 import "page_request.proto";
 
-option go_package = "github.com/harrybrwn/remora/web/pb";
+option go_package = "github.com/harrybrwn/remora/web/webpb";
 
 enum Status {
     Ok = 0;
