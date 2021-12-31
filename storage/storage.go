@@ -1,12 +1,13 @@
 package storage
 
 import (
+	"context"
 	"net/url"
 	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/go-redis/redis"
+	redis "github.com/go-redis/redis/v8"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,15 +20,15 @@ type Store interface {
 }
 
 type URLSet interface {
-	Put(*url.URL) error
-	Has(*url.URL) bool
-	HasMulti([]*url.URL) []bool
+	Put(context.Context, *url.URL) error
+	Has(context.Context, *url.URL) bool
+	HasMulti(context.Context, []*url.URL) []bool
 }
 
 type Redis interface {
-	MGet(...string) *redis.SliceCmd
-	Get(string) *redis.StringCmd
-	Set(string, interface{}, time.Duration) *redis.StatusCmd
+	MGet(context.Context, ...string) *redis.SliceCmd
+	Get(context.Context, string) *redis.StringCmd
+	Set(context.Context, string, interface{}, time.Duration) *redis.StatusCmd
 }
 
 func SetLogger(l *logrus.Logger) { log = l }
@@ -40,26 +41,26 @@ type redisURLSet struct {
 	client Redis
 }
 
-func (set *redisURLSet) Has(u *url.URL) bool {
+func (set *redisURLSet) Has(ctx context.Context, u *url.URL) bool {
 	var l = *u
 	stripURL(&l)
-	err := set.client.Get(l.String()).Err()
+	err := set.client.Get(ctx, l.String()).Err()
 	if err != nil && err != redis.Nil {
 		log.WithError(err).Warn("failed to get key from redis")
 	}
 	return err != redis.Nil
 }
 
-func (set *redisURLSet) Put(u *url.URL) error {
+func (set *redisURLSet) Put(ctx context.Context, u *url.URL) error {
 	var l = *u
 	stripURL(&l)
-	return set.client.Set(l.String(), 1, 0).Err()
+	return set.client.Set(ctx, l.String(), 1, 0).Err()
 }
 
-func (set *redisURLSet) HasMulti(urls []*url.URL) []bool {
+func (set *redisURLSet) HasMulti(ctx context.Context, urls []*url.URL) []bool {
 	ok := make([]bool, len(urls))
 	keys := urlKeys(urls)
-	result, err := set.client.MGet(keys...).Result()
+	result, err := set.client.MGet(ctx, keys...).Result()
 	if err != nil {
 		return ok
 	}
@@ -84,7 +85,7 @@ type visitedSet struct {
 	db *badger.DB
 }
 
-func (vs *visitedSet) Has(u *url.URL) bool {
+func (vs *visitedSet) Has(_ context.Context, u *url.URL) bool {
 	var l = *u
 	ok := false
 	stripURL(&l)
@@ -110,7 +111,7 @@ func (vs *visitedSet) Has(u *url.URL) bool {
 	return ok
 }
 
-func (vs *visitedSet) HasMulti(urls []*url.URL) []bool {
+func (vs *visitedSet) HasMulti(_ context.Context, urls []*url.URL) []bool {
 	ok := make([]bool, len(urls))
 	keys := make([][]byte, len(urls))
 	var u url.URL
@@ -135,7 +136,7 @@ func (vs *visitedSet) HasMulti(urls []*url.URL) []bool {
 	return ok
 }
 
-func (vs *visitedSet) Put(u *url.URL) error {
+func (vs *visitedSet) Put(_ context.Context, u *url.URL) error {
 	var l = *u
 	stripURL(&l)
 
@@ -162,7 +163,7 @@ func stripURL(u *url.URL) {
 	u.RawFragment = ""
 }
 
-func (s *inMemoryURLSet) Has(u *url.URL) bool {
+func (s *inMemoryURLSet) Has(_ context.Context, u *url.URL) bool {
 	var l = *u
 	stripURL(&l)
 	s.mu.Lock()
@@ -171,7 +172,7 @@ func (s *inMemoryURLSet) Has(u *url.URL) bool {
 	return ok
 }
 
-func (s *inMemoryURLSet) Put(u *url.URL) error {
+func (s *inMemoryURLSet) Put(_ context.Context, u *url.URL) error {
 	var l = *u
 	stripURL(&l)
 	s.mu.Lock()
@@ -180,7 +181,7 @@ func (s *inMemoryURLSet) Put(u *url.URL) error {
 	return nil
 }
 
-func (s *inMemoryURLSet) HasMulti(urls []*url.URL) []bool {
+func (s *inMemoryURLSet) HasMulti(_ context.Context, urls []*url.URL) []bool {
 	var l url.URL
 	ok := make([]bool, len(urls))
 	s.mu.Lock()
@@ -249,7 +250,7 @@ type redisstore struct {
 }
 
 func (rs *redisstore) Get(k []byte) ([]byte, error) {
-	res, err := rs.client.Get(string(k)).Result()
+	res, err := rs.client.Get(context.TODO(), string(k)).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -257,10 +258,10 @@ func (rs *redisstore) Get(k []byte) ([]byte, error) {
 }
 
 func (rs *redisstore) Set(k, v []byte) error {
-	return rs.client.Set(string(k), v, 0).Err()
+	return rs.client.Set(context.TODO(), string(k), v, 0).Err()
 }
 
 func (rs *redisstore) Has(k []byte) bool {
-	err := rs.client.Get(string(k)).Err()
+	err := rs.client.Get(context.TODO(), string(k)).Err()
 	return err != redis.Nil
 }

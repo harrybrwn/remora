@@ -1,12 +1,13 @@
 package storage
 
 import (
+	"context"
 	"net/url"
 	"sync"
 	"testing"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
 )
 
 func testSets(t *testing.T) ([]URLSet, func()) {
@@ -24,7 +25,8 @@ func testSets(t *testing.T) ([]URLSet, func()) {
 	client := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
-	if err = client.Ping().Err(); err == nil {
+	ctx := context.Background()
+	if err = client.Ping(ctx).Err(); err == nil {
 		log.Println("adding redis to tests")
 		sets = append(sets, NewRedisURLSet(client))
 	}
@@ -32,7 +34,10 @@ func testSets(t *testing.T) ([]URLSet, func()) {
 }
 
 func TestURLSet(t *testing.T) {
-	var err error
+	var (
+		err error
+		ctx = context.Background()
+	)
 	sets, cleanup := testSets(t)
 	defer cleanup()
 	for _, s := range sets {
@@ -41,36 +46,36 @@ func TestURLSet(t *testing.T) {
 			Host:   "www.google.com",
 			Path:   "/",
 		}
-		err = s.Put(u)
+		err = s.Put(ctx, u)
 		if err != nil {
 			t.Error(err)
 			continue
 		}
-		ok := s.Has(u)
+		ok := s.Has(ctx, u)
 		if !ok {
 			t.Error("expected url to be in set")
 		}
 		u.Fragment = "#other-part-of-same-page"
-		ok = s.Has(u)
+		ok = s.Has(ctx, u)
 		if !ok {
 			t.Error("should return true even if url has a fragment")
 		}
-		err = s.Put(&url.URL{Scheme: "https", Host: "www.google.com", Path: "/search"})
+		err = s.Put(ctx, &url.URL{Scheme: "https", Host: "www.google.com", Path: "/search"})
 		if err != nil {
 			t.Error(err)
 			continue
 		}
-		err = s.Put(&url.URL{Scheme: "https", Host: "www.google.com", Path: "/maps"})
+		err = s.Put(ctx, &url.URL{Scheme: "https", Host: "www.google.com", Path: "/maps"})
 		if err != nil {
 			t.Error(err)
 			continue
 		}
-		err = s.Put(&url.URL{Scheme: "https", Host: "www.google.com", Path: "/other_stuff"})
+		err = s.Put(ctx, &url.URL{Scheme: "https", Host: "www.google.com", Path: "/other_stuff"})
 		if err != nil {
 			t.Error(err)
 			continue
 		}
-		oks := s.HasMulti([]*url.URL{
+		oks := s.HasMulti(ctx, []*url.URL{
 			{Scheme: "https", Host: "www.google.com", Path: "/search"},
 			{Scheme: "https", Host: "www.google.com", Path: "/maps"},
 			{Scheme: "https", Host: "www.google.com", Path: "/maps", Fragment: "#fragment"},
@@ -89,18 +94,22 @@ func TestURLSet(t *testing.T) {
 }
 
 func TestURLSet_Err(t *testing.T) {
+	ctx := context.Background()
 	sets, cleanup := testSets(t)
 	defer cleanup()
 	for _, s := range sets {
-		s.Put(&url.URL{})
-		s.Has(&url.URL{})
-		s.HasMulti(nil)
+		s.Put(ctx, &url.URL{})
+		s.Has(ctx, &url.URL{})
+		s.HasMulti(ctx, nil)
 	}
 }
 
 // Should be run with -race
 func TestURLSetRace(t *testing.T) {
-	var wg sync.WaitGroup
+	var (
+		wg  sync.WaitGroup
+		ctx = context.Background()
+	)
 	sets, cleanup := testSets(t)
 	defer cleanup()
 	for _, s := range sets {
@@ -112,7 +121,7 @@ func TestURLSetRace(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					err := s.Put(&url.URL{
+					err := s.Put(ctx, &url.URL{
 						Scheme: "https",
 						Host:   "www.google.com",
 						Path:   "/",
@@ -120,7 +129,7 @@ func TestURLSetRace(t *testing.T) {
 					if err != nil {
 						t.Error(err)
 					}
-					ok := s.Has(&url.URL{
+					ok := s.Has(ctx, &url.URL{
 						Scheme: "https",
 						Host:   "www.google.com",
 						Path:   "/",
