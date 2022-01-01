@@ -1,19 +1,24 @@
 package db
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/harrybrwn/remora/internal/region"
 )
 
 type Config struct {
@@ -23,6 +28,22 @@ type Config struct {
 	Password string `yaml:"password" config:"password" env:"POSTGRES_PASSWORD"`
 	Name     string `yaml:"name" config:"name" env:"POSTGRES_DB"`
 	SSL      string `yaml:"ssl" config:"ssl" default:"disable"`
+
+	Logger logrus.FieldLogger `yaml:"-" json:"-"`
+}
+
+func (c *Config) dsn() string {
+	c.init()
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		c.Host, c.Port, c.User, c.Password, c.Name, c.SSL,
+	)
+}
+
+func (c *Config) init() {
+	if c.SSL == "" {
+		c.SSL = "disable"
+	}
 }
 
 func New(cfg *Config) (*sql.DB, error) {
@@ -44,6 +65,11 @@ func New(cfg *Config) (*sql.DB, error) {
 func WaitForNew(ctx context.Context, cfg *Config, ping time.Duration) (*sql.DB, error) {
 	os.Unsetenv("PGSERVICEFILE") // lib/pq panics when this is set
 	os.Unsetenv("PGSERVICE")
+	if cfg.Logger == nil {
+		logger := logrus.New()
+		logger.SetOutput(io.Discard)
+		cfg.Logger = logger
+	}
 	db, err := sql.Open("postgres", cfg.dsn())
 	if err != nil {
 		return nil, err
@@ -59,6 +85,7 @@ func WaitForNew(ctx context.Context, cfg *Config, ping time.Duration) (*sql.DB, 
 		case <-ctx.Done():
 			return nil, driver.ErrBadConn
 		case <-ticker.C:
+			cfg.Logger.WithField("time", time.Now()).Info("pinging database")
 			err = db.Ping()
 			if err == nil {
 				return db, nil
@@ -67,65 +94,170 @@ func WaitForNew(ctx context.Context, cfg *Config, ping time.Duration) (*sql.DB, 
 	}
 }
 
-func ServiceFileExists() {
+func NewWithTimeout(ctx context.Context, timeout time.Duration, cfg *Config) (*sql.DB, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return WaitForNew(ctx, cfg, time.Second)
 }
 
-func findServiceFiles() (string, error) {
-	var filename string
-	for _, key := range []string{
-		"PGSERVICEFILE",
-		"PGSERVICE",
-	} {
-		filename = os.Getenv(key)
-		if filename != "" {
-			break
-		}
-	}
-	if exists(filename) {
-		return filename, nil
-	}
-
-	var e1 error
-	home, err := os.UserHomeDir()
-	if err != nil {
-		e1 = err
-	}
-	filename = filepath.Join(home, ".pg_service.conf")
-	if exists(filename) {
-		return filename, nil
-	}
-	return "", e1
+type DB interface {
+	io.Closer
+	Queryable
+	BeginTx(context.Context, ...TxOption) (Tx, error)
 }
 
-func execPGConfig(args ...string) (string, error) {
-	var (
-		buf bytes.Buffer
-		cmd = exec.Command("pg_config", args...)
+type Queryable interface {
+	QueryContext(context.Context, string, ...interface{}) (Rows, error)
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+type Statement interface {
+	io.Closer
+	QueryContext(context.Context, ...interface{}) (Rows, error)
+	ExecContext(context.Context, ...interface{}) (sql.Result, error)
+}
+
+type TxOption func(txo *sql.TxOptions)
+
+type Tx interface {
+	Queryable
+	Commit() error
+	Rollback() error
+}
+
+type Scanner interface {
+	Scan(...interface{}) error
+}
+
+type Rows interface {
+	Scanner
+	io.Closer
+	Next() bool
+	Err() error
+}
+
+type dbOptions struct {
+	name string
+}
+
+type DBOption func(o *dbOptions)
+
+func WithName(name string) DBOption { return func(o *dbOptions) { o.name = name } }
+
+func Wrap(database *sql.DB, opts ...DBOption) DB {
+	var o dbOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.name == "" {
+		o.name = "database/sql"
+	}
+	tracer := otel.Tracer(o.name)
+	return &db{
+		DB:     database,
+		tracer: tracer,
+		region: region.New(tracer, dbSystem),
+	}
+}
+
+var (
+	dbSystem = semconv.DBSystemPostgreSQL
+	dbQuery  = semconv.DBStatementKey
+)
+
+type db struct {
+	*sql.DB
+	tracer trace.Tracer
+	region *region.Span
+}
+
+var _ DB = (*db)(nil)
+
+func (db *db) QueryContext(ctx context.Context, query string, v ...interface{}) (rs Rows, err error) {
+	db.region.
+		Attr(dbQuery.String(query)).
+		Wrap(
+			ctx, "query",
+			func(ctx context.Context) ([]attribute.KeyValue, error) {
+				rs, err = db.DB.QueryContext(ctx, query, v...)
+				return nil, err
+			},
+		)
+	return rs, err
+}
+
+func (db *db) ExecContext(ctx context.Context, query string, v ...interface{}) (res sql.Result, err error) {
+	db.region.
+		Attr(dbQuery.String(query)).
+		Wrap(ctx, "exec", func(ctx context.Context) ([]attribute.KeyValue, error) {
+			res, err = db.DB.ExecContext(ctx, query, v...)
+			return nil, err
+		})
+	return res, err
+}
+
+func TxReadOnly(ro bool) TxOption {
+	return func(txo *sql.TxOptions) { txo.ReadOnly = ro }
+}
+
+func TxIsolation(iso sql.IsolationLevel) TxOption {
+	return func(txo *sql.TxOptions) { txo.Isolation = iso }
+}
+
+func (db *db) BeginTx(ctx context.Context, opts ...TxOption) (Tx, error) {
+	var options sql.TxOptions
+	for _, o := range opts {
+		o(&options)
+	}
+	ctx, span := db.tracer.Start(
+		ctx, "begin transaction",
+		trace.WithLinks(trace.LinkFromContext(ctx)),
 	)
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	err := cmd.Run()
+	t, err := db.DB.BeginTx(ctx, &options)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return strings.TrimRight(buf.String(), "\n"), nil
+	return &tx{
+		tx:     t,
+		span:   span,
+		region: db.region.WithParent(span),
+	}, nil
 }
 
-func (c *Config) dsn() string {
-	c.init()
-	return fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.Host, c.Port, c.User, c.Password, c.Name, c.SSL,
-	)
+type tx struct {
+	tx     *sql.Tx
+	span   trace.Span
+	region *region.Span
 }
 
-func (c *Config) init() {
-	if c.SSL == "" {
-		c.SSL = "disable"
+func (tx *tx) Commit() error   { return tx.end(tx.tx.Commit()) }
+func (tx *tx) Rollback() error { return tx.end(tx.tx.Rollback()) }
+
+func (tx *tx) end(e error) error {
+	if e != nil {
+		tx.span.RecordError(e)
+		tx.span.SetStatus(codes.Error, e.Error())
 	}
+	tx.span.End()
+	return e
 }
 
-func exists(filename string) bool {
-	_, err := os.Stat(filename)
-	return !os.IsNotExist(err)
+func (tx *tx) QueryContext(ctx context.Context, query string, v ...interface{}) (rs Rows, err error) {
+	tx.region.
+		Attr(dbQuery.String(query)).
+		Wrap(ctx, "query", func(ctx context.Context) ([]attribute.KeyValue, error) {
+			rs, err = tx.tx.QueryContext(ctx, query, v...)
+			return nil, err
+		})
+	return
+}
+
+func (tx *tx) ExecContext(ctx context.Context, query string, v ...interface{}) (res sql.Result, err error) {
+	tx.region.
+		Attr(dbQuery.String(query)).
+		Wrap(ctx, "query", func(ctx context.Context) ([]attribute.KeyValue, error) {
+			res, err = tx.tx.ExecContext(ctx, query, v...)
+			return nil, err
+		})
+	return
 }
