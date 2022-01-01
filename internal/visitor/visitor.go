@@ -20,12 +20,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
+	"github.com/harrybrwn/remora/db"
 	"github.com/harrybrwn/remora/internal"
+	"github.com/harrybrwn/remora/internal/region"
 	"github.com/harrybrwn/remora/storage"
 	"github.com/harrybrwn/remora/web"
-	"github.com/lib/pq" // database driver
+	"github.com/lib/pq" // database driver implementation
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const Timed = true
@@ -47,16 +51,13 @@ func init() {
 
 func SetLogger(l *logrus.Logger) { log = l }
 
-func New(db *sql.DB, redis storage.Redis) (*Visitor, error) {
-	page, err := db.Prepare(insertPageSQL)
-	if err != nil {
-		return nil, err
-	}
+func New(sqlDB *sql.DB, redis storage.Redis) (*Visitor, error) {
 	return &Visitor{
-		db:             db,
-		hashes:         hashSet{redis},
-		Hosts:          make(map[string]struct{}),
-		insertPageStmt: page,
+		db: db.Wrap(sqlDB, db.WithName("visitor-db")),
+		hashes: hashSet{
+			r:      redis,
+			region: region.New(otel.Tracer("remora/visitor.redisHashset"))},
+		Hosts: make(map[string]struct{}),
 	}, nil
 }
 
@@ -80,11 +81,11 @@ func AddHosts(v web.Visitor, hosts []string) {
 }
 
 type Visitor struct {
-	db             *sql.DB
-	Hosts          map[string]struct{}
-	hashes         hashSet
-	Visited        int64
-	insertPageStmt *sql.Stmt
+	// db      *sql.DB
+	db      db.DB
+	Hosts   map[string]struct{}
+	hashes  hashSet
+	Visited int64
 }
 
 type stats struct {
@@ -94,10 +95,6 @@ type stats struct {
 }
 
 func (v *Visitor) Close() error {
-	err := v.insertPageStmt.Close()
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -120,14 +117,14 @@ func (v *Visitor) Visit(ctx context.Context, page *web.Page) {
 		return
 	default:
 	}
-	if v.hashes.has(page.Hash) {
+	if v.hashes.has(ctx, page.Hash) {
 		log.WithFields(logrus.Fields{
 			"url":  page.URL.String(),
 			"hash": hex.EncodeToString(page.Hash[:]),
 		}).Warn("already seen page content hash")
 		return
 	}
-	v.hashes.put(page.Hash)
+	v.hashes.put(ctx, page.Hash)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -217,10 +214,14 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 		pageurl = page.URL.String()
 		start   = time.Now()
 	)
-	tx, err := v.db.BeginTx(ctx, &sql.TxOptions{
-		ReadOnly:  false,
-		Isolation: sql.LevelRepeatableRead,
-	})
+	tx, err := v.db.BeginTx(ctx,
+		db.TxReadOnly(false),
+		db.TxIsolation(sql.LevelRepeatableRead),
+	)
+	// tx, err := v.db.BeginTx(ctx, &sql.TxOptions{
+	// 	ReadOnly:  false,
+	// 	Isolation: sql.LevelRepeatableRead,
+	// })
 	if err != nil {
 		log.WithError(err).Error("could not create transaction")
 		return
@@ -344,7 +345,7 @@ func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page
 	return nil
 }
 
-func insertEdges(ctx context.Context, tx *sql.Tx, h hash.Hash, id []byte, page *web.Page, stats *stats) error {
+func insertEdges(ctx context.Context, tx db.Tx, h hash.Hash, id []byte, page *web.Page, stats *stats) error {
 	select {
 	case <-ctx.Done():
 		return nil
@@ -449,16 +450,35 @@ func memoryLogs(mem *runtime.MemStats) logrus.Fields {
 }
 
 type hashSet struct {
-	r storage.Redis
+	r      storage.Redis
+	region *region.Span
 }
 
-func (h *hashSet) has(b [16]byte) bool {
-	err := h.r.Get(hex.EncodeToString(b[:])).Err()
-	return err != redis.Nil
+func (h *hashSet) has(ctx context.Context, b [16]byte) bool {
+	var (
+		has bool
+		err error
+	)
+	h.region.Wrap(ctx, "HashSet.has", func(ctx context.Context) ([]attribute.KeyValue, error) {
+		err = h.r.Get(ctx, hex.EncodeToString(b[:])).Err()
+		has = err != redis.Nil
+		if err == redis.Nil {
+			err = nil
+		}
+		return []attribute.KeyValue{
+			{Key: "has.return", Value: attribute.BoolValue(has)},
+		}, err
+	})
+	return has
 }
 
-func (h *hashSet) put(b [16]byte) error {
-	return h.r.Set(hex.EncodeToString(b[:]), 2, 0).Err()
+func (h *hashSet) put(ctx context.Context, b [16]byte) error {
+	var err error
+	h.region.Wrap(ctx, "HashSet.put", func(ctx context.Context) ([]attribute.KeyValue, error) {
+		err = h.r.Set(ctx, hex.EncodeToString(b[:]), 2, 0).Err()
+		return nil, err
+	})
+	return err
 }
 
 var stopwords = map[string]struct{}{

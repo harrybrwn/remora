@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
 	"github.com/harrybrwn/remora/web"
 	"github.com/sirupsen/logrus"
 )
@@ -28,11 +28,11 @@ func init() {
 type redisMock struct {
 }
 
-func (rm *redisMock) MGet(...string) *redis.SliceCmd { return &redis.SliceCmd{} }
-func (rm *redisMock) Get(string) *redis.StringCmd {
+func (rm *redisMock) MGet(context.Context, ...string) *redis.SliceCmd { return &redis.SliceCmd{} }
+func (rm *redisMock) Get(context.Context, string) *redis.StringCmd {
 	return redis.NewStringResult("testvalue", redis.Nil) // always returns not found
 }
-func (rm *redisMock) Set(string, interface{}, time.Duration) *redis.StatusCmd {
+func (rm *redisMock) Set(context.Context, string, interface{}, time.Duration) *redis.StatusCmd {
 	return &redis.StatusCmd{}
 }
 
