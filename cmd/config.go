@@ -1,16 +1,16 @@
 package cmd
 
 import (
-	"fmt"
 	"net"
 	"strconv"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
 	"github.com/harrybrwn/remora/db"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
+	"github.com/streadway/amqp"
 )
 
 type Config struct {
@@ -34,14 +34,16 @@ type Config struct {
 		AllowedHosts []string `yaml:"allowed_hosts" config:"allowed_hosts"`
 	} `yaml:"profiles"`
 	MessageQueue MessageQueueConfig `yaml:"message_queue" config:"message_queue"`
-
+	// Redis config
 	VisitedSet struct {
 		Host     string `yaml:"host"`
 		Port     int    `yaml:"port"`
 		DB       int    `yaml:"db"`
 		Password string `yaml:"password"`
 	} `yaml:"visited_set" config:"visited_set,notflag"`
-	UserAgent string `yaml:"user_agent" config:"user_agent" default:"Remora"`
+	// Opentelemetry tracing config
+	Tracer    TracerConfig `yaml:"tracer" config:"tracer,notflag"`
+	UserAgent string       `yaml:"user_agent" config:"user_agent" default:"Remora"`
 }
 
 func (c *Config) Bind(flag *flag.FlagSet) {
@@ -81,15 +83,19 @@ type MessageQueueConfig struct {
 }
 
 func (mqc *MessageQueueConfig) URI() string {
-	if mqc.User == "" || mqc.Password == "" {
-		return fmt.Sprintf("amqp://%s:%d", mqc.Host, mqc.Port)
-	}
-	return fmt.Sprintf("amqp://%s:%s@%s:%d",
-		mqc.User,
-		mqc.Password,
-		mqc.Host,
-		mqc.Port,
-	)
+	return amqp.URI{
+		Scheme:   "amqp",
+		Host:     mqc.Host,
+		Port:     mqc.Port,
+		Username: mqc.User,
+		Password: mqc.Password,
+	}.String()
+}
+
+type TracerConfig struct {
+	Type     string `yaml:"type" config:"type"` // jaeger, zipkin, datadog
+	Endpoint string `yaml:"endpoint" config:"endpoint"`
+	Service  string `yaml:"service" config:"service"`
 }
 
 func (c *Config) GetLevel() logrus.Level {
@@ -107,6 +113,22 @@ var (
 	commit     string
 	sourcehash string
 )
+
+func GetVersionInfo() *VersionInfo {
+	return &VersionInfo{
+		Version:    version,
+		Date:       date,
+		Commit:     commit,
+		SourceHash: sourcehash,
+	}
+}
+
+type VersionInfo struct {
+	Version    string
+	Date       string
+	Commit     string
+	SourceHash string
+}
 
 func NewVersionCmd() *cobra.Command {
 	return &cobra.Command{
