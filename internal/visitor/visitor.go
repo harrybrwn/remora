@@ -81,31 +81,15 @@ func AddHosts(v web.Visitor, hosts []string) {
 }
 
 type Visitor struct {
-	// db      *sql.DB
 	db      db.DB
 	Hosts   map[string]struct{}
 	hashes  hashSet
 	Visited int64
 }
 
-type stats struct {
-	page    time.Duration
-	edge    time.Duration
-	edgeDel time.Duration
-}
-
-func (v *Visitor) Close() error {
-	return nil
-}
+func (v *Visitor) Close() error { return nil }
 
 func (v *Visitor) Filter(p *web.PageRequest, u *url.URL) error {
-	// v.mu.Lock()
-	// _, ok := v.Hosts[u.Host]
-	// v.mu.Unlock()
-	// if ok {
-	// 	return nil
-	// }
-	// return web.ErrSkipURL
 	return nil
 }
 
@@ -210,10 +194,7 @@ func init() {
 }
 
 func (v *Visitor) record(ctx context.Context, page *web.Page) {
-	var (
-		pageurl = page.URL.String()
-		start   = time.Now()
-	)
+	var pageurl = page.URL.String()
 	tx, err := v.db.BeginTx(ctx,
 		db.TxReadOnly(false),
 		db.TxIsolation(sql.LevelRepeatableRead),
@@ -249,41 +230,25 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 	io.WriteString(h, pageurl)
 	id := h.Sum(nil)
 
-	var (
-		wg    sync.WaitGroup
-		stats stats
-	)
+	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		a := time.Now()
 		defer wg.Done()
 		err = insertPage(ctx, tx, id, page)
 		if err != nil {
 			log.WithError(err).Error("could not insert page")
 			return
 		}
-		stats.page = time.Since(a)
 	}()
 	go func() {
 		defer wg.Done()
-		err = insertEdges(ctx, tx, h, id, page, &stats)
+		err = insertEdges(ctx, tx, h, id, page)
 		if err != nil {
 			log.WithError(err).Error("could not insert edges")
 			return
 		}
 	}()
 	wg.Wait()
-	if Timed {
-		log.WithFields(logrus.Fields{
-			"page":     stats.page,
-			"edges":    stats.edge,
-			"edge_del": stats.edgeDel,
-			"links":    len(page.Links),
-			"response": page.ResponseTime,
-			"0-total":  time.Since(start),
-			"n":        v.Visited,
-		}).Debug("done with visit")
-	}
 }
 
 type execerCtx interface {
@@ -345,7 +310,7 @@ func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page
 	return nil
 }
 
-func insertEdges(ctx context.Context, tx db.Tx, h hash.Hash, id []byte, page *web.Page, stats *stats) error {
+func insertEdges(ctx context.Context, tx db.Tx, h hash.Hash, id []byte, page *web.Page) error {
 	select {
 	case <-ctx.Done():
 		return nil
@@ -353,9 +318,7 @@ func insertEdges(ctx context.Context, tx db.Tx, h hash.Hash, id []byte, page *we
 	}
 	pageurl := page.URL.String()
 
-	now := time.Now()
 	_, err := tx.ExecContext(ctx, "DELETE FROM edge WHERE parent_id = $1", id)
-	stats.edgeDel = time.Since(now)
 	switch err {
 	case nil, sql.ErrTxDone, sqldriver.ErrBadConn:
 		break
@@ -371,12 +334,10 @@ func insertEdges(ctx context.Context, tx db.Tx, h hash.Hash, id []byte, page *we
 
 	links := filterOutURL(pageurl, page.Links)
 	if len(links) > 0 {
-		now = time.Now()
 		edgeBuf, edgeValues := insertEdgesQuery(id, pageurl, links)
 		query := edgeBuf.String()
 		// Exec is the bottleneck here!
 		_, err = tx.ExecContext(ctx, query, edgeValues...)
-		stats.edge = time.Since(now)
 		switch err {
 		case nil, context.Canceled, sqldriver.ErrBadConn:
 			break
@@ -479,134 +440,4 @@ func (h *hashSet) put(ctx context.Context, b [16]byte) error {
 		return nil, err
 	})
 	return err
-}
-
-var stopwords = map[string]struct{}{
-	"i":          {},
-	"me":         {},
-	"my":         {},
-	"myself":     {},
-	"we":         {},
-	"our":        {},
-	"ours":       {},
-	"ourselves":  {},
-	"you":        {},
-	"your":       {},
-	"yours":      {},
-	"yourself":   {},
-	"yourselves": {},
-	"he":         {},
-	"him":        {},
-	"his":        {},
-	"himself":    {},
-	"she":        {},
-	"her":        {},
-	"hers":       {},
-	"herself":    {},
-	"it":         {},
-	"its":        {},
-	"itself":     {},
-	"they":       {},
-	"them":       {},
-	"their":      {},
-	"theirs":     {},
-	"themselves": {},
-	"what":       {},
-	"which":      {},
-	"who":        {},
-	"whom":       {},
-	"this":       {},
-	"that":       {},
-	"these":      {},
-	"those":      {},
-	"am":         {},
-	"is":         {},
-	"are":        {},
-	"was":        {},
-	"were":       {},
-	"be":         {},
-	"been":       {},
-	"being":      {},
-	"have":       {},
-	"has":        {},
-	"had":        {},
-	"having":     {},
-	"do":         {},
-	"does":       {},
-	"did":        {},
-	"doing":      {},
-	"a":          {},
-	"an":         {},
-	"the":        {},
-	"and":        {},
-	"but":        {},
-	"if":         {},
-	"or":         {},
-	"because":    {},
-	"as":         {},
-	"until":      {},
-	"while":      {},
-	"of":         {},
-	"at":         {},
-	"by":         {},
-	"for":        {},
-	"with":       {},
-	"about":      {},
-	"against":    {},
-	"between":    {},
-	"into":       {},
-	"through":    {},
-	"during":     {},
-	"before":     {},
-	"after":      {},
-	"above":      {},
-	"below":      {},
-	"to":         {},
-	"from":       {},
-	"up":         {},
-	"down":       {},
-	"in":         {},
-	"out":        {},
-	"on":         {},
-	"off":        {},
-	"over":       {},
-	"under":      {},
-	"again":      {},
-	"further":    {},
-	"then":       {},
-	"once":       {},
-	"here":       {},
-	"there":      {},
-	"when":       {},
-	"where":      {},
-	"why":        {},
-	"how":        {},
-	"all":        {},
-	"any":        {},
-	"both":       {},
-	"each":       {},
-	"few":        {},
-	"more":       {},
-	"most":       {},
-	"other":      {},
-	"some":       {},
-	"such":       {},
-	"no":         {},
-	"nor":        {},
-	"not":        {},
-	"only":       {},
-	"own":        {},
-	"same":       {},
-	"so":         {},
-	"than":       {},
-	"too":        {},
-	"very":       {},
-	"s":          {},
-	"t":          {},
-	"can":        {},
-	"will":       {},
-	"just":       {},
-	"don":        {},
-	"should":     {},
-	"now":        {},
 }
