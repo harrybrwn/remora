@@ -15,7 +15,6 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/temoto/robotstxt"
 	"golang.org/x/net/html"
 )
 
@@ -28,12 +27,30 @@ type Fetcher interface {
 	Fetch(context.Context, *PageRequest) (*Page, error)
 }
 
-func NewFetcher(userAgent string) *pageFetcher {
-	return &pageFetcher{agent: userAgent}
+func NewFetcher(userAgent string, opts ...FetcherOption) *pageFetcher {
+	fetcher := &pageFetcher{
+		agent:  userAgent,
+		client: http.Client{Timeout: time.Minute},
+	}
+	for _, o := range opts {
+		o(fetcher)
+	}
+	return fetcher
+}
+
+type FetcherOption func(*pageFetcher)
+
+func WithTransport(rt http.RoundTripper) FetcherOption {
+	return func(pf *pageFetcher) { pf.client.Transport = rt }
+}
+
+func WithTimeout(d time.Duration) FetcherOption {
+	return func(pf *pageFetcher) { pf.client.Timeout = d }
 }
 
 type pageFetcher struct {
-	agent string
+	agent  string
+	client http.Client
 }
 
 func (pf *pageFetcher) Fetch(ctx context.Context, req *PageRequest) (*Page, error) {
@@ -117,45 +134,11 @@ func (pf *pageFetcher) Fetch(ctx context.Context, req *PageRequest) (*Page, erro
 	return p, err
 }
 
-func GetRobotsTxT(host string) (*robotstxt.RobotsData, error) {
-	req := &http.Request{
-		Method:     "GET",
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Host:       host,
-		URL: &url.URL{
-			Scheme: "https",
-			Host:   host,
-			Path:   "/robots.txt",
-		},
-		Header:  http.Header{},
-		Body:    http.NoBody,
-		GetBody: defaultGetBody,
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return robotstxt.FromStatusAndBytes(resp.StatusCode, b)
-}
-
-func AllowAll() *robotstxt.RobotsData {
-	r, _ := robotstxt.FromBytes(nil)
-	return r
-}
-
 // RequestQueue is a queue for pages
 type RequestQueue interface {
 	Enqueue(*PageRequest) error
 	Dequeue() (*PageRequest, error)
 	Close() error
-	Size() int64
 }
 
 var RetryLimit int32 = 5

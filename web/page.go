@@ -69,17 +69,17 @@ func (req *PageRequest) HexKey() string {
 
 // Page holds metadata for a webpage
 type Page struct {
-	URL   *url.URL
-	Links []*url.URL
+	URL   *url.URL   `json:"url"`
+	Links []*url.URL `json:"links"`
 
-	Depth        uint32
-	ResponseTime time.Duration
+	Depth        uint32        `json:"depth"`
+	ResponseTime time.Duration `json:"response_time"`
 
-	Redirected     bool
-	RedirectedFrom *url.URL
-	Status         int
-	ContentType    string
-	RetryAfter     time.Duration
+	Redirected     bool          `json:"redirected"`
+	RedirectedFrom *url.URL      `json:"redirected_from"`
+	Status         int           `json:"status"`
+	ContentType    string        `json:"content_type"`
+	RetryAfter     time.Duration `json:"retry_after"`
 
 	Doc      *goquery.Document
 	Encoding string
