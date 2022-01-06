@@ -6,60 +6,27 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/harrybrwn/remora/event"
+	"github.com/harrybrwn/remora/frontier"
 	"github.com/harrybrwn/remora/internal/visitor"
 	"github.com/harrybrwn/remora/storage"
 	"github.com/harrybrwn/remora/web"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 	"google.golang.org/protobuf/proto"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 )
 
 func Test(t *testing.T) {
-}
-
-func TestRedirects(t *testing.T) {
-	log.SetFormatter(&logrus.JSONFormatter{})
-	log.SetOutput(os.Stdout)
-	log.SetLevel(logrus.DebugLevel)
-	var wg sync.WaitGroup
-	links := []string{
-		"https://en.wikipedia.org/",
-		"https://loc.gov/help/",
-		"https://creativecommons.org/legalcode",
-		"http://foundation.wikimedia.org/wiki/Terms_of_Use",
-		"http://quotes.toscrape.com/",
-	}
-	wg.Add(len(links))
-	for _, l := range links {
-		go func(l string) {
-			defer wg.Done()
-			u, err := url.Parse(l)
-			if err != nil {
-				panic(err)
-			}
-			p := web.NewPage(u, 0)
-
-			err = p.Fetch()
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if p == nil {
-				t.Error("nil page")
-				return
-			}
-			fmt.Println(u)
-			fmt.Println(p.URL)
-			fmt.Println("redirected", p.URL.Path != u.Path)
-			println()
-		}(l)
-	}
-	wg.Wait()
 }
 
 type vis struct{}
@@ -69,9 +36,8 @@ func (*vis) Visit(_ context.Context, p *web.Page)    { log.Infof("visit %s", p.U
 func (*vis) LinkFound(*url.URL) error                { return nil }
 
 func TestSpider(t *testing.T) {
+	t.Skip()
 	log.SetLevel(logrus.TraceLevel)
-	// log.SetLevel(logrus.InfoLevel)
-	// log.SetLevel(logrus.PanicLevel)
 	web.SetLogger(log)
 	visitor.SetLogger(log)
 	ctx := context.Background()
@@ -100,8 +66,13 @@ func TestSpider(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		<-time.After(time.Second * 2)
-		pub, _ := bus.Publisher()
+		<-time.After(time.Second * 1)
+		pub, err := bus.Publisher()
+		if err != nil {
+			log.WithError(err).Error("could not create publisher")
+			return
+		}
+		// defer pub.Close()
 		log.Info("publishing seed url")
 		err = pub.Publish("en.wikipedia.org", amqp.Publishing{Body: raw})
 		if err != nil {
@@ -113,18 +84,126 @@ func TestSpider(t *testing.T) {
 	ctx, cancel = context.WithTimeout(ctx, time.Second*5)
 	defer cancel()
 	s := &spider{
-		Wait:    time.Millisecond * 500 * 2 * 10,
+		// Wait:    time.Millisecond * 500 * 2 * 10,
+		Wait:    time.Second * 5,
 		Host:    "en.wikipedia.org",
 		Visitor: &vis{},
 		URLSet:  storage.NewInMemoryURLSet(),
 		Bus:     bus,
 	}
 	go func() {
-		err = s.start(ctx)
+		// err = s.start(ctx)
+		// if err != nil {
+		// 	t.Error(err)
+		// 	cancel()
+		// }
+		defer cancel()
+		s.robots, err = web.GetRobotsTxT(ctx, s.Host)
 		if err != nil {
-			t.Error(err)
-			cancel()
+			panic(err)
+		}
+		s.init()
+		publisher, err := s.Bus.Publisher(event.PublishWithContext(ctx))
+		if err != nil {
+			panic(err)
+		}
+		consumer, err := s.Bus.Consumer(
+			s.Host,
+			event.ConsumeWithContext(ctx),
+			event.WithPrefetch(s.Prefetch),
+			event.WithKeys(s.hostHashKey()),
+			frontier.WithAutoAck(false), // for rabbitmq message busses
+		)
+		if err != nil {
+			panic(err)
+		}
+		defer consumer.Close()
+		deliveries, err := consumer.Consume()
+		if err != nil {
+			panic(err)
+		}
+		go func() {
+			for range s.sleep {
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Info("context cancelled")
+				return
+			case msg, ok := <-deliveries:
+				if !ok {
+					return
+				}
+				var (
+					req     web.PageRequest
+					msgType = frontier.ParseMessageType(msg.Type)
+				)
+				if msgType != frontier.PageRequest {
+					// This message was not meant for use, ignore it and don't ack
+					log.Warn("skipping message: not a page request message")
+				}
+				err = proto.Unmarshal(msg.Body, &req)
+				if err != nil {
+					log.WithError(err).Error("could not unmarshal page request")
+					continue
+				}
+				log.WithFields(logrus.Fields{
+					"key": msg.RoutingKey, "tag": msg.DeliveryTag,
+					"exchange": msg.Exchange, "type": msg.Type,
+					"consumer": msg.ConsumerTag, "depth": req.Depth,
+					"url": req.URL,
+				}).Trace("request")
+				err := s.handle(ctx, &req, publisher)
+				if err == nil {
+					if err = msg.Ack(false); err != nil {
+						log.WithFields(logrus.Fields{
+							"error": err,
+						}).Warning("could not acknowledge message")
+					}
+				}
+			}
 		}
 	}()
 	<-ctx.Done()
+}
+
+func TestTracing(t *testing.T) {
+	const (
+		service     = "tracing-test"
+		environment = "production"
+		id          = 1
+	)
+	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://localhost:14268/api/traces")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exp),
+		trace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(service),
+			attribute.String("environment", environment),
+			attribute.Int64("ID", id),
+		)),
+	)
+	otel.SetTracerProvider(tp)
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	defer func(ctx context.Context) {
+		// Do not make the application hang when it is shutdown.
+		ctx, cancel = context.WithTimeout(ctx, time.Second*5)
+		defer cancel()
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Fatal(err)
+		}
+	}(ctx)
+
+	tr := tp.Tracer("test-component")
+	ctx, span := tr.Start(ctx, "foo")
+	defer span.End()
+	time.Sleep(time.Second * 5)
+	fmt.Println(ctx)
 }

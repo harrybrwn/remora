@@ -2,6 +2,9 @@ module github.com/harrybrwn/remora
 
 go 1.16
 
+// I added better error wrapping, will make a pull request soon
+replace github.com/streadway/amqp v1.0.1-0.20200716223359-e6b33f460591 => github.com/harrybrwn/amqp v1.0.1-0.20220102100227-cc1f5697e563
+
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/DataDog/zstd v1.4.8 // indirect
@@ -14,27 +17,34 @@ require (
 	github.com/docker/docker v20.10.7+incompatible
 	github.com/docker/go-connections v0.4.0 // indirect
 	github.com/fatih/color v1.7.0
-	github.com/go-redis/redis v6.15.9+incompatible
+	github.com/go-chi/chi v1.5.4
+	github.com/go-chi/chi/v5 v5.0.7
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-redis/redis/extra/redisotel/v8 v8.11.4
+	github.com/go-redis/redis/v8 v8.11.4
 	github.com/golang/mock v1.6.0
-	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/harrybrwn/config v0.1.5-0.20210910011935-4c6674a26dd3
 	github.com/joho/godotenv v1.3.0
 	github.com/lib/pq v1.10.2
 	github.com/matryer/is v1.4.0
 	github.com/moby/term v0.0.0-20210619224110-3f7ff695adc6 // indirect
 	github.com/morikuni/aec v1.0.0 // indirect
-	github.com/onsi/ginkgo v1.16.4 // indirect
-	github.com/onsi/gomega v1.13.0 // indirect
 	github.com/opencontainers/image-spec v1.0.1
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.8.1
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/pflag v1.0.5
-	github.com/streadway/amqp v1.0.0
+	github.com/streadway/amqp v1.0.1-0.20200716223359-e6b33f460591
 	github.com/temoto/robotstxt v1.1.2
-	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
-	golang.org/x/net v0.0.0-20210610132358-84b48f89b13b
-	google.golang.org/grpc v1.38.0
-	google.golang.org/protobuf v1.26.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.28.0
+	go.opentelemetry.io/otel v1.3.0
+	go.opentelemetry.io/otel/exporters/jaeger v1.3.0
+	go.opentelemetry.io/otel/exporters/zipkin v1.3.0
+	go.opentelemetry.io/otel/sdk v1.3.0
+	go.opentelemetry.io/otel/trace v1.3.0
+	golang.org/x/crypto v0.0.0-20210920023735-84f357641f63
+	golang.org/x/net v0.0.0-20210917221730-978cfadd31cf
+	google.golang.org/grpc v1.41.0
+	google.golang.org/protobuf v1.27.1
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0
 )

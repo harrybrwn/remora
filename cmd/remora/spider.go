@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"github.com/harrybrwn/remora/cmd"
 	"github.com/harrybrwn/remora/event"
 	"github.com/harrybrwn/remora/frontier"
+	"github.com/harrybrwn/remora/internal/tracing"
 	"github.com/harrybrwn/remora/internal/visitor"
 	"github.com/harrybrwn/remora/storage"
 	"github.com/harrybrwn/remora/web"
@@ -24,6 +26,13 @@ import (
 	"github.com/streadway/amqp"
 	"github.com/temoto/robotstxt"
 	"google.golang.org/protobuf/proto"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -73,6 +82,14 @@ func newCrawlCmd(conf *cmd.Config) *cobra.Command {
 					return err
 				}
 			}
+			fetcher := web.NewFetcher(
+				conf.UserAgent,
+				web.WithTransport(otelhttp.NewTransport(
+					http.DefaultTransport,
+					otelhttp.WithSpanOptions(trace.WithSpanKind(trace.SpanKindClient)),
+					otelhttp.WithSpanNameFormatter(httpTraceSpanNameFMT),
+				)),
+			)
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 			bus := event.NewChannelBus()
@@ -83,7 +100,7 @@ func newCrawlCmd(conf *cmd.Config) *cobra.Command {
 				withhost(u.Host),
 				prefetch(1),
 				wait(sleep),
-				WithFetcher(web.NewFetcher(conf.UserAgent)),
+				WithFetcher(fetcher),
 			)
 			go spider.start(ctx)
 			go func() {
@@ -139,7 +156,20 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 				conf.Sleep = sleep
 			}
 
-			db, redis, err := getDataStores(conf)
+			tp, err := tracing.Provider(&conf.Tracer, "remora.spider")
+			if err != nil {
+				return errors.Wrap(err, "could not create tracer provider")
+			}
+			defer func(ctx context.Context) {
+				// Do not make the application hang when it is shutdown.
+				ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+				defer cancel()
+				if err := tp.Shutdown(ctx); err != nil {
+					log.Fatal(err)
+				}
+			}(ctx)
+
+			db, redis, err := getDataStores(ctx, conf)
 			if err != nil {
 				return errors.Wrap(err, "datastore connection failure")
 			}
@@ -170,8 +200,20 @@ func newSpiderCmd(conf *cmd.Config) *cobra.Command {
 				log.Info("spider: message queue connection closed")
 				stop()
 			}()
+
+			transport := otelhttp.NewTransport(
+				http.DefaultTransport,
+				otelhttp.WithSpanOptions(trace.WithSpanKind(trace.SpanKindClient)),
+				otelhttp.WithTracerProvider(tp),
+			)
+			web.HttpClient.Transport = transport
+			http.DefaultTransport = transport
+			http.DefaultClient.Transport = transport
 			opts := []spiderOpt{
-				WithFetcher(web.NewFetcher(conf.UserAgent)),
+				WithFetcher(web.NewFetcher(
+					conf.UserAgent,
+					web.WithTransport(transport)),
+				),
 				prefetch(conf.MessageQueue.Prefetch),
 				limit(conf.Depth),
 			}
@@ -245,6 +287,7 @@ type spider struct {
 	robots *robotstxt.RobotsData
 	mu     sync.Mutex
 	hash   hash.Hash
+	tracer trace.Tracer
 }
 
 func (s *spider) Init(opts ...spiderOpt) {
@@ -272,6 +315,7 @@ func (s *spider) init() {
 		s.Fetcher = web.NewFetcher("Remora")
 	}
 	if s.robots == nil {
+		log.Warn("spider found no robots.txt")
 		s.robots = web.AllowAll()
 	}
 	if s.Visitor == nil {
@@ -284,13 +328,20 @@ func (s *spider) init() {
 		s.Prefetch = 1
 	}
 	s.hash = fnv.New128()
+	s.tracer = otel.Tracer("remora.spider")
 }
+
+var (
+	spiderHostKey = attribute.Key("spider.host")
+	crawlDepthKey = attribute.Key("spider.message.crawl_depth")
+	msgURLKey     = attribute.Key("spider.message.url")
+)
 
 func (s *spider) start(ctx context.Context) (err error) {
 	if s.Host == "" {
 		return errors.New("no hostname to crawl")
 	}
-	s.robots, err = web.GetRobotsTxT(s.Host)
+	s.robots, err = web.GetRobotsTxT(ctx, s.Host)
 	if err != nil {
 		log.WithError(err).Error("could not get robots.txt")
 		return err
@@ -351,25 +402,40 @@ func (s *spider) start(ctx context.Context) (err error) {
 				// This message was not meant for use, ignore it and don't ack
 				log.Warn("skipping message: not a page request message")
 			}
-			err = proto.Unmarshal(msg.Body, &req)
-			if err != nil {
-				log.WithError(err).Error("could not unmarshal page request")
-				continue
-			}
-			log.WithFields(logrus.Fields{
-				"key": msg.RoutingKey, "tag": msg.DeliveryTag,
-				"exchange": msg.Exchange, "type": msg.Type,
-				"consumer": msg.ConsumerTag, "depth": req.Depth,
-				"url": req.URL,
-			}).Trace("request")
 			go func() {
+				err = proto.Unmarshal(msg.Body, &req)
+				if err != nil {
+					log.WithError(err).Error("could not unmarshal page request")
+					return
+				}
+				ctx, span := s.tracer.Start(
+					ctx, "spider.receive",
+					trace.WithSpanKind(trace.SpanKindConsumer),
+					trace.WithAttributes(
+						spiderHostKey.String(s.Host),
+						msgURLKey.String(req.URL),
+						crawlDepthKey.Int(int(req.Depth)),
+						semconv.MessagingRabbitmqRoutingKeyKey.String(msg.RoutingKey),
+						semconv.MessagingOperationReceive,
+					),
+				)
+				defer span.End()
+				log.WithFields(logrus.Fields{
+					"key": msg.RoutingKey, "tag": msg.DeliveryTag,
+					"exchange": msg.Exchange, "type": msg.Type,
+					"consumer": msg.ConsumerTag, "depth": req.Depth,
+					"url": req.URL,
+				}).Trace("request")
 				err = s.handle(ctx, &req, publisher)
 				if err == nil {
 					if err = msg.Ack(false); err != nil {
 						log.WithFields(logrus.Fields{
 							"error": err,
 						}).Warning("could not acknowledge message")
+						span.SetStatus(codes.Error, err.Error())
 					}
+				} else {
+					span.SetStatus(codes.Error, err.Error())
 				}
 			}()
 		}
@@ -398,7 +464,7 @@ func (s *spider) handle(
 	}
 	s.Visitor.LinkFound(page.URL)
 
-	if s.inRobotsTxt(page.URL.Path) || s.URLSet.Has(page.URL) {
+	if s.inRobotsTxt(page.URL.Path) || s.URLSet.Has(ctx, page.URL) {
 		log.WithField(
 			"url", req.URL,
 		).Trace("already seen or found in robots.txt")
@@ -408,19 +474,22 @@ func (s *spider) handle(
 
 	// Assume that if handleRequest is called then it made a
 	// request to the web server and so we need to wait for politness.
-	fetchCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	fetchCtx, cancelFetch := context.WithTimeout(ctx, time.Minute)
 	page, err = s.Fetcher.Fetch(fetchCtx, req)
 	if err != nil {
 		log.WithError(err).Error("could not fetch page")
-		cancel()
+		span := trace.SpanFromContext(ctx)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("could not fetch page: %v", err))
+		cancelFetch()
 		go func() { s.sleep <- 0 }()
 		return nil
 	}
-	cancel()
+	cancelFetch()
 	go func() { s.sleep <- time.Since(start) }()
 
 	if page.Redirected {
-		if s.inRobotsTxt(page.URL.Path) || s.URLSet.Has(page.URL) {
+		if s.inRobotsTxt(page.URL.Path) || s.URLSet.Has(ctx, page.URL) {
 			return nil
 		}
 	}
@@ -431,14 +500,17 @@ func (s *spider) handle(
 		log.WithError(err).Error("failed to publish page")
 	}
 
-	err = s.URLSet.Put(page.URL)
+	err = s.URLSet.Put(ctx, page.URL)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"error": err, "url": page.URL,
 		}).Warn("could not mark as seen")
+		span := trace.SpanFromContext(ctx)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("could not mark as seen: %v", err))
 	}
 	if page.Redirected {
-		err = s.URLSet.Put(page.RedirectedFrom)
+		err = s.URLSet.Put(ctx, page.RedirectedFrom)
 		if err != nil {
 			log.WithFields(logrus.Fields{
 				"error": err, "url": page.URL,
@@ -485,7 +557,7 @@ func (s *spider) publishLinks(
 		return nil
 	}
 
-	visited := s.URLSet.HasMulti(page.Links)
+	visited := s.URLSet.HasMulti(ctx, page.Links)
 	for i, l := range page.Links {
 		select {
 		case <-done:
@@ -528,9 +600,9 @@ func (s *spider) hostHashKey() string {
 
 type noOpURLSet struct{}
 
-func (*noOpURLSet) Put(*url.URL) error           { return nil }
-func (*noOpURLSet) Has(*url.URL) bool            { return false }
-func (*noOpURLSet) HasMulti(u []*url.URL) []bool { return make([]bool, len(u)) }
+func (*noOpURLSet) Put(context.Context, *url.URL) error             { return nil }
+func (*noOpURLSet) Has(context.Context, *url.URL) bool              { return false }
+func (*noOpURLSet) HasMulti(_ context.Context, u []*url.URL) []bool { return make([]bool, len(u)) }
 
 type noOpEventBus struct {
 	ch chan amqp.Delivery

@@ -30,7 +30,7 @@ services:
     #  RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
     ports:
       - "5672:5672"
-      - "15672:15672"
+      - "15672:15672" # managment ui http://localhost:15672/
     restart: unless-stopped
 
   visited:
@@ -40,20 +40,25 @@ services:
       - 6379:6379
     restart: unless-stopped
 
-  crawler:
-    image: remora:latest
-    build:
-      dockerfile: ./Dockerfile
-      context: .
-      target: remora
-    container_name: remora-crawler
-    network_mode: host
-    command: ["spider", "en.wikipedia.org"]
-    # Volume is overridden in prod
-    volumes:
-      - ./config/config.yml:/var/local/remora/config.yml:ro
+  jaeger:
+    image: jaegertracing/all-in-one:1.29
+    ports:
+      # - 5775:5775/udp
+      - 6831:6831/udp
+      - 6832:6832/udp
+      - 5778:5778   # configuration
+      - 16686:16686 # frontend http://localhost:16686/
+      - 14250:14250
+      - 14268:14268 # traces api
+      - 14269:14269
+      # - 9411:9411 # zipkin
+    environment:
+      - JAEGER_SAMPLER_PARAM=1
+      - JAEGER_SAMPLER_TYPE=const
+      - JAEGER_REPORTER_LOG_SPANS=true
+    restart: unless-stopped
 
-  api:
+  graph-api:
     image: remora-api:latest
     build:
       dockerfile: ./Dockerfile
@@ -69,6 +74,20 @@ services:
       - "8080:8080"
     restart: unless-stopped
 
+  crawler-api:
+    image: crawler-api:latest
+    build:
+      dockerfile: ./Dockerfile
+      context: .
+      target: crawler-api
+    command: ["-port", "3010"]
+    container_name: crawler-api
+    volumes:
+      - ./config/config.yml:/var/local/remora/config.yml:ro
+    ports:
+      - "3010:3010"
+    restart: unless-stopped
+
   search:
     image: solr:8.11.0
     container_name: remora-search
@@ -76,16 +95,18 @@ services:
     ports:
       - "8983:8983"
 
-  # dummy:
-  #   # image: nothing:latest
-  #   # build:
-  #     # dockerfile: docker/Dockerfile.nothing
-  #     # context: .
-  #   image: alpine:latest
-  #   command: ["tail", "-f", "/dev/null"]
-  #   volumes:
-  #     - remora-config:/var/local/remora
-  #     - ./config/config.yml:/var/local/remora/config.yml
+  #crawler:
+  #  image: remora:latest
+  #  build:
+  #    dockerfile: ./Dockerfile
+  #    context: .
+  #    target: remora
+  #  container_name: remora-crawler
+  #  network_mode: host
+  #  command: ["spider", "en.wikipedia.org"]
+  #  # Volume is overridden in prod
+  #  volumes:
+  #    - ./config/config.yml:/var/local/remora/config.yml:ro
 
 volumes:
   remora-config: {}

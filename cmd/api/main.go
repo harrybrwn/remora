@@ -37,7 +37,7 @@ func main() {
 	config.AddPath("/var/local/remora")
 	config.AddPath(".")
 	config.InitDefaults()
-	err := config.ReadConfigFile()
+	err := config.ReadConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func main() {
 		mux = http.NewServeMux()
 		srv = http.Server{
 			Addr:    fmt.Sprintf(":%d", port),
-			Handler: logall(mux),
+			Handler: logging.LogHTTPRequests(log)(mux),
 		}
 	)
 

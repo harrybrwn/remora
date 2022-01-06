@@ -16,7 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/extra/redisotel/v8"
+	"github.com/go-redis/redis/v8"
 	"github.com/harrybrwn/remora/cmd"
 	"github.com/harrybrwn/remora/db"
 	"github.com/harrybrwn/remora/event"
@@ -49,14 +50,18 @@ func publish(p event.Publisher, hash hash.Hash, host string, req *web.PageReques
 	return p.Publish(key, msg)
 }
 
-func getDataStores(conf *cmd.Config) (d *sql.DB, r *redis.Client, err error) {
+func getDataStores(ctx context.Context, conf *cmd.Config) (d *sql.DB, r *redis.Client, err error) {
 	d, err = db.New(&conf.DB)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	d, err = db.WaitForNew(ctx, &conf.DB, time.Second*2)
 	if err != nil {
 		err = errors.Wrap(err, "could not connect to sql database")
 		return
 	}
 	r = redis.NewClient(conf.RedisOpts())
-	if err = r.Ping().Err(); err != nil {
+	r.AddHook(redisotel.NewTracingHook())
+	if err = r.Ping(ctx).Err(); err != nil {
 		d.Close()
 		err = errors.Wrap(err, "could not ping redis server")
 		return
@@ -65,21 +70,22 @@ func getDataStores(conf *cmd.Config) (d *sql.DB, r *redis.Client, err error) {
 }
 
 func purgeRedis(conf *cmd.Config, args []string) error {
+	ctx := context.TODO()
 	opts := conf.RedisOpts()
 	opts.WriteTimeout = time.Minute
 	c := redis.NewClient(opts)
-	if err := c.Ping().Err(); err != nil {
+	if err := c.Ping(ctx).Err(); err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		return c.FlushDB().Err()
+		return c.FlushDB(ctx).Err()
 	}
-	return c.Del(args...).Err()
+	return c.Del(ctx, args...).Err()
 }
 
 func gatherSitemap(ctx context.Context, host string, ch chan string, wg *sync.WaitGroup) error {
 	defer wg.Done()
-	robs, err := web.GetRobotsTxT(host)
+	robs, err := web.GetRobotsTxT(ctx, host)
 	if err != nil {
 		log.WithError(err).Warn("could not get robots.txt")
 		return err
@@ -172,6 +178,10 @@ func getWait(
 		tm = 1
 	}
 	return tm
+}
+
+func httpTraceSpanNameFMT(operation string, r *http.Request) string {
+	return fmt.Sprintf("%s %s %s", r.Proto, r.RequestURI, r.Method)
 }
 
 func isTooManyOpenFiles(err error) bool {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,8 +11,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
 	"github.com/harrybrwn/remora/cmd"
+	"github.com/harrybrwn/remora/db"
 	"github.com/harrybrwn/remora/internal/rabbitmq"
 	"github.com/harrybrwn/remora/web"
 	"github.com/pkg/errors"
@@ -66,13 +68,25 @@ func newPurgeCmd(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func newEnqueueCmd(conf *cmd.Config) *cobra.Command {
+func newStatusCmd(conf *cmd.Config) *cobra.Command {
+	c := &cobra.Command{
+		Use:   "status",
+		Short: "Print the connection status of dependency services.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return nil
+		},
+	}
+	return c
+}
+
+func newEnqueueCmd(use string, conf *cmd.Config) *cobra.Command {
 	var (
 		fromConfig bool
 		useSitemap bool
 	)
 	c := &cobra.Command{
-		Use:   "enqueue",
+		// Use:   "enqueue",
+		Use:   use,
 		Short: "Send a url to the frontier",
 		Long:  "Send a url to the frontier of the distributed crawler",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -126,11 +140,11 @@ func newEnqueueCmd(conf *cmd.Config) *cobra.Command {
 }
 
 func newRedisCmd(conf *cmd.Config) *cobra.Command {
-	newclient := func() (*redis.Client, error) {
+	newclient := func(ctx context.Context) (*redis.Client, error) {
 		opts := conf.RedisOpts()
 		opts.ReadTimeout = time.Minute
 		client := redis.NewClient(opts)
-		if err := client.Ping().Err(); err != nil {
+		if err := client.Ping(ctx).Err(); err != nil {
 			client.Close()
 			return nil, errors.Wrap(err, "could not ping redis server")
 		}
@@ -140,7 +154,7 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 		Use:   "redis",
 		Short: "Manage the redis database",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := newclient()
+			c, err := newclient(cmd.Context())
 			if err != nil {
 				fmt.Println("could not connect to redis")
 				return nil
@@ -155,12 +169,13 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			Use: "list", Short: "List all keys stored in the database",
 			Aliases: []string{"l"}, SilenceUsage: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
-				client, err := newclient()
+				ctx := cmd.Context()
+				client, err := newclient(ctx)
 				if err != nil {
 					return err
 				}
 				defer client.Close()
-				keys, err := client.Keys("*").Result()
+				keys, err := client.Keys(ctx, "*").Result()
 				if err != nil {
 					return err
 				}
@@ -174,12 +189,13 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			Use: "get", Short: "Get a value from the database",
 			Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				client, err := newclient()
+				ctx := cmd.Context()
+				client, err := newclient(ctx)
 				if err != nil {
 					return err
 				}
 				defer client.Close()
-				res, err := client.Get(args[0]).Result()
+				res, err := client.Get(ctx, args[0]).Result()
 				if err != nil {
 					return err
 				}
@@ -191,12 +207,13 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			Use: "has <key>", Short: "Test whether or not the database has a key",
 			Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				client, err := newclient()
+				ctx := cmd.Context()
+				client, err := newclient(ctx)
 				if err != nil {
 					return err
 				}
 				defer client.Close()
-				err = client.Get(args[0]).Err()
+				err = client.Get(ctx, args[0]).Err()
 				fmt.Println(err != redis.Nil)
 				return nil
 			},
@@ -205,25 +222,27 @@ func newRedisCmd(conf *cmd.Config) *cobra.Command {
 			Use: "put <key> <value>", Short: "Add a value to the database",
 			Args: cobra.ExactArgs(2),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				cli, err := newclient()
+				ctx := cmd.Context()
+				cli, err := newclient(ctx)
 				if err != nil {
 					return err
 				}
 				defer cli.Close()
-				return cli.Set(args[0], args[1], 0).Err()
+				return cli.Set(ctx, args[0], args[1], 0).Err()
 			},
 		},
 		&cobra.Command{
 			Use: "delete <key>", Short: "Remove a value from the database",
 			Aliases: []string{"del"}, Args: cobra.MinimumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				cli, err := newclient()
+				ctx := cmd.Context()
+				cli, err := newclient(ctx)
 				if err != nil {
 					return err
 				}
 				defer cli.Close()
 				for _, k := range args {
-					err = cli.Del(k).Err()
+					err = cli.Del(ctx, k).Err()
 					if err != nil {
 						log.WithError(err).Warning("could not delete " + k)
 					}
@@ -287,6 +306,7 @@ func newQueueCmd(conf *cmd.Config) *cobra.Command {
 		},
 	}
 	c.AddCommand(
+		newEnqueueCmd("put", conf),
 		&cobra.Command{
 			Use: "list", Short: "List all the queues",
 			RunE: newQueueListCmdFunc(conf),
@@ -361,7 +381,7 @@ func newQueueCmd(conf *cmd.Config) *cobra.Command {
 	return c
 }
 
-func newDBCmd(conf *cmd.Config) *cobra.Command {
+func newPSQLCmd(conf *cmd.Config) *cobra.Command {
 	return &cobra.Command{
 		Use: "psql [psql arguments...]", Short: "Run psql using the data from the config",
 		// DisableFlagParsing: true,
@@ -378,6 +398,24 @@ func newDBCmd(conf *cmd.Config) *cobra.Command {
 			c.Stderr = cmd.ErrOrStderr()
 			c.Stdin = os.Stdin
 			return c.Run()
+		},
+	}
+}
+
+func newDBCmd(conf *cmd.Config) *cobra.Command {
+	return &cobra.Command{
+		Use: "db",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			db, err := db.New(&conf.DB)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			if err = db.Ping(); err != nil {
+				return err
+			}
+			fmt.Println("database is up")
+			return nil
 		},
 	}
 }

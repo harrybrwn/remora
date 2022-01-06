@@ -1,12 +1,15 @@
 version: "3.8"
 
 services:
-  crawler:
+  graph-api:
     volumes:
       - remora-config:/var/local/remora:ro
-  api:
+  crawler-api:
     volumes:
       - remora-config:/var/local/remora:ro
   mq:
     volumes:
       - ./data/rabbitmq:/var/lib/rabbitmq/
+  #crawler:
+  #  volumes:
+  #    - remora-config:/var/local/remora:ro

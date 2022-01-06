@@ -13,6 +13,7 @@ import (
 
 	"github.com/harrybrwn/config"
 	"github.com/harrybrwn/remora/cmd"
+	"github.com/harrybrwn/remora/db"
 	"github.com/harrybrwn/remora/frontier"
 	"github.com/harrybrwn/remora/internal/logging"
 	"github.com/harrybrwn/remora/internal/visitor"
@@ -86,6 +87,7 @@ func NewCLIRoot() *cobra.Command {
 				lvl = conf.GetLevel()
 			}
 			initLogger(noColor, lvl)
+			conf.DB.Logger = log
 			return nil
 		},
 	}
@@ -100,11 +102,13 @@ func NewCLIRoot() *cobra.Command {
 		newCrawlCmd(&conf),
 		newSpiderCmd(&conf),
 		newPurgeCmd(&conf),
-		newEnqueueCmd(&conf),
+		newEnqueueCmd("enqueue", &conf),
 		newQueueCmd(&conf),
 		newRedisCmd(&conf),
+		newPSQLCmd(&conf),
 		newDBCmd(&conf),
 		newHitCmd(),
+		newStatusCmd(&conf),
 		cmd.NewVersionCmd(),
 		confcmd,
 		&cobra.Command{
@@ -121,9 +125,48 @@ func NewCLIRoot() *cobra.Command {
 		},
 		&cobra.Command{
 			Use: "test", Hidden: true,
-			RunE: func(cmd *cobra.Command, args []string) error { return nil },
+			RunE: func(cmd *cobra.Command, args []string) error {
+				fmt.Println(conf.MessageQueue.URI())
+				return nil
+				db, err := db.New(&conf.DB)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+				rows, err := db.Query("select id, url, crawled_at, depth from page")
+				if err != nil {
+					return err
+				}
+				types, err := rows.ColumnTypes()
+				if err != nil {
+					return err
+				}
+				for _, t := range types {
+					fmt.Println("type:", t)
+				}
+				for rows.Next() {
+					var (
+						id    []byte
+						url   string
+						tm    time.Time
+						depth int
+					)
+					err = rows.Scan(&id, &url, &tm, &depth)
+					if err != nil {
+						return err
+					}
+					fmt.Printf("%x, %s, %v, %d\n", id, url, tm, depth)
+				}
+				return nil
+			},
 		},
-		&cobra.Command{Use: "license", Run: func(cmd *cobra.Command, args []string) { fmt.Printf("%s\n", license) }},
+		&cobra.Command{
+			Use:   "license",
+			Short: "Print out the license.",
+			Run: func(cmd *cobra.Command, args []string) {
+				fmt.Printf("%s\n", license)
+			},
+		},
 	)
 	c.SetOut(os.Stdout)
 	c.SetErr(os.Stderr)
