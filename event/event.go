@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	ErrNoQueue           = errors.New("queue does not exist")
-	ErrWrongConsumerType = errors.New("wrong consumer type")
+	ErrNoQueue            = errors.New("queue does not exist")
+	ErrWrongConsumerType  = errors.New("wrong consumer type")
+	ErrWrongPublisherType = errors.New("wrong publisher type")
 )
 
 type Event struct {
@@ -53,7 +54,11 @@ func WithKeys(keys ...string) ConsumerOpt {
 	return func(c Consumer) error {
 		switch v := c.(type) {
 		case interface{ BindKeys(...string) error }:
-			return v.BindKeys(keys...)
+			err := v.BindKeys(keys...)
+			if err != nil {
+				return errors.Wrap(err, "consumer failed to bind routing keys to queue")
+			}
+			return nil
 		default:
 			return errors.New("could not bind keys")
 		}
@@ -102,10 +107,12 @@ func NewChannelBusContext(ctx context.Context) *ChannelBus {
 }
 
 type ChannelBus struct {
-	mu     sync.Mutex
-	queues map[string]*queue
-	ctx    context.Context
-	cancel context.CancelFunc
+	mu       sync.Mutex
+	queues   map[string]*queue
+	ctx      context.Context
+	cancel   context.CancelFunc
+	pubhooks []func(*amqp.Publishing)
+	conhooks []func(*amqp.Delivery)
 }
 
 func (cb *ChannelBus) Consumer(key string, opts ...ConsumerOpt) (Consumer, error) {
@@ -130,12 +137,19 @@ func (cb *ChannelBus) Publish(key string, msg amqp.Publishing) error {
 	if !ok {
 		return errors.Wrap(ErrNoQueue, fmt.Sprintf("queue %q not found", key))
 	}
-	select {
-	case q.pub <- msg:
-		return nil
-	case <-cb.ctx.Done():
-		return cb.ctx.Err()
-	}
+	// Non-blocking publish so we can imitate a real message queue.
+	go func() {
+		for _, h := range cb.pubhooks {
+			h(&msg)
+		}
+		select {
+		case <-cb.ctx.Done():
+			return
+		case q.pub <- msg:
+			return
+		}
+	}()
+	return nil
 }
 
 func (cb *ChannelBus) PublishEvent(key string, msg Event) error {
@@ -170,6 +184,8 @@ type queue struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	keys   []string
+
+	consumeHooks []func(*amqp.Delivery)
 }
 
 func newqueue(ctx context.Context, opts []ConsumerOpt) (*queue, error) {
@@ -211,7 +227,7 @@ func (q *queue) BindKeys(keys ...string) error {
 }
 
 func (q *queue) Consume(...string) (<-chan amqp.Delivery, error) {
-	go start(q.ctx, q.con, q.pub)
+	go start(q.ctx, q.con, q.pub, q.consumeHooks)
 	return q.con, nil
 }
 
@@ -219,6 +235,7 @@ func start(
 	ctx context.Context,
 	con chan<- amqp.Delivery,
 	pub <-chan amqp.Publishing,
+	hooks []func(*amqp.Delivery),
 ) {
 	var count uint64 = 0
 	defer close(con)
@@ -230,7 +247,11 @@ func start(
 			if !ok {
 				return
 			}
-			con <- pubToDelivery(msg, count)
+			delivery := pubToDelivery(msg, count)
+			for _, h := range hooks {
+				h(&delivery)
+			}
+			con <- delivery
 			count++
 		}
 	}

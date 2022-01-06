@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/url"
@@ -17,8 +18,8 @@ type RobotsController interface {
 	ShouldSkip(*url.URL) bool
 }
 
-func NewRobotCtrl(host string, agents []string) (*RobotCtrl, error) {
-	data, err := GetRobotsTxT(host)
+func NewRobotCtrl(ctx context.Context, host string, agents []string) (*RobotCtrl, error) {
+	data, err := GetRobotsTxT(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +54,7 @@ func AllowAll() *robotstxt.RobotsData {
 	return r
 }
 
-func GetRobotsTxT(host string) (*robotstxt.RobotsData, error) {
+func GetRobotsTxT(ctx context.Context, host string) (*robotstxt.RobotsData, error) {
 	req := &http.Request{
 		Method:     "GET",
 		Proto:      "HTTP/1.1",
@@ -70,7 +71,7 @@ func GetRobotsTxT(host string) (*robotstxt.RobotsData, error) {
 		GetBody: defaultGetBody,
 	}
 	// TODO don't use a global http client
-	resp, err := HttpClient.Do(req)
+	resp, err := HttpClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}

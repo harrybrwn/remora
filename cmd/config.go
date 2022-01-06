@@ -83,13 +83,20 @@ type MessageQueueConfig struct {
 }
 
 func (mqc *MessageQueueConfig) URI() string {
-	return amqp.URI{
+	uri := amqp.URI{
 		Scheme:   "amqp",
 		Host:     mqc.Host,
 		Port:     mqc.Port,
 		Username: mqc.User,
 		Password: mqc.Password,
-	}.String()
+	}
+	if uri.Password == "" {
+		uri.Password = "guest"
+	}
+	if uri.Username == "" {
+		uri.Username = "guest"
+	}
+	return uri.String()
 }
 
 type TracerConfig struct {

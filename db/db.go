@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/harrybrwn/remora/internal/region"
 	_ "github.com/lib/pq"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -17,8 +18,6 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/harrybrwn/remora/internal/region"
 )
 
 type Config struct {
@@ -156,7 +155,7 @@ func Wrap(database *sql.DB, opts ...DBOption) DB {
 	return &db{
 		DB:     database,
 		tracer: tracer,
-		region: region.New(tracer, dbSystem),
+		region: region.NewRegion(tracer, dbSystem),
 	}
 }
 
@@ -168,7 +167,7 @@ var (
 type db struct {
 	*sql.DB
 	tracer trace.Tracer
-	region *region.Span
+	region *region.Region
 }
 
 var _ DB = (*db)(nil)
@@ -227,7 +226,7 @@ func (db *db) BeginTx(ctx context.Context, opts ...TxOption) (Tx, error) {
 type tx struct {
 	tx     *sql.Tx
 	span   trace.Span
-	region *region.Span
+	region *region.Region
 }
 
 func (tx *tx) Commit() error   { return tx.end(tx.tx.Commit()) }

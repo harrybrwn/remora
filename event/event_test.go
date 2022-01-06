@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/streadway/amqp"
 )
@@ -20,17 +21,19 @@ func TestBus(t *testing.T) {
 	defer bus.Close()
 	con, err := bus.Consumer("q", ConsumeWithContext(ctx), WithPrefetch(3))
 	fail(err, t)
+	defer con.Close()
 	n := 10
 	pub, err := bus.Publisher(PublishWithContext(ctx))
 	fail(err, t)
 	defer pub.Close()
 	go func() {
-		defer con.Close()
 		for i := 0; i < n; i++ {
 			err = bus.PublishEvent(
 				"q", Event{Body: []byte(fmt.Sprintf("%d", i))})
 			handle(err, t)
 		}
+		time.Sleep(time.Millisecond * 150)
+		cancel()
 	}()
 	consumer(t, nil, con, n)
 }
@@ -61,43 +64,54 @@ func TestBusBindKeys(t *testing.T) {
 	bus := NewChannelBusContext(ctx)
 	con, err := bus.Consumer("one", WithKeys("two", "three"))
 	fail(err, t)
+	defer con.Close()
 	pub, err := bus.Publisher()
 	fail(err, t)
 	n := 5
 	go func() {
-		defer con.Close()
 		for i := 0; i < n; i++ {
 			msg := amqp.Publishing{Body: []byte(fmt.Sprintf("%d", i))}
 			handle(pub.Publish("one", msg), t)
 			handle(pub.Publish("two", msg), t)
 			handle(pub.Publish("three", msg), t)
 		}
+		time.Sleep(time.Millisecond * 25)
+		cancel()
 	}()
 	consumer(t, nil, con, n*3)
 }
 
 func TestBusCancel(t *testing.T) {
-	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	bus := NewChannelBusContext(ctx)
 	defer bus.Close()
 	con, err := bus.Consumer("should-timeout")
 	fail(err, t)
-	wg.Add(1)
-	go consumer(t, &wg, con, 1)
 	pub, err := bus.Publisher()
 	fail(err, t)
 	defer pub.Close()
-	fail(pub.Publish("should-timeout", amqp.Publishing{Body: []byte("first")}), t)
-	cancel()
-	for i := 0; i < 3; i++ {
-		err = pub.Publish("should-timeout", amqp.Publishing{Body: []byte("second")})
-		if err == nil {
-			t.Error("expected error after publishing on a closed bus")
+
+	fail(pub.Publish("should-timeout", amqp.Publishing{}), t)
+
+	go func() {
+		<-time.After(time.Millisecond * 50)
+		cancel()
+		for i := 0; i < 5; i++ {
+			fail(pub.Publish("should-timeout", amqp.Publishing{}), t)
 		}
+		time.Sleep(time.Millisecond * 10)
+	}()
+
+	msgs, err := con.Consume()
+	fail(err, t)
+	count := 0
+	for range msgs {
+		count++
 	}
-	con.Close()
-	wg.Wait()
+	if count != 1 {
+		t.Errorf("expected 1 receive, not %d", count)
+	}
 }
 
 type prefetcher struct{ Consumer }

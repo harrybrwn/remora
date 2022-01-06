@@ -10,26 +10,26 @@ import (
 )
 
 type Wrapper interface {
-	Wrap(ctx context.Context, name string, fn Region)
+	Wrap(ctx context.Context, name string, fn RegionFn)
 }
 
-type Span struct {
+type Region struct {
 	tracer      trace.Tracer
 	attrs       []attribute.KeyValue
 	parent      trace.Span
 	parentAttrs []attribute.KeyValue
 }
 
-func New(tracer trace.Tracer, attrs ...attribute.KeyValue) *Span {
-	return &Span{
+func NewRegion(tracer trace.Tracer, attrs ...attribute.KeyValue) *Region {
+	return &Region{
 		tracer: tracer,
 		attrs:  attrs,
 	}
 }
 
-type Region func(ctx context.Context) ([]attribute.KeyValue, error)
+type RegionFn func(ctx context.Context) ([]attribute.KeyValue, error)
 
-func (s *Span) Wrap(ctx context.Context, name string, fn Region) {
+func (s *Region) Wrap(ctx context.Context, name string, fn RegionFn) {
 	opts := []trace.SpanStartOption{
 		trace.WithAttributes(s.attrs...),
 	}
@@ -55,21 +55,21 @@ func (s *Span) Wrap(ctx context.Context, name string, fn Region) {
 	}
 }
 
-func (s *Span) WithParent(span trace.Span, attrs ...attribute.KeyValue) *Span {
+func (s *Region) WithParent(span trace.Span, attrs ...attribute.KeyValue) *Region {
 	cp := s.Copy()
 	cp.parent = span
 	cp.parentAttrs = attrs
 	return s
 }
 
-func (s *Span) Attr(attrs ...attribute.KeyValue) *Span {
+func (s *Region) Attr(attrs ...attribute.KeyValue) *Region {
 	cp := s.Copy()
 	cp.attrs = append(cp.attrs, attrs...)
 	return cp
 }
 
-func (s *Span) Copy() *Span {
-	cp := Span{
+func (s *Region) Copy() *Region {
+	cp := Region{
 		tracer:      s.tracer,
 		parent:      s.parent,
 		attrs:       make([]attribute.KeyValue, len(s.attrs)),

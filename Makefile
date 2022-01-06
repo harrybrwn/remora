@@ -18,7 +18,7 @@ install: $(BINDIR)/remora
 	install ./bin/remora ~/dev/go/bin/remora
 
 .PHONY: $(BINDIR)/remora
-$(BINDIR)/remora: $(GENERATED)
+$(BINDIR)/remora: gen
 	CGO_ENABLED=0 go build -o $@ $(GOFLAGS) ./cmd/remora
 
 $(BINDIR)/docker: ./cmd/docker/main.go
@@ -28,10 +28,15 @@ $(BINDIR)/deploy: ./cmd/deploy/main.go $(shell find ./cmd/deploy -name '*.go')
 	CGO_ENABLED=0 go build -o $@ ./cmd/deploy
 
 gen:
-	go generate ./web ./cmd/remora
+	go generate ./web ./cmd/remora ./internal
+
+docs/protobuf:
+	mkdir -p $@
+	docker container run --rm \
+		-v $(shell pwd)/docs/protobuf:/out \
+		-v $(shell pwd)/protobuf:/protos pseudomuto/protoc-gen-doc
 
 web/pb/page.pb.go web/pb/page_grpc.pb.go: protobuf/page.proto
-	@if [ ! -d web/pb ]; then mkdir web/pb; fi
 	go generate ./web
 
 test:
@@ -44,6 +49,6 @@ image:
 
 clean:
 	$(RM) ./remora
-	$(RM) -r ./bin
+	$(RM) -r ./bin ./internal/mock docs/protobuf
 
 .PHONY: all gen test clean image install

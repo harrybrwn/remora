@@ -56,7 +56,7 @@ func New(sqlDB *sql.DB, redis storage.Redis) (*Visitor, error) {
 		db: db.Wrap(sqlDB, db.WithName("visitor-db")),
 		hashes: hashSet{
 			r:      redis,
-			region: region.New(otel.Tracer("remora/visitor.redisHashset"))},
+			region: region.NewRegion(otel.Tracer("remora/visitor.redisHashset"))},
 		Hosts: make(map[string]struct{}),
 	}, nil
 }
@@ -412,7 +412,7 @@ func memoryLogs(mem *runtime.MemStats) logrus.Fields {
 
 type hashSet struct {
 	r      storage.Redis
-	region *region.Span
+	region *region.Region
 }
 
 func (h *hashSet) has(ctx context.Context, b [16]byte) bool {

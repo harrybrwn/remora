@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
@@ -47,7 +49,7 @@ func NewPageFromString(link string, depth uint32) *Page {
 func NewPageRequest(u *url.URL, depth uint32) *PageRequest {
 	s := u.String()
 	h := fnv.New128()
-	io.WriteString(h, s)
+	io.WriteString(h, u.Host)
 	return &PageRequest{
 		URL:   s,
 		Depth: depth,
@@ -116,6 +118,7 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		GetBody:    defaultGetBody,
 		Header:     http.Header{"User-Agent": {UserAgent}},
 	}
+	span := trace.SpanFromContext(ctx)
 	req = req.WithContext(ctx)
 	resp, err := HttpClient.Do(req)
 	if err != nil {
@@ -128,6 +131,10 @@ func (p *Page) FetchCtx(ctx context.Context) error {
 		p.RetryAfter = getRetryTime(resp.Header)
 		fields := logHeader(resp.Header)
 		log.WithFields(fields).Warn(resp.Status + " " + u.String())
+		span.AddEvent("rate_limited")
+	}
+	if resp.StatusCode >= 300 {
+		span.AddEvent(fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode)))
 	}
 	p.Status = resp.StatusCode
 	p.ContentType = getContentType(resp)

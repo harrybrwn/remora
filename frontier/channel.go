@@ -42,6 +42,11 @@ type channel struct {
 	prefetch int
 }
 
+type alerts struct {
+	cancel chan string
+	closed chan *amqp.Error
+}
+
 func initChannel(
 	ctx context.Context,
 	ch *channel,
@@ -154,7 +159,8 @@ func (c *channel) Publish(
 	)
 }
 
-func (c *channel) Consume(
+func (c *channel) ConsumeContext(
+	ctx context.Context,
 	queue, consumer string,
 	autoAck, exclusive, noLocal, noWait bool,
 	args amqp.Table,
@@ -171,7 +177,7 @@ func (c *channel) Consume(
 				err error
 			)
 			select {
-			case <-c.ctx.Done():
+			case <-ctx.Done():
 				log.Debug("channel: consumer context closed")
 				return
 			default:
@@ -212,7 +218,7 @@ func (c *channel) Consume(
 					select {
 					case deliveries <- msg:
 						// TODO consider calling msg.Ack(false) here
-					case <-c.ctx.Done():
+					case <-ctx.Done():
 						return
 					case <-c.notifyCancel:
 						goto NextConsumer
@@ -223,6 +229,18 @@ func (c *channel) Consume(
 		}
 	}()
 	return deliveries, nil
+}
+
+func (c *channel) Consume(
+	queue, consumer string,
+	autoAck, exclusive, noLocal, noWait bool,
+	args amqp.Table,
+) (<-chan amqp.Delivery, error) {
+	return c.ConsumeContext(
+		c.ctx,
+		queue, consumer, autoAck,
+		exclusive, noLocal, noWait, args,
+	)
 }
 
 func (c *channel) Reload() error {
