@@ -2,6 +2,7 @@ package que
 
 import (
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -26,7 +27,6 @@ type (
 	Delivery         = amqp.Delivery
 	Publishing       = amqp.Publishing
 	AMQPError        = amqp.Error
-	AMQPTable        = amqp.Table
 	AMQPQueue        = amqp.Queue
 	AMQPBlocking     = amqp.Blocking
 	AMQPReturn       = amqp.Return
@@ -34,6 +34,36 @@ type (
 	// Interfaces
 	Acknowledger = amqp.Acknowledger
 )
+
+type AMQPTable = amqp.Table
+type TableCarrier map[string]interface{}
+
+func (tab TableCarrier) Get(key string) string {
+	val, ok := tab[key]
+	if !ok {
+		return ""
+	}
+	switch v := val.(type) {
+	case fmt.Stringer:
+		return v.String()
+	case string:
+		return v
+	default:
+		return ""
+	}
+}
+
+func (tab TableCarrier) Set(k, v string) { tab[k] = v }
+
+func (tab TableCarrier) Keys() []string {
+	keys := make([]string, len(tab))
+	i := 0
+	for k := range tab {
+		keys[i] = k
+		i++
+	}
+	return keys
+}
 
 type AMQPConnection interface {
 	io.Closer

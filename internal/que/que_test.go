@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/harrybrwn/remora/event"
 	"github.com/matryer/is"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
@@ -33,9 +34,8 @@ func TestMessageQueue(t *testing.T) {
 	// t.Skip()
 	is := is.New(t)
 	mq := MessageQueue{Exchange: &Exchange{
-		Name: "test_exchange",
-		Kind: ExchangeTopic,
-		// Kind:       ExchangeDirect,
+		Name:       "test_exchange",
+		Kind:       ExchangeTopic,
 		Durable:    true,
 		AutoDelete: true,
 	}}
@@ -44,7 +44,7 @@ func TestMessageQueue(t *testing.T) {
 
 	con, err := mq.Consumer(
 		"q",
-		// event.WithKeys("q.*"),
+		event.WithKeys("q", "k.*"),
 		WithConsumerQueueOpts(&QueueDeclareOptions{
 			Durable:    false,
 			AutoDelete: true,
@@ -57,26 +57,22 @@ func TestMessageQueue(t *testing.T) {
 	go func() {
 		time.Sleep(time.Millisecond * 250)
 		is.NoErr(pub.Publish("q", Publishing{Body: []byte("help")}))
-		// is.NoErr(pub.Publish("q", Publishing{Body: []byte("me")}))
 		is.NoErr(pub.Publish("k.what", Publishing{Body: []byte("me")}))
 		time.Sleep(time.Millisecond * 10)
 		is.NoErr(pub.Close())
 		is.NoErr(con.Close())
 	}()
 
-	msgs, err := con.Consume(
-		"q",
-		// "k.*",
-		"k.*",
-	)
+	msgs, err := con.Consume()
 	is.NoErr(err)
 	for msg := range msgs {
 		msg.Ack(false)
-		fmt.Printf("key(%q) body(%q)\n", msg.RoutingKey, msg.Body)
+		fmt.Printf("key(%q) body(%q) consumer(%s)\n", msg.RoutingKey, msg.Body, msg.ConsumerTag)
 	}
 }
 
 func TestScratchpad(t *testing.T) {
+	println()
 	// t.Skip()
 	t.Parallel()
 	is := is.New(t)
@@ -141,7 +137,7 @@ func TestScratchpad(t *testing.T) {
 			// time.Sleep(time.Second)
 			goto done
 		case msg := <-ch:
-			fmt.Printf("key: %q, msg: %s\n", msg.RoutingKey, msg.Body)
+			fmt.Printf("key: %q, msg: %s, consumer: %s\n", msg.RoutingKey, msg.Body, msg.ConsumerTag)
 			messages++
 		}
 	}

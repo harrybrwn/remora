@@ -59,6 +59,22 @@ func (e *Exchange) declare(ch AMQPChannel) error {
 
 func (mq *MessageQueue) Close() error { return mq.conn.Close() }
 
+func (mq *MessageQueue) channel() (*mqChannel, error) {
+	ch, err := mq.conn.Channel()
+	if err != nil {
+		return nil, err
+	}
+	var exchange string
+	if mq.Exchange != nil {
+		exchange = mq.Exchange.Name
+		err = mq.Exchange.declare(ch)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &mqChannel{ch: ch, exchange: exchange}, nil
+}
+
 type QueueDeclareOptions struct {
 	Name       string
 	Durable    bool
@@ -73,15 +89,9 @@ func (mq *MessageQueue) Publisher(opts ...event.PublisherOpt) (event.Publisher, 
 		err error
 		p   mqPublisher
 	)
-	p.mqChannel.ch, err = mq.conn.Channel()
+	p.mqChannel, err = mq.channel()
 	if err != nil {
 		return nil, err
-	}
-	if mq.Exchange != nil {
-		p.exchange = mq.Exchange.Name
-		if err = mq.Exchange.declare(p.mqChannel.ch); err != nil {
-			return nil, err
-		}
 	}
 
 	for _, opt := range opts {
@@ -100,31 +110,30 @@ func (mq *MessageQueue) Consumer(
 		err error
 		c   mqConsumer
 	)
-	c.queue = queue
-	c.opts.Queue = queue
-	c.queueOpts.Name = queue
 
-	c.mqChannel.ch, err = mq.conn.Channel()
+	c.mqChannel, err = mq.channel()
 	if err != nil {
 		return nil, err
 	}
-	if mq.Exchange != nil {
-		c.exchange = mq.Exchange.Name
-		if err = mq.Exchange.declare(c.mqChannel.ch); err != nil {
-			return nil, errors.Wrap(err, "could not declare exchange")
-		}
-	}
-
-	if err = c.declareQueue(); err != nil {
-		return nil, errors.Wrap(err, "could not declare queue")
-	}
-
 	for _, opt := range opts {
 		if err = opt(&c); err != nil {
 			c.mqChannel.ch.Close()
 			return nil, err
 		}
 	}
+	c.queue = queue
+	c.opts.Queue = queue
+	c.queueOpts.Name = queue
+	if err = c.declareQueue(); err != nil {
+		return nil, errors.Wrap(err, "could not declare queue")
+	}
+	for _, k := range c.keys {
+		err = c.ch.QueueBind(c.queue, k, c.exchange, false, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	c.keys = nil // clear the routing keys
 	return &c, nil
 }
 
@@ -154,21 +163,20 @@ func (ch *mqChannel) Close() error {
 }
 
 type mqConsumer struct {
-	mqChannel
+	*mqChannel
 	opts  ConsumeOptions
 	queue string
+	keys  []string
 }
 
 func (c *mqConsumer) Consume(keys ...string) (<-chan Delivery, error) {
 	if err := c.BindKeys(keys...); err != nil {
 		return nil, err
 	}
-	deliveries, err := c.mqChannel.ch.Consume(
+	deliveries, err := c.ch.Consume(
 		c.queue,
-		// c.opts.Consumer,
-		"",
-		// c.opts.AutoAck,
-		false,
+		c.opts.Consumer,
+		c.opts.AutoAck,
 		c.opts.Exclusive,
 		c.opts.NoLocal,
 		c.opts.NoWait,
@@ -182,28 +190,18 @@ func (c *mqConsumer) Consume(keys ...string) (<-chan Delivery, error) {
 
 // BindKeys makes event.WithKeys work
 func (c *mqConsumer) BindKeys(keys ...string) error {
-	for _, k := range keys {
-		log.WithFields(logrus.Fields{
-			"queue":    c.opts.Queue,
-			"key":      k,
-			"exchange": c.exchange,
-		}).Info("binding key")
-		err := c.ch.QueueBind(c.opts.Queue, k, c.exchange, false, nil)
-		if err != nil {
-			return err
-		}
-	}
+	c.keys = append(c.keys, keys...)
 	return nil
 }
 
 type mqPublisher struct {
-	mqChannel
+	*mqChannel
 	opts PublishOptions
 }
 
 func (ch *mqPublisher) Publish(key string, msg Publishing) error {
 	ch.mqChannel.ch.Publish(
-		ch.opts.Exchange,
+		ch.exchange,
 		key,
 		ch.opts.Mandatory,
 		ch.opts.Immediate,
