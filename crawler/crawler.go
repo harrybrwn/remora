@@ -2,10 +2,8 @@ package crawler
 
 import (
 	"context"
-	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net/url"
 	"sync/atomic"
 	"time"
@@ -227,6 +225,7 @@ func (c *Crawler) recv(ctx context.Context) error {
 			c.Logger.WithError(err).Warn("could not send message acknowledgment")
 		}
 		atomic.AddUint64(&c.count, 1)
+
 		var req web.PageRequest
 		err := proto.Unmarshal(msg.Body, &req)
 		if err != nil {
@@ -241,7 +240,6 @@ func (c *Crawler) recv(ctx context.Context) error {
 			KeyPageRequestDepth.Int(int(req.Depth)),
 			KeyPageRequestKey.String(req.HexKey()),
 		)
-
 		err = c.handle(ctx, &req)
 		if err != nil {
 			span.RecordError(err)
@@ -374,12 +372,4 @@ func (tf *timeoutFetcher) Fetch(
 	}
 	cancelFetch()
 	return page, nil
-}
-
-func pageHash(p *web.Page) []byte {
-	h := sha512.New()
-	for _, l := range p.Links {
-		io.WriteString(h, l.String())
-	}
-	return h.Sum(nil)
 }

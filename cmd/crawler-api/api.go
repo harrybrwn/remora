@@ -101,10 +101,11 @@ func (api *api) status(rw http.ResponseWriter, r *http.Request) {
 }
 
 type ControlParams struct {
-	MaxDepth   int    `json:"max_depth"`
-	Host       string `json:"host"`
-	Wait       string `json:"wait,omitempty"`
-	NopVisitor bool   `json:"nop_visitor"`
+	MaxDepth     int      `json:"max_depth"`
+	Host         string   `json:"host"`
+	Wait         string   `json:"wait,omitempty"`
+	NopVisitor   bool     `json:"nop_visitor"`
+	ConsumerKeys []string `json:"consumer_keys"` // TODO add these keys to message queue consumer
 }
 
 func (api *api) start(rw http.ResponseWriter, r *http.Request) {
@@ -135,11 +136,7 @@ func (api *api) start(rw http.ResponseWriter, r *http.Request) {
 	if params.NopVisitor {
 		crawler.Visitor = &logVisitor{}
 	}
-	if crawler.Running() {
-		err = errors.New("crawler is already running")
-		api.Error(ctx, rw, http.StatusBadRequest, err)
-		return
-	}
+
 	api.logger.Debug("starting crawler")
 	err = crawler.Start(api.ctx)
 	if err != nil {
@@ -299,11 +296,9 @@ func (api *api) createCrawler(ctx context.Context, host string) (*crawler.Crawle
 }
 
 func (api *api) initialize(ctx context.Context, c *crawler.Crawler) error {
-	api.logger.Debug("initializing crawler")
-	defer api.logger.Debug("done initializing crawler")
 	var err error
 	c.Consumer, err = api.connections.bus.Consumer(
-		routingKey(c.Host),
+		c.Host,
 		que.WithConsumerQueueOpts(&que.QueueDeclareOptions{
 			Durable: true,
 			Args:    que.AMQPTable{"x-queue-mode": "lazy"},

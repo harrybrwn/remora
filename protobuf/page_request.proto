@@ -4,9 +4,15 @@ package web;
 
 option go_package = "github.com/harrybrwn/remora/web";
 
+// PageRequest is a request for the crawler to crawl a webpage.
 message PageRequest {
+    // URL is the url to be crawled.
     string URL   = 1;
+    // Key is the routing key that might optionally be used to deturmine which
+    // web crawler the request will go to.
     bytes  key   = 2;
+    // Depth is the crawl depth of the request.
     uint32 depth = 3;
+    // Retry is a counter for the number of retries for fetching the webpage.
     int32  retry = 4;
 }

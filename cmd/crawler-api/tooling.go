@@ -35,6 +35,7 @@ func setup(conf *Config) error {
 	if conf.ConfigFile != "" {
 		config.AddFilepath(conf.ConfigFile)
 	} else {
+		config.AddFile("remora.yml")
 		config.AddFile("config.yml")
 		config.AddPath("/var/local/remora")
 		config.AddPath(".")

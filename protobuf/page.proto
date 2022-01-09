@@ -42,6 +42,6 @@ message Page {
 message None { }
 
 service PageFetcher {
-    rpc links(web.PageRequest) returns (PageResponse) {}
-    rpc enqueue(web.PageRequest) returns (Response) {}
+    rpc links(PageRequest) returns (PageResponse) {}
+    rpc enqueue(PageRequest) returns (Response) {}
 }

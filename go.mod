@@ -2,9 +2,6 @@ module github.com/harrybrwn/remora
 
 go 1.16
 
-// I added better error wrapping, will make a pull request soon
-replace github.com/streadway/amqp v1.0.1-0.20200716223359-e6b33f460591 => github.com/harrybrwn/amqp v1.0.1-0.20220102100227-cc1f5697e563
-
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/DataDog/zstd v1.4.8 // indirect

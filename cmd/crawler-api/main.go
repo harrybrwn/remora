@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -97,6 +98,12 @@ func listenAndServe(port int, h http.Handler) error {
 		log.Error(err)
 	}
 	return err
+}
+
+func hostPrefix(host string) string {
+	hash := fnv.New128()
+	io.WriteString(hash, host)
+	return hex.EncodeToString(hash.Sum(nil)[2:])
 }
 
 func routingKey(host string) string {

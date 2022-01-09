@@ -2,9 +2,9 @@ syntax = "proto3";
 
 package web;
 
-import "protobuf/page.proto";
-
 option go_package = "github.com/harrybrwn/remora/web/webpb";
+
+import "page.proto";
 
 message SpiderConfig {
 	string host = 1;

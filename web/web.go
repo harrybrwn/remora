@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/xml"
-	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -94,7 +94,7 @@ func (pf *pageFetcher) Fetch(ctx context.Context, req *PageRequest) (*Page, erro
 	}
 	var (
 		buf  bytes.Buffer
-		hash = fnv.New128()
+		hash = sha256.New()
 	)
 	_, err = io.Copy(&buf, io.TeeReader(resp.Body, hash))
 	if err != nil {
