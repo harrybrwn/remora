@@ -13,6 +13,7 @@ RUN go mod download
 COPY . /app/src
 WORKDIR /app/src
 
+FROM builder as remora-bulider
 RUN go generate ./web && \
     CGO_ENABLED=0 go build     \
         -o /app/bin/remora     \
@@ -23,6 +24,8 @@ RUN go generate ./web && \
             -X 'github.com/harrybrwn/remora/cmd.sourcehash=$(./scripts/sourcehash.sh -e './cmd/deploy/*')' \
             -X 'github.com/harrybrwn/remora/cmd.commit=$(git rev-parse HEAD)'" \
         ./cmd/remora
+
+FROM builder as remora-api-builder
 RUN CGO_ENABLED=0 go build     \
         -o /app/bin/remora-api \
         -trimpath              \
@@ -32,6 +35,8 @@ RUN CGO_ENABLED=0 go build     \
             -X 'github.com/harrybrwn/remora/cmd.sourcehash=$(./scripts/sourcehash.sh -e './cmd/deploy/*')' \
             -X 'github.com/harrybrwn/remora/cmd.commit=$(git rev-parse HEAD)'" \
         ./cmd/api
+
+FROM builder as crawler-api-builder
 RUN CGO_ENABLED=0 go build      \
         -o /app/bin/crawler-api \
         -trimpath               \
@@ -44,17 +49,17 @@ RUN CGO_ENABLED=0 go build      \
 
 # API Image
 FROM alpine:3.14 as api
-COPY --from=builder /app/bin/remora-api /usr/bin/
+COPY --from=remora-api-builder /app/bin/remora-api /usr/bin/
 ENTRYPOINT ["remora-api"]
 
 # Crawler API Image
 FROM alpine:3.14 as crawler-api
-COPY --from=builder /app/bin/crawler-api /usr/bin/
+COPY --from=crawler-api-builder /app/bin/crawler-api /usr/bin/
 ENTRYPOINT ["crawler-api"]
 
 # Main Image
 FROM alpine:3.14 as remora
-COPY --from=builder /app/bin/remora /usr/bin/remora
+COPY --from=remora-builder /app/bin/remora /usr/bin/remora
 RUN mkdir -p -m 3777 /var/local/remora
 WORKDIR /
 ENTRYPOINT ["remora"]

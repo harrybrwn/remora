@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"io"
 	"os"
@@ -48,15 +47,9 @@ func (c *Config) init() {
 func New(cfg *Config) (*sql.DB, error) {
 	os.Unsetenv("PGSERVICEFILE") // lib/pq panics when this is set
 	os.Unsetenv("PGSERVICE")
-
 	db, err := sql.Open("postgres", cfg.dsn())
 	if err != nil {
 		return nil, errors.Wrap(err, "could not open postgres db")
-	}
-	err = db.Ping()
-	if err != nil {
-		db.Close()
-		return nil, errors.Wrap(err, "could not ping postgres")
 	}
 	return db, nil
 }
@@ -82,7 +75,7 @@ func WaitForNew(ctx context.Context, cfg *Config, ping time.Duration) (*sql.DB, 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, driver.ErrBadConn
+			return nil, err
 		case <-ticker.C:
 			cfg.Logger.WithField("time", time.Now()).Info("pinging database")
 			err = db.Ping()
@@ -96,7 +89,11 @@ func WaitForNew(ctx context.Context, cfg *Config, ping time.Duration) (*sql.DB, 
 func NewWithTimeout(ctx context.Context, timeout time.Duration, cfg *Config) (*sql.DB, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return WaitForNew(ctx, cfg, time.Second)
+	db, err := WaitForNew(ctx, cfg, time.Second)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to connect to database")
+	}
+	return db, nil
 }
 
 type DB interface {

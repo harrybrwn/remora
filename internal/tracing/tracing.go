@@ -14,6 +14,18 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 )
 
+var tracer *tracesdk.TracerProvider
+
+func Init(cfg *cmd.TracerConfig, name string, opts ...tracesdk.TracerProviderOption) {
+	var err error
+	tracer, err = Provider(cfg, name, opts...)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func Default() *tracesdk.TracerProvider { return tracer }
+
 func Provider(cfg *cmd.TracerConfig, name string, opts ...tracesdk.TracerProviderOption) (*tracesdk.TracerProvider, error) {
 	switch cfg.Type {
 	case "jaeger":

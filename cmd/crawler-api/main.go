@@ -46,15 +46,13 @@ func main() {
 	if err := setup(&conf); err != nil {
 		log.Fatal(err)
 	}
+	tracing.Init(&conf.Tracer, component)
 
-	tp, err := tracing.Provider(&conf.Tracer, component)
-	if err != nil {
-		log.Fatal(err)
-	}
 	v := cmd.GetVersionInfo()
 	web.UserAgent = fmt.Sprintf("Remora/%s", v.Version)
 
 	var (
+		err   error
 		ctx   = logging.Stash(context.Background(), log)
 		conns = connections{bus: &que.MessageQueue{Exchange: &que.Exchange{
 			Name:    "page_topic",
@@ -63,9 +61,10 @@ func main() {
 		}}}
 		fetcher = web.NewFetcher(
 			web.UserAgent,
-			web.WithTransport(transport(tp)),
+			web.WithTransport(transport(tracing.Default())),
 		)
 	)
+	conf.DB.Logger = log
 	if err = conns.Connect(ctx, &conf.Config); err != nil {
 		log.Fatal(err)
 	}
@@ -80,13 +79,13 @@ func main() {
 		fetcher:     fetcher,
 		visitor:     vis,
 		crawlers:    make(map[string]*crawler.Crawler),
-		tp:          tp,
+		tp:          tracing.Default(),
 		connections: conns,
 	}
 
-	r.Use(instrumentation(api.logger, tp.Tracer(component), component))
-	// r.Use(logging.LogHTTPRequests(api.logger))
+	r.Use(instrumentation(api.logger, tracing.Default().Tracer(component), component))
 	api.ApplyRoutes(r)
+	api.logger.Info("starting server")
 	listenAndServe(conf.Port, r)
 }
 
@@ -147,6 +146,7 @@ func (c *connections) Connect(ctx context.Context, conf *cmd.Config) error {
 		func() (string, error) {
 			var err error
 			c.db, err = db.NewWithTimeout(ctx, time.Second*30, &conf.DB)
+			// c.db, err = db.New(&conf.DB)
 			return "database", err
 		},
 		func() (string, error) {

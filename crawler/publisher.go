@@ -8,7 +8,6 @@ import (
 	"github.com/harrybrwn/remora/event"
 	"github.com/harrybrwn/remora/frontier"
 	"github.com/harrybrwn/remora/internal/logging"
-	"github.com/harrybrwn/remora/storage"
 	"github.com/harrybrwn/remora/web"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
@@ -23,7 +22,6 @@ type LinkPublisher interface {
 }
 
 type PagePublisher struct {
-	URLSet    storage.URLSet
 	Robots    web.RobotsController
 	Publisher event.Publisher
 	Logger    logrus.FieldLogger
@@ -39,7 +37,7 @@ func (pp *PagePublisher) Publish(ctx context.Context, depth uint32, links []*url
 		logger = logging.FromContext(ctx)
 		tracer = otel.Tracer("crawler")
 	)
-	ctx, span := tracer.Start(
+	_, span := tracer.Start(
 		ctx, "crawler.publish_links",
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
@@ -51,8 +49,7 @@ func (pp *PagePublisher) Publish(ctx context.Context, depth uint32, links []*url
 	if length <= 0 {
 		return nil
 	}
-	visited := pp.URLSet.HasMulti(ctx, links)
-	for i, l := range links {
+	for _, l := range links {
 		select {
 		case <-done:
 			return nil
@@ -66,13 +63,6 @@ func (pp *PagePublisher) Publish(ctx context.Context, depth uint32, links []*url
 			"":
 			continue
 		default:
-		}
-		if visited[i] {
-			span.AddEvent(
-				"already visited",
-				trace.WithAttributes(attribute.Key("link").String(l.String())),
-			)
-			continue
 		}
 		if pp.Robots.ShouldSkip(l) {
 			span.AddEvent(

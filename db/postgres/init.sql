@@ -64,3 +64,20 @@ CREATE MATERIALIZED VIEW hosts AS
     count(DISTINCT url) as n
   FROM page
   GROUP BY host, ipv4;
+
+CREATE TABLE node (
+  id        BIGSERIAL PRIMARY KEY,  -- should never by zero so we can use it as a null value
+  parent_id BIGINT,
+  page_id   BYTEA,
+  CHECK (id <> parent_id)
+);
+
+-- WITH new_node AS (
+--   INSERT INTO node (parent_id, page_id)
+--   VALUES (0, E'\x79ff909872c10ba9d779b84ea0900c2e')
+--   RETURNING id
+-- )
+-- INSERT INTO node (parent_id, page_id)
+--   SELECT id, E'\x072366a1b8b480d67498be3000710664'::bytea FROM new_node
+-- UNION
+--   SELECT id, E'\x79d70ee7b124e48777a9e2ffce04b4df'::bytea FROM new_node;

@@ -3,8 +3,7 @@ version: "3.8"
 services:
 
   db:
-    image: postgres:13.3-alpine
-    container_name: remora-db
+    image: postgres:15
     shm_size: 2Gb
     command:
       - 'postgres'
@@ -17,15 +16,14 @@ services:
       POSTGRES_USER: crawler
       POSTGRES_DB: page_crawls
     restart: unless-stopped
-    ports:
-      - "55432:5432"
+    # ports:
+    #   - "55432:5432"
     volumes:
       - ./db/postgres:/docker-entrypoint-initdb.d:ro
-      - ./data/postgres:/var/lib/postgresql/data/
+      - postgres:/var/lib/postgresql/data/
 
   mq:
     image: rabbitmq:3-management-alpine
-    container_name: remora-msgq
     # environment:
     #  RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
     ports:
@@ -34,8 +32,7 @@ services:
     restart: unless-stopped
 
   visited:
-    image: redis:6.2.4-alpine
-    container_name: remora-visited-set
+    image: redis:6.2-alpine
     ports:
       - 6379:6379
     restart: unless-stopped
@@ -43,36 +40,35 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.29
     ports:
-      # - 5775:5775/udp
-      - 6831:6831/udp
-      - 6832:6832/udp
-      - 5778:5778   # configuration
-      - 16686:16686 # frontend http://localhost:16686/
-      - 14250:14250
-      - 14268:14268 # traces api
-      - 14269:14269
-      # - 9411:9411 # zipkin
+     # - 5775:5775/udp
+     - 6831:6831/udp
+     - 6832:6832/udp
+     - 5778:5778   # configuration
+     - 16686:16686 # frontend http://localhost:16686/
+     - 14250:14250
+     - 14268:14268 # traces api
+     - 14269:14269
+     # - 9411:9411 # zipkin
     environment:
       - JAEGER_SAMPLER_PARAM=1
       - JAEGER_SAMPLER_TYPE=const
       - JAEGER_REPORTER_LOG_SPANS=true
     restart: unless-stopped
 
-  graph-api:
-    image: remora-api:latest
-    build:
-      dockerfile: ./Dockerfile
-      context: .
-      target: api
-    command: ["-p", "8080"]
-    container_name: remora-api
-    network_mode: host
-    # Volume is overridden in prod
-    volumes:
-      - ./config/config.yml:/var/local/remora/config.yml:ro
-    ports:
-      - "8080:8080"
-    restart: unless-stopped
+  # graph-api:
+  #   image: remora-api:latest
+  #   build:
+  #     dockerfile: ./Dockerfile
+  #     context: .
+  #     target: api
+  #   command: ["-p", "8080"]
+  #   network_mode: host
+  #   # Volume is overridden in prod
+  #   volumes:
+  #     - ./config/config.yml:/var/local/remora/config.yml:ro
+  #   ports:
+  #     - "8080:8080"
+  #   restart: unless-stopped
 
   crawler-api:
     image: crawler-api:latest
@@ -81,19 +77,17 @@ services:
       context: .
       target: crawler-api
     command: ["-port", "3010"]
-    container_name: crawler-api
     volumes:
       - ./config/config.yml:/var/local/remora/config.yml:ro
     ports:
       - "3010:3010"
     restart: unless-stopped
 
-  search:
-    image: solr:8.11.0
-    container_name: remora-search
-    restart: unless-stopped
-    ports:
-      - "8983:8983"
+  # search:
+  #   image: solr:8.11.0
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8983:8983"
 
   #crawler:
   #  image: remora:latest
@@ -101,7 +95,6 @@ services:
   #    dockerfile: ./Dockerfile
   #    context: .
   #    target: remora
-  #  container_name: remora-crawler
   #  network_mode: host
   #  command: ["spider", "en.wikipedia.org"]
   #  # Volume is overridden in prod
@@ -109,4 +102,8 @@ services:
   #    - ./config/config.yml:/var/local/remora/config.yml:ro
 
 volumes:
-  remora-config: {}
+  postgres:
+
+configs:
+  remora.yml:
+    file: ./remora.yml

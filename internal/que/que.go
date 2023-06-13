@@ -32,7 +32,10 @@ type MessageQueue struct {
 
 func (mq *MessageQueue) Connect(url string) (err error) {
 	mq.conn, err = AMQPDial(url)
-	return err
+	if err != nil {
+		return errors.Wrap(err, "failed to connect to message queue")
+	}
+	return nil
 }
 
 type Exchange struct {

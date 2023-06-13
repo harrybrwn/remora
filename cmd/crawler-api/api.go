@@ -25,7 +25,7 @@ import (
 
 type api struct {
 	ctx    context.Context
-	logger logrus.FieldLogger
+	logger *logrus.Logger
 
 	mu       sync.Mutex
 	crawlers map[string]*crawler.Crawler
@@ -41,6 +41,7 @@ func (api *api) ApplyRoutes(r chi.Router) {
 	r.Get("/crawl", api.crawl)
 	r.Post("/start", api.start)
 	r.Post("/stop", api.stop)
+	r.Post("/config", api.config)
 }
 
 func (api *api) Error(ctx context.Context, rw http.ResponseWriter, status int, err error) {
@@ -57,14 +58,16 @@ func (api *api) Error(ctx context.Context, rw http.ResponseWriter, status int, e
 	rw.Write(b)
 }
 
+type crawlerStatus struct {
+	Host       string `json:"host"`
+	Running    bool   `json:"running"`
+	RoutingKey string `json:"routing_key,omitempty"`
+	Wait       string `json:"wait"`
+	Uptime     string `json:"uptime,omitempty"`
+	Count      uint64 `json:"count"`
+}
+
 func (api *api) status(rw http.ResponseWriter, r *http.Request) {
-	type crawlerStatus struct {
-		Host       string `json:"host"`
-		Running    bool   `json:"running"`
-		RoutingKey string `json:"routing_key,omitempty"`
-		Uptime     string `json:"uptime"`
-		Count      uint64 `json:"count"`
-	}
 	var (
 		statuses = make([]crawlerStatus, 0, len(api.crawlers))
 		m        = make(map[string]interface{})
@@ -87,6 +90,7 @@ func (api *api) status(rw http.ResponseWriter, r *http.Request) {
 			Running: running,
 			Uptime:  fmt.Sprintf("%v", uptime),
 			Count:   crawler.Count(),
+			Wait:    crawler.Wait.String(),
 		})
 	}
 	api.mu.Unlock()
@@ -153,6 +157,67 @@ func (api *api) start(rw http.ResponseWriter, r *http.Request) {
 		"running":     crawler.Running(),
 		"routing_key": routingKey(crawler.Host),
 	})
+	if err != nil {
+		api.Error(ctx, rw, 500, err)
+		return
+	}
+}
+
+func (api *api) config(rw http.ResponseWriter, request *http.Request) {
+	var (
+		req  []ControlParams
+		resp []crawlerStatus
+		ctx  = request.Context()
+	)
+	err := json.NewDecoder(request.Body).Decode(&req)
+	if err != nil {
+		api.Error(ctx, rw, http.StatusBadRequest, err)
+		return
+	}
+	resp = make([]crawlerStatus, 0, len(req))
+
+	for _, conf := range req {
+		wait, err := time.ParseDuration(conf.Wait)
+		if err != nil {
+			api.Error(ctx, rw, http.StatusBadRequest, errors.New("invalid wait string"))
+			return
+		}
+		cr, err := api.GetOrCreateCrawler(ctx, conf.Host)
+		if err != nil {
+			if errors.Is(err, crawler.ErrCrawlerRunning) {
+				api.logger.Info("crawler already created, skipping")
+				continue
+			} else {
+				api.Error(ctx, rw, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		cr.DepthLimit = conf.MaxDepth
+		cr.Wait = wait
+		if conf.NopVisitor {
+			cr.Visitor = &logVisitor{}
+		}
+		err = cr.Start(api.ctx)
+		if err != nil {
+			if errors.Is(err, crawler.ErrCrawlerRunning) {
+				api.logger.Info("crawler already created, skipping")
+				goto response
+			} else {
+				api.Error(ctx, rw, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		api.AddCrawler(conf.Host, cr)
+	response:
+		resp = append(resp, crawlerStatus{
+			Host:       cr.Host,
+			Running:    cr.Running(),
+			RoutingKey: routingKey(cr.Host),
+			Wait:       cr.Wait.String(),
+		})
+	}
+
+	err = sendJSON(rw, 200, resp)
 	if err != nil {
 		api.Error(ctx, rw, 500, err)
 		return
@@ -321,7 +386,6 @@ func (api *api) initialize(ctx context.Context, c *crawler.Crawler) error {
 	}
 	c.Publisher = &crawler.PagePublisher{
 		Publisher: publisher,
-		URLSet:    c.URLSet,
 		Robots:    c.RobotsCtrl,
 		Logger:    api.logger,
 	}

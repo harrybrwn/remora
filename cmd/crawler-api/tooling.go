@@ -45,6 +45,12 @@ func setup(conf *Config) error {
 	if err != nil {
 		return err
 	}
+	lvl, err := logrus.ParseLevel(conf.LogLevel)
+	if err != nil {
+		lvl = logrus.InfoLevel
+		log.WithError(err).Warn("failed to parse configuration log level")
+	}
+	log.SetLevel(lvl)
 	return nil
 }
 
