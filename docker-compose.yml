@@ -15,9 +15,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_USER: crawler
       POSTGRES_DB: page_crawls
-    restart: unless-stopped
-    # ports:
-    #   - "55432:5432"
     volumes:
       - ./db/postgres:/docker-entrypoint-initdb.d:ro
       - postgres:/var/lib/postgresql/data/
@@ -25,17 +22,19 @@ services:
   mq:
     image: rabbitmq:3-management-alpine
     # environment:
-    #  RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.65
+    #   RABBITMQ_VM_MEMORY_HIGH_WATERMARK: '0.65'
     ports:
       - "5672:5672"
       - "15672:15672" # managment ui http://localhost:15672/
-    restart: unless-stopped
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq/mnesia
 
   visited:
     image: redis:6.2-alpine
     ports:
       - 6379:6379
-    restart: unless-stopped
+    volumes:
+      - redis:/data
 
   jaeger:
     image: jaegertracing/all-in-one:1.46
@@ -48,12 +47,31 @@ services:
      - 14250:14250
      - 14268:14268 # traces api
      - 14269:14269
-     # - 9411:9411 # zipkin
+     #- 9411:9411 # zipkin
     environment:
       - JAEGER_SAMPLER_PARAM=1
       - JAEGER_SAMPLER_TYPE=const
       - JAEGER_REPORTER_LOG_SPANS=true
-    restart: unless-stopped
+      - COLLECTOR_OTLP_ENABLED=true
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+      - SPAN_STORAGE_TYPE=badger  # default is 'memory'
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/var/lib/badger/data
+      - BADGER_DIRECTORY_KEY=/var/lib/badger/key
+    volumes:
+      - jaeger-badger:/var/lib/badger
+
+  crawler:
+    image: remora-crawler:latest
+    build:
+      context: .
+      target: crawler-api
+    command: ["-port", "3010"]
+    volumes:
+      - ./config/config.yml:/var/local/remora/config.yml:ro
+    ports:
+      - "3010:3010"
+    restart: on-failure
 
   # graph-api:
   #   image: remora-api:latest
@@ -70,25 +88,6 @@ services:
   #     - "8080:8080"
   #   restart: unless-stopped
 
-  crawler:
-    image: remora-crawler:latest
-    build:
-      dockerfile: ./Dockerfile
-      context: .
-      target: crawler-api
-    command: ["-port", "3010"]
-    volumes:
-      - ./config/config.yml:/var/local/remora/config.yml:ro
-    ports:
-      - "3010:3010"
-    restart: unless-stopped
-
-  # search:
-  #   image: solr:8.11.0
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8983:8983"
-
   #crawler:
   #  image: remora:latest
   #  build:
@@ -103,6 +102,9 @@ services:
 
 volumes:
   postgres:
+  rabbitmq:
+  redis:
+  jaeger-badger:
 
 configs:
   remora.yml:

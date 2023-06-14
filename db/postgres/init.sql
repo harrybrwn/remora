@@ -67,9 +67,9 @@ CREATE MATERIALIZED VIEW hosts AS
 
 CREATE TABLE node (
   id        BIGSERIAL PRIMARY KEY,  -- should never by zero so we can use it as a null value
+  page_id   BYTEA
   -- parent_id BIGINT,
-  page_id   BYTEA,
-  CHECK (id <> parent_id)
+  -- CHECK (id <> parent_id)
 );
 
 CREATE TABLE node_edge (

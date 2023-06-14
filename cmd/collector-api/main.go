@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/harrybrwn/config"
 	"github.com/harrybrwn/remora/cmd"
 	"github.com/harrybrwn/remora/internal/tracing"

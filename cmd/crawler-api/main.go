@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/chromedp"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-redis/redis/extra/redisotel/v8"
 	"github.com/go-redis/redis/v8"
@@ -63,6 +64,8 @@ func main() {
 			web.WithTransport(transport(tracing.Default())),
 		)
 	)
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
 	conf.DB.Logger = log
 	if err = conns.Connect(ctx, &conf.Config); err != nil {
 		log.Fatal(err)
@@ -73,7 +76,7 @@ func main() {
 		log.Fatal(err)
 	}
 	api := api{
-		ctx:         ctx, // cancellation for workers
+		ctx:         ctx, // holds logger and chrome
 		logger:      log,
 		fetcher:     fetcher,
 		visitor:     vis,

@@ -1,6 +1,13 @@
+# syntax=docker/dockerfile:1.5
+
 # Build Image
-FROM golang:1.16.10-alpine as builder
-RUN apk update && apk --upgrade add git protoc && \
+FROM golang:1.20.4-alpine as builder
+RUN --mount=type=cache,target=/var/cache/apk \
+    apk update && apk --upgrade \
+        add         \
+        git         \
+        protoc      \
+        chromium && \
     go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1 && \
     go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
 
@@ -8,13 +15,17 @@ COPY go.mod /app/build/go.mod
 COPY go.sum /app/build/go.sum
 
 WORKDIR /app/build
-RUN go mod download
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg/mod  \
+    go mod download
 
 COPY . /app/src
 WORKDIR /app/src
 
 FROM builder as remora-bulider
-RUN go generate ./web && \
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg/mod  \
+    go generate ./web && \
     CGO_ENABLED=0 go build     \
         -o /app/bin/remora     \
         -trimpath              \
@@ -26,7 +37,9 @@ RUN go generate ./web && \
         ./cmd/remora
 
 FROM builder as remora-api-builder
-RUN CGO_ENABLED=0 go build     \
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg/mod  \
+    CGO_ENABLED=0 go build     \
         -o /app/bin/remora-api \
         -trimpath              \
         -ldflags "-w -s \
@@ -37,7 +50,9 @@ RUN CGO_ENABLED=0 go build     \
         ./cmd/api
 
 FROM builder as crawler-api-builder
-RUN CGO_ENABLED=0 go build      \
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg/mod  \
+    CGO_ENABLED=0 go build      \
         -o /app/bin/crawler-api \
         -trimpath               \
         -ldflags "-w -s \
@@ -54,6 +69,9 @@ ENTRYPOINT ["remora-api"]
 
 # Crawler API Image
 FROM alpine:3.14 as crawler-api
+RUN --mount=type=cache,target=/var/cache/apk \
+    apk update && \
+    apk add --upgrade chromium
 COPY --from=crawler-api-builder /app/bin/crawler-api /usr/bin/
 ENTRYPOINT ["crawler-api"]
 
