@@ -25,3 +25,7 @@ type Visitor interface {
 	// Visit is called after a page is fetched.
 	Visit(context.Context, *Page)
 }
+
+type LinkFilter interface {
+	Filter(context.Context, *Page) ([]*url.URL, error)
+}

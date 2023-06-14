@@ -18,7 +18,6 @@ node_modules/
 *.ps
 *.log
 *.txt
-*.http
 
 # Config
 /.vscode

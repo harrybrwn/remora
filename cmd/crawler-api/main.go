@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -99,12 +98,6 @@ func listenAndServe(port int, h http.Handler) error {
 	return err
 }
 
-func hostPrefix(host string) string {
-	hash := fnv.New128()
-	io.WriteString(hash, host)
-	return hex.EncodeToString(hash.Sum(nil)[2:])
-}
-
 func routingKey(host string) string {
 	hash := fnv.New128()
 	io.WriteString(hash, host)
@@ -182,7 +175,7 @@ func (c *connections) Connect(ctx context.Context, conf *cmd.Config) error {
 
 func transport(tp trace.TracerProvider) http.RoundTripper {
 	httpTransport := otelhttp.NewTransport(
-		http.DefaultTransport,
+		web.DefaultTransport,
 		otelhttp.WithSpanOptions(trace.WithSpanKind(trace.SpanKindClient)),
 		otelhttp.WithTracerProvider(tp),
 	)

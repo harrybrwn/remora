@@ -57,6 +57,12 @@ func (set *redisURLSet) Put(ctx context.Context, u *url.URL) error {
 	return set.client.Set(ctx, l.String(), 1, 0).Err()
 }
 
+func (set *redisURLSet) PutTimed(ctx context.Context, u *url.URL, timeout time.Duration) error {
+	var l = *u
+	stripURL(&l)
+	return set.client.Set(ctx, l.String(), 1, timeout).Err()
+}
+
 func (set *redisURLSet) HasMulti(ctx context.Context, urls []*url.URL) []bool {
 	ok := make([]bool, len(urls))
 	keys := urlKeys(urls)

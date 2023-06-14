@@ -22,29 +22,42 @@ func Test(t *testing.T) {
 }
 
 func TestParseCacheControl(t *testing.T) {
+	type CC = CacheControl
 	is := is.New(t)
 	for _, tst := range []struct {
 		s string
-		Control
+		CC
 	}{
+		{"", CC{}},
 		{
 			"max-age=3600, s-max-age=600, public, must-revalidate",
-			Control{
-				Scope:          public,
-				MaxAge:         time.Second * 3600,
-				SharedMaxAge:   time.Second * 600,
-				MustRevalidate: true,
+			CC{
+				Scope:        public,
+				MaxAge:       time.Second * 3600,
+				SharedMaxAge: time.Second * 600,
+				Attrs:        CacheMustRevalidate,
 			},
 		},
+		{
+			"no-store, no-cache, max-age=0, must-revalidate, proxy-revalidate",
+			CC{Attrs: CacheNoStore | CacheNoCache | CacheMustRevalidate | CacheProxyRevalidate},
+		},
+		{"max-age=3", CC{MaxAge: 3 * time.Second}},
+		{"max-age=5, private", CC{MaxAge: 5 * time.Second}},
+		{"private, max-age=6", CC{MaxAge: 6 * time.Second}},
+		{"max-age=3, public", CC{Scope: public, MaxAge: 3 * time.Second}},
+		{"s-age=60, public", CC{Scope: public, SharedMaxAge: time.Minute}},
 	} {
-		ctrl, err := parseCacheControl(tst.s)
+		var ctrl CC
+		err := parseCacheControl(tst.s, &ctrl)
 		is.NoErr(err)
-		is.Equal(ctrl.MaxAge, tst.MaxAge)
-		is.Equal(ctrl.SharedMaxAge, tst.SharedMaxAge)
-		is.Equal(ctrl.Scope, tst.Scope)
-		is.Equal(ctrl.MustRevalidate, tst.MustRevalidate)
-		is.Equal(ctrl.NoTransform, tst.NoTransform)
-		is.Equal(ctrl.OnlyIfCached, tst.OnlyIfCached)
+		is.Equal(ctrl.Attrs, tst.CC.Attrs)
+		is.Equal(ctrl.Attrs&CacheNoStore == CacheNoStore, ctrl.NoStore())
+		is.Equal(ctrl.Attrs&CacheNoCache == CacheNoCache, ctrl.NoCache())
+		is.Equal(ctrl.Attrs&CacheNoTransform == CacheNoTransform, ctrl.NoTransform())
+		is.Equal(ctrl.Attrs&CacheMustRevalidate == CacheMustRevalidate, ctrl.MustRevalidate())
+		is.Equal(ctrl.Attrs&CacheProxyRevalidate == CacheProxyRevalidate, ctrl.ProxyRevalidate())
+		is.Equal(ctrl.Attrs&CacheOnlyIfCached == CacheOnlyIfCached, ctrl.OnlyIfCached())
 	}
 }
 

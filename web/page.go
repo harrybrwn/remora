@@ -24,12 +24,6 @@ import (
 
 //go:generate protoc -I.. -I../protobuf --go_out=paths=source_relative:./webpb --go-grpc_out=paths=source_relative:./webpb page.proto
 
-var (
-	HttpClient = &http.Client{
-		Timeout: time.Minute,
-	}
-)
-
 func NewPage(u *url.URL, depth uint32) *Page {
 	return &Page{
 		URL:   u,

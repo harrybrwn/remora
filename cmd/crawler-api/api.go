@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -38,10 +39,15 @@ type api struct {
 
 func (api *api) ApplyRoutes(r chi.Router) {
 	r.Get("/status", api.status)
-	r.Get("/crawl", api.crawl)
+	r.Put("/crawl", api.crawl)
 	r.Post("/start", api.start)
-	r.Post("/stop", api.stop)
+	r.Post("/stop/{host}", api.stop)
+
+	// New (better) interface
 	r.Post("/config", api.config)
+	r.Patch("/{host}", api.update)
+	r.Patch("/{host}/stop", api.stop)
+	r.Delete("/{host}", api.delete)
 }
 
 func (api *api) Error(ctx context.Context, rw http.ResponseWriter, status int, err error) {
@@ -65,6 +71,21 @@ type crawlerStatus struct {
 	Wait       string `json:"wait"`
 	Uptime     string `json:"uptime,omitempty"`
 	Count      uint64 `json:"count"`
+	MaxDepth   int32  `json:"max_depth"`
+}
+
+func initCrawlerStatus(status *crawlerStatus, crawler *crawler.Crawler) {
+	status.Count = crawler.Count()
+	status.Host = crawler.Host
+	status.RoutingKey = routingKey(crawler.Host)
+	status.Running = crawler.Running()
+	status.Wait = crawler.Wait.String()
+	uptime := time.Since(crawler.StartedAt())
+	if !status.Running {
+		uptime = time.Duration(0)
+	}
+	status.Uptime = uptime.String()
+	status.MaxDepth = crawler.DepthLimit
 }
 
 func (api *api) status(rw http.ResponseWriter, r *http.Request) {
@@ -79,19 +100,10 @@ func (api *api) status(rw http.ResponseWriter, r *http.Request) {
 		m["status"] = "ok"
 	}
 	api.mu.Lock()
-	for host, crawler := range api.crawlers {
-		running := crawler.Running()
-		uptime := time.Since(crawler.StartedAt())
-		if !running {
-			uptime = time.Duration(0)
-		}
-		statuses = append(statuses, crawlerStatus{
-			Host:    host,
-			Running: running,
-			Uptime:  fmt.Sprintf("%v", uptime),
-			Count:   crawler.Count(),
-			Wait:    crawler.Wait.String(),
-		})
+	for _, crawler := range api.crawlers {
+		var status crawlerStatus
+		initCrawlerStatus(&status, crawler)
+		statuses = append(statuses, status)
 	}
 	api.mu.Unlock()
 	m["crawlers"] = statuses
@@ -105,7 +117,7 @@ func (api *api) status(rw http.ResponseWriter, r *http.Request) {
 }
 
 type ControlParams struct {
-	MaxDepth     int      `json:"max_depth"`
+	MaxDepth     int32    `json:"max_depth"`
 	Host         string   `json:"host"`
 	Wait         string   `json:"wait,omitempty"`
 	NopVisitor   bool     `json:"nop_visitor"`
@@ -130,35 +142,114 @@ func (api *api) start(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	crawler, err := api.GetOrCreateCrawler(ctx, params.Host)
+	spider, err := api.GetOrCreateCrawler(ctx, params.Host)
 	if err != nil {
 		api.Error(ctx, rw, http.StatusInternalServerError, err)
 		return
 	}
-	crawler.DepthLimit = params.MaxDepth
-	crawler.Wait = wait
+	if spider.Running() {
+		// api.Error(ctx, rw, http.StatusAccepted, crawler.ErrCrawlerRunning)
+		var status crawlerStatus
+		initCrawlerStatus(&status, spider)
+		sendJSON(rw, http.StatusAccepted, &status)
+		return
+	}
+	spider.DepthLimit = params.MaxDepth
+	spider.Wait = wait
 	if params.NopVisitor {
-		crawler.Visitor = &logVisitor{}
+		spider.Visitor = &logVisitor{}
 	}
 
 	api.logger.Debug("starting crawler")
-	err = crawler.Start(api.ctx)
+	err = spider.Start(api.ctx)
 	if err != nil {
 		api.Error(ctx, rw, http.StatusInternalServerError, err)
 		return
 	}
 
-	api.AddCrawler(params.Host, crawler)
+	api.AddCrawler(params.Host, spider)
 
 	err = sendJSON(rw, 200, map[string]interface{}{
-		"started":     time.Now(),
-		"host":        crawler.Host,
-		"wait":        crawler.Wait.String(),
-		"running":     crawler.Running(),
-		"routing_key": routingKey(crawler.Host),
+		"started":     spider.StartedAt(),
+		"host":        spider.Host,
+		"wait":        spider.Wait.String(),
+		"running":     spider.Running(),
+		"routing_key": routingKey(spider.Host),
 	})
 	if err != nil {
 		api.Error(ctx, rw, 500, err)
+		return
+	}
+}
+
+type updateCrawlerRequest struct {
+	Wait     *string `json:"wait"`
+	MaxDepth *int32  `json:"max_depth"`
+}
+
+func (api *api) update(rw http.ResponseWriter, request *http.Request) {
+	var (
+		ctx  = request.Context()
+		c    = chi.RouteContext(ctx)
+		host = c.URLParams.Values[0]
+		body updateCrawlerRequest
+	)
+	spider, ok := api.GetCrawler(host)
+	if !ok {
+		sendJSON(rw, http.StatusNotFound, map[string]string{})
+		return
+	}
+	err := json.NewDecoder(request.Body).Decode(&body)
+	if err != nil {
+		api.Error(ctx, rw, http.StatusBadRequest, err)
+		return
+	}
+	api.logger.WithFields(logrus.Fields{
+		"max_depth": body.MaxDepth,
+		"wait":      body.Wait,
+	}).Info("updating crawler")
+	if body.MaxDepth != nil {
+		atomic.StoreInt32(&spider.DepthLimit, *body.MaxDepth)
+	}
+	var status crawlerStatus
+	initCrawlerStatus(&status, spider)
+	if body.Wait != nil {
+		wait, err := time.ParseDuration(*body.Wait)
+		if err != nil {
+			api.Error(ctx, rw, http.StatusBadRequest, err)
+			return
+		}
+		crawler.SetWait(wait).Apply(spider)
+		status.Wait = wait.String()
+	}
+	sendJSON(rw, 200, &status)
+}
+
+func (api *api) delete(rw http.ResponseWriter, request *http.Request) {
+	status := http.StatusOK
+	host := chi.URLParam(request, "host")
+	spider, ok := api.GetCrawler(host)
+	if !ok {
+		err := sendJSON(rw, http.StatusNotFound, map[string]string{})
+		if err != nil {
+			api.Error(request.Context(), rw, 500, err)
+			return
+		}
+		return
+	}
+	api.mu.Lock()
+	delete(api.crawlers, host)
+	api.mu.Unlock()
+	err := spider.Stop()
+	if err != nil {
+		api.Error(request.Context(), rw, 500, err)
+		return
+	}
+	var cs crawlerStatus
+	initCrawlerStatus(&cs, spider)
+	err = sendJSON(rw, status, &cs)
+	if err != nil {
+		api.Error(request.Context(), rw, 500, err)
 		return
 	}
 }
@@ -209,12 +300,9 @@ func (api *api) config(rw http.ResponseWriter, request *http.Request) {
 		}
 		api.AddCrawler(conf.Host, cr)
 	response:
-		resp = append(resp, crawlerStatus{
-			Host:       cr.Host,
-			Running:    cr.Running(),
-			RoutingKey: routingKey(cr.Host),
-			Wait:       cr.Wait.String(),
-		})
+		var status crawlerStatus
+		initCrawlerStatus(&status, cr)
+		resp = append(resp, status)
 	}
 
 	err = sendJSON(rw, 200, resp)
@@ -227,17 +315,11 @@ func (api *api) config(rw http.ResponseWriter, request *http.Request) {
 func (api *api) stop(rw http.ResponseWriter, r *http.Request) {
 	var (
 		params ControlParams
-		ctx    = logging.Stash(r.Context(), api.logger)
+		ctx    = r.Context()
+		host   = chi.URLParamFromCtx(ctx, "host")
 	)
-	err := json.NewDecoder(r.Body).Decode(&params)
-	if err != nil {
-		api.Error(ctx, rw, http.StatusBadRequest, err)
-		return
-	}
-	if params.Host == "" {
-		params.Host = r.URL.Query().Get("host")
-	}
-	crawler, found := api.GetCrawler(params.Host)
+	ctx = logging.Stash(ctx, api.logger)
+	crawler, found := api.GetCrawler(host)
 	if !found {
 		api.Error(
 			ctx, rw, http.StatusNotFound,
@@ -252,7 +334,7 @@ func (api *api) stop(rw http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
-	err = crawler.Stop()
+	err := crawler.Stop()
 	if err != nil {
 		api.Error(ctx, rw, 500, err)
 		return
@@ -335,7 +417,7 @@ func (api *api) AddCrawler(host string, c *crawler.Crawler) {
 
 func (api *api) GetOrCreateCrawler(ctx context.Context, host string) (*crawler.Crawler, error) {
 	tracer := api.tp.Tracer("crawler-api")
-	_, span := tracer.Start(ctx, "api.get_crawler", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "api.get_crawler", trace.WithAttributes(
 		attribute.Key("host").String(host),
 	))
 	defer span.End()
@@ -350,12 +432,15 @@ func (api *api) GetOrCreateCrawler(ctx context.Context, host string) (*crawler.C
 }
 
 func (api *api) createCrawler(ctx context.Context, host string) (*crawler.Crawler, error) {
+	set := storage.NewRedisURLSet(api.connections.redis)
 	c := crawler.Crawler{
 		Host:    host,
 		Fetcher: api.fetcher,
 		Logger:  api.logger,
 		Tracer:  api.tp.Tracer("crawler-api.crawler"),
 		Visitor: api.visitor,
+		URLSet:  set,
+		Filter:  &crawler.URLSetLinkFilter{URLSet: set},
 	}
 	return &c, api.initialize(ctx, &c)
 }
@@ -375,7 +460,6 @@ func (api *api) initialize(ctx context.Context, c *crawler.Crawler) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create consumer")
 	}
-	c.URLSet = storage.NewRedisURLSet(api.connections.redis)
 	c.RobotsCtrl, err = web.NewRobotCtrl(ctx, c.Host, []string{"*", web.UserAgent})
 	if err != nil {
 		return errors.Wrap(err, "failed to fetch robots.txt")

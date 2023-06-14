@@ -17,24 +17,22 @@ type Cache interface {
 	Del(string) error
 }
 
-type CacheTransport struct {
+type CachingTransport struct {
 	Transport http.RoundTripper
 	Cache     Cache
 }
 
-func (ct *CacheTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+func (ct *CachingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	var (
 		cancache bool
-		key      = fmt.Sprintf("%s.%s", r.Method, r.URL.String())
+		// TODO is this really the right move?
+		key = fmt.Sprintf("%s.%s", r.Method, r.URL.String())
 	)
 	switch r.Method {
 	case "GET", "HEAD":
 		cancache = true
 	default:
 		cancache = false
-	}
-	if ct.Transport == nil {
-		ct.Transport = http.DefaultTransport
 	}
 	if !cancache {
 		ct.Cache.Del(key)
@@ -55,15 +53,15 @@ func (ct *CacheTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if pragma == "no-cache" || cacheControl == "" {
 		return resp, err
 	}
-	ctrl, err := parseCacheControl(cacheControl)
+	var ctrl CacheControl
+	err = parseCacheControl(cacheControl, &ctrl)
 	if err != nil {
 		return resp, nil
 	}
 
-	if ctrl.NoCache || ctrl.NoStore {
+	if ctrl.NoCache() || ctrl.NoStore() {
 		return resp, nil
 	}
-
 	b, err := dumpResponse(resp)
 	if err != nil {
 		return resp, err
@@ -85,31 +83,62 @@ func getResponse(c Cache, r *http.Request, key string) (*http.Response, error) {
 	return resp, nil
 }
 
-type scope int
+type CacheControl struct {
+	Scope scope // public or private
+	// Attrs is a bit field containing no-store, no-cache, no-transform, must-revalidate, proxy-revalidate, and only-if-cached
+	Attrs        CacheAttr
+	MaxAge       time.Duration // max-age
+	SharedMaxAge time.Duration // s-max-age
+}
+
+func (ctrl *CacheControl) Init(r *http.Response) error {
+	cacheControl := r.Header.Get("Cache-Control")
+	return parseCacheControl(cacheControl, ctrl)
+}
+
+func (ctrl *CacheControl) NoStore() bool     { return ctrl.Attrs&CacheNoStore == CacheNoStore }
+func (ctrl *CacheControl) NoCache() bool     { return ctrl.Attrs&CacheNoCache == CacheNoCache }
+func (ctrl *CacheControl) NoTransform() bool { return ctrl.Attrs&CacheNoTransform == CacheNoTransform }
+func (ctrl *CacheControl) MustRevalidate() bool {
+	return ctrl.Attrs&CacheMustRevalidate == CacheMustRevalidate
+}
+func (ctrl *CacheControl) ProxyRevalidate() bool {
+	return ctrl.Attrs&CacheProxyRevalidate == CacheProxyRevalidate
+}
+func (ctrl *CacheControl) OnlyIfCached() bool {
+	return ctrl.Attrs&CacheOnlyIfCached == CacheOnlyIfCached
+}
+
+type scope uint8
 
 const (
 	private scope = iota
 	public
 )
 
-type Control struct {
-	Scope           scope // public or private
-	NoStore         bool  // no-store
-	NoCache         bool  // no-cache
-	NoTransform     bool
-	MustRevalidate  bool // must-revalidate
-	ProxyRevalidate bool // proxy-revalidate
-	OnlyIfCached    bool
-	MaxAge          time.Duration // max-age
-	SharedMaxAge    time.Duration // s-max-age
-}
+const (
+	ScopePrivate = private
+	ScopePublic  = public
+)
 
-func parseCacheControl(s string) (*Control, error) {
+type CacheAttr uint8
+
+const (
+	CacheNoStore CacheAttr = 1 << iota
+	CacheNoCache
+	CacheNoTransform
+	CacheMustRevalidate
+	CacheProxyRevalidate
+	CacheOnlyIfCached
+	// CacheNil represents the absence of cache attributes.
+	CacheNil CacheAttr = 0
+)
+
+func parseCacheControl(s string, ctrl *CacheControl) error {
 	var (
-		ctrl Control
-		b    strings.Builder
-		err  error
-		l    = len(s)
+		b   strings.Builder
+		err error
+		l   = len(s)
 	)
 	for i := 0; i < l; {
 		if s[i] == ' ' || s[i] == '\t' || s[i] == '\n' {
@@ -121,7 +150,7 @@ func parseCacheControl(s string) (*Control, error) {
 		}
 		err = b.WriteByte(s[i])
 		if err != nil {
-			return nil, err
+			return err
 		}
 		i++
 		if i == l {
@@ -138,32 +167,32 @@ func parseCacheControl(s string) (*Control, error) {
 		case "private":
 			ctrl.Scope = private
 		case "no-store":
-			ctrl.NoStore = true
+			ctrl.Attrs |= CacheNoStore
 		case "no-cache":
-			ctrl.NoCache = true
+			ctrl.Attrs |= CacheNoCache
 		case "no-transform":
-			ctrl.NoTransform = true
+			ctrl.Attrs |= CacheNoTransform
 		case "must-revalidate":
-			ctrl.MustRevalidate = true
+			ctrl.Attrs |= CacheMustRevalidate
 		case "proxy-revalidate":
-			ctrl.ProxyRevalidate = true
+			ctrl.Attrs |= CacheProxyRevalidate
 		case "only-if-cached":
-			ctrl.OnlyIfCached = true
+			ctrl.Attrs |= CacheOnlyIfCached
 		case "max-age":
 			n, err := strconv.ParseInt(parts[1], 10, 32)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			ctrl.MaxAge = time.Second * time.Duration(n)
 		case "s-max-age", "s-maxage":
 			n, err := strconv.ParseInt(parts[1], 10, 32)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			ctrl.SharedMaxAge = time.Second * time.Duration(n)
 		}
 	}
-	return &ctrl, nil
+	return nil
 }
 
 // Taken from httputil.DumpResponse

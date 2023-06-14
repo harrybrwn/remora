@@ -20,7 +20,7 @@ RUN go generate ./web && \
         -trimpath              \
         -ldflags "-w -s \
             -X 'github.com/harrybrwn/remora/cmd.date=$(date -R)' \
-            -X 'github.com/harrybrwn/remora/cmd.version=docker-build' \
+            -X 'github.com/harrybrwn/remora/cmd.version=dev' \
             -X 'github.com/harrybrwn/remora/cmd.sourcehash=$(./scripts/sourcehash.sh -e './cmd/deploy/*')' \
             -X 'github.com/harrybrwn/remora/cmd.commit=$(git rev-parse HEAD)'" \
         ./cmd/remora
@@ -31,7 +31,7 @@ RUN CGO_ENABLED=0 go build     \
         -trimpath              \
         -ldflags "-w -s \
             -X 'github.com/harrybrwn/remora/cmd.date=$(date -R)' \
-            -X 'github.com/harrybrwn/remora/cmd.version=docker-build' \
+            -X 'github.com/harrybrwn/remora/cmd.version=dev' \
             -X 'github.com/harrybrwn/remora/cmd.sourcehash=$(./scripts/sourcehash.sh -e './cmd/deploy/*')' \
             -X 'github.com/harrybrwn/remora/cmd.commit=$(git rev-parse HEAD)'" \
         ./cmd/api
@@ -42,7 +42,7 @@ RUN CGO_ENABLED=0 go build      \
         -trimpath               \
         -ldflags "-w -s \
             -X 'github.com/harrybrwn/remora/cmd.date=$(date -R)' \
-            -X 'github.com/harrybrwn/remora/cmd.version=docker-build' \
+            -X 'github.com/harrybrwn/remora/cmd.version=dev' \
             -X 'github.com/harrybrwn/remora/cmd.sourcehash=$(./scripts/sourcehash.sh -e './cmd/deploy/*')' \
             -X 'github.com/harrybrwn/remora/cmd.commit=$(git rev-parse HEAD)'" \
         ./cmd/crawler-api

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/xml"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -16,7 +17,32 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/html"
+	"golang.org/x/net/http2"
 )
+
+var (
+	DefaultTransport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	HttpClient = &http.Client{
+		Timeout:   time.Minute,
+		Transport: DefaultTransport,
+	}
+)
+
+func init() {
+	http.DefaultTransport = DefaultTransport
+	http2.ConfigureTransport(DefaultTransport)
+}
 
 var log = logrus.StandardLogger()
 
@@ -61,14 +87,14 @@ func (pf *pageFetcher) Fetch(ctx context.Context, req *PageRequest) (*Page, erro
 	}
 	p := NewPage(u, req.Depth)
 	request := (&http.Request{
-		Method:     "GET",
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Host:       u.Host,
-		URL:        u,
-		Body:       http.NoBody,
-		GetBody:    defaultGetBody,
+		Method: "GET",
+		// Proto:      "HTTP/1.1",
+		// ProtoMajor: 1,
+		// ProtoMinor: 1,
+		Host:    u.Host,
+		URL:     u,
+		Body:    http.NoBody,
+		GetBody: defaultGetBody,
 		Header: http.Header{
 			"User-Agent": {pf.agent},
 		},

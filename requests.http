@@ -1,0 +1,11 @@
+@base = http://localhost:3010
+
+###
+
+GET {{base}}/status
+
+###
+
+GET {{base}}/crawl?url=https://en.wikipedia.org/wiki/Main_Page
+
+###

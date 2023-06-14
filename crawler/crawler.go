@@ -2,7 +2,10 @@ package crawler
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -34,9 +37,10 @@ type Crawler struct {
 	Consumer   event.Consumer
 	Visitor    web.Visitor
 	Publisher  LinkPublisher
+	Filter     web.LinkFilter
 	// Optional
 	Wait       time.Duration // defaults to 5 seconds
-	DepthLimit int           // DepthLimit of zero means limit is not enforced
+	DepthLimit int32         // DepthLimit of zero means limit is not enforced
 	Logger     interface {
 		logrus.FieldLogger
 		logrus.Ext1FieldLogger
@@ -78,6 +82,9 @@ func (c *Crawler) init() (err error) {
 	}
 	if c.Consumer == nil {
 		return errors.New("no consumer")
+	}
+	if c.Filter == nil {
+		c.Filter = &URLSetLinkFilter{c.URLSet}
 	}
 	if c.Wait == 0 {
 		c.Wait = time.Second * 5
@@ -176,7 +183,7 @@ func (c *Crawler) loop(ctx context.Context) {
 			c.Wait = d
 		case tm := <-c.next:
 			if tm > time.Nanosecond {
-				c.Logger.Tracef("sleeping for %s", tm)
+				// c.Logger.Tracef("sleeping for %s", tm)
 				time.Sleep(tm)
 			}
 			go fn()
@@ -192,6 +199,7 @@ const (
 	KeyPageRequestDepth  = attribute.Key("page_request.depth")
 	KeyPageRequestKey    = attribute.Key("page_request.key")
 	KeyLink              = attribute.Key("link")
+	KeyDuration          = attribute.Key("duration")
 
 	EventInRobotsTXT      = "Found in robots.txt"
 	EventInURLSet         = "URL found in urlset"
@@ -204,6 +212,7 @@ type loopControl uint8
 const (
 	ctrlWait loopControl = iota
 	ctrlGo
+	ctrlSent
 )
 
 // recv is the message receive and decode stage. It should only ever return an error
@@ -227,7 +236,7 @@ func (c *Crawler) recv(ctx context.Context) error {
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(
 				KeyCrawlerHost.String(c.Host),
-				KeyCrawlerDepthLimit.Int(c.DepthLimit),
+				KeyCrawlerDepthLimit.Int(int(c.DepthLimit)),
 				KeyCrawlerWait.String(c.Wait.String()),
 			),
 		)
@@ -240,7 +249,6 @@ func (c *Crawler) recv(ctx context.Context) error {
 		err := proto.Unmarshal(msg.Body, &req)
 		if err != nil {
 			c.Logger.WithError(err).Warn("could not unmarshal page request")
-			span.AddEvent("Could not unmarshal page request")
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			span.End()
@@ -251,17 +259,22 @@ func (c *Crawler) recv(ctx context.Context) error {
 			KeyPageRequestDepth.Int(int(req.Depth)),
 			KeyPageRequestKey.String(req.HexKey()),
 		)
+		defer span.End()
 		var action loopControl
 		start := time.Now()
 		action, err = c.handle(ctx, &req)
 		if err != nil {
+			c.Logger.WithError(err).Warn("could not unmarshal page request")
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
-			span.End()
 			return err
 		}
+		span.SetStatus(codes.Ok, "message handled")
 		var wait time.Duration
 		switch action {
+		case ctrlSent:
+			// already sent requested the next url
+			return nil
 		case ctrlWait:
 			wait = c.Wait - time.Since(start)
 			if wait < 0 {
@@ -270,9 +283,8 @@ func (c *Crawler) recv(ctx context.Context) error {
 		case ctrlGo:
 			wait = time.Nanosecond
 		}
-		span.AddEvent("wait", trace.WithAttributes(attribute.Key("time").String(wait.String())))
-		c.next <- time.Nanosecond
-		span.End()
+		span.AddEvent("wait", trace.WithAttributes(KeyDuration.String(wait.String())))
+		go func() { c.next <- wait }()
 		return nil
 	}
 }
@@ -280,8 +292,9 @@ func (c *Crawler) recv(ctx context.Context) error {
 func (c *Crawler) handle(ctx context.Context, req *web.PageRequest) (loopControl, error) {
 	span := trace.SpanFromContext(ctx)
 	logger := c.Logger.WithFields(logrus.Fields{
-		"url":   req.URL,
-		"depth": req.Depth,
+		"url":      req.URL,
+		"depth":    req.Depth,
+		"trace_id": span.SpanContext().TraceID(),
 	})
 	logger.Debug("handling page request")
 
@@ -289,6 +302,7 @@ func (c *Crawler) handle(ctx context.Context, req *web.PageRequest) (loopControl
 	if err != nil {
 		logger.WithError(err).Warn("could not parse url")
 		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return ctrlGo, nil // continue to next request
 	}
 	if c.shouldSkip(ctx, u) {
@@ -298,12 +312,24 @@ func (c *Crawler) handle(ctx context.Context, req *web.PageRequest) (loopControl
 		return ctrlGo, nil // continue to next request
 	}
 
-	page, err := c.Fetcher.Fetch(ctx, req)
+	action := ctrlWait
+	page, sent, err := c.fetch(ctx, req, c.Wait)
+	if sent {
+		action = ctrlSent
+	}
 	if err != nil {
 		logger.WithError(err).Warn("failed to fetch page")
 		span.RecordError(err, trace.WithAttributes(KeyLink.String(req.URL)))
 		span.SetStatus(codes.Error, err.Error())
-		return ctrlWait, nil // continue to next request
+		return action, nil // continue to next request
+	}
+	if page.Response != nil {
+		span.AddEvent("response", trace.WithAttributes(
+			attribute.String("status", page.Response.Status),
+			attribute.Int("status_code", page.Response.StatusCode),
+			attribute.StringSlice("headers", headerSlice(page.Response.Header)),
+			attribute.String("http.version", page.Response.Proto),
+		))
 	}
 
 	// If the page was reached through a redirect, then we want to check if
@@ -315,19 +341,24 @@ func (c *Crawler) handle(ctx context.Context, req *web.PageRequest) (loopControl
 		span.AddEvent(EventRedirected)
 		c.markVisited(ctx, span, logger, page.RedirectedFrom)
 		if c.shouldSkip(ctx, page.URL) {
-			return ctrlWait, nil
+			return action, nil
 		}
 		if c.inURLSet(ctx, page.URL) {
-			return ctrlWait, nil
+			return action, nil
 		}
 	}
 
 	// copy the page data that we still need to prevent data races with visitor
-	var (
-		pageurl = *page.URL
-		links   = c.filterURLs(ctx, span, &pageurl, page.Links)
-	)
-	logger = logger.WithField("page_url", pageurl.String())
+	// links := c.filterURLs(ctx, span, page)
+	links, err := c.Filter.Filter(ctx, page)
+	if err != nil {
+		logger.WithError(err).Warn("failed to fetch page")
+		span.RecordError(err, trace.WithAttributes(KeyLink.String(req.URL)))
+		span.SetStatus(codes.Error, err.Error())
+		return action, nil
+	}
+	pageurl := *page.URL
+	logger = logger.WithField("page_url", page.URL.String())
 
 	// Yeet it over the fence
 	go c.Visitor.Visit(ctx, page)
@@ -335,14 +366,41 @@ func (c *Crawler) handle(ctx context.Context, req *web.PageRequest) (loopControl
 	c.markVisited(ctx, span, logger, &pageurl)
 	// Check depth limit and skip publishing new links if limit reached
 	if c.DepthLimit > 0 && page.Depth >= uint32(c.DepthLimit) {
-		return ctrlWait, nil
+		return action, nil
 	}
 	err = c.Publisher.Publish(logging.Stash(ctx, c.Logger), page.Depth, links)
 	if err != nil {
 		logger.WithError(err).Error("could not publish links")
 		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 	}
-	return ctrlWait, nil
+	return action, nil
+}
+
+func (c *Crawler) fetch(ctx context.Context, req *web.PageRequest, duration time.Duration) (*web.Page, bool, error) {
+	type result struct {
+		page *web.Page
+		err  error
+	}
+	timer := time.NewTimer(duration)
+	results := make(chan *result)
+	defer func() {
+		timer.Stop()
+		close(results)
+	}()
+	go func() {
+		p, err := c.Fetcher.Fetch(ctx, req)
+		results <- &result{page: p, err: err}
+	}()
+	select {
+	case <-timer.C:
+		// Tell the main loop to get the next url
+		go func() { c.next <- time.Nanosecond }()
+		res := <-results // we still need to wait for the current fetch
+		return res.page, true, res.err
+	case res := <-results:
+		return res.page, false, res.err
+	}
 }
 
 func (c *Crawler) markVisited(ctx context.Context, span trace.Span, logger logrus.FieldLogger, u *url.URL) {
@@ -351,27 +409,6 @@ func (c *Crawler) markVisited(ctx context.Context, span trace.Span, logger logru
 		logger.WithError(err).Warn("could not store page_url in urlset")
 		span.RecordError(err)
 	}
-}
-
-func (c *Crawler) filterURLs(ctx context.Context, span trace.Span, source *url.URL, links []*url.URL) []*url.URL {
-	var (
-		results      = make([]*url.URL, 0, len(links))
-		visited      = c.URLSet.HasMulti(ctx, links)
-		visitedNames = make([]attribute.KeyValue, 0, len(links)/2)
-	)
-	for i, l := range links {
-		if visited[i] {
-			visitedNames = append(visitedNames, attribute.Key("kind").String(l.String()))
-			continue
-		}
-		if !urlEq(source, l) {
-			results = append(results, l)
-		}
-	}
-	if len(visitedNames) > 0 {
-		span.AddEvent("already_visited", trace.WithAttributes(visitedNames...))
-	}
-	return results
 }
 
 func (c *Crawler) shouldSkip(ctx context.Context, u *url.URL) bool {
@@ -419,4 +456,12 @@ func (tf *timeoutFetcher) Fetch(
 
 func urlEq(a, b *url.URL) bool {
 	return a.Host == b.Host && a.Scheme == b.Scheme && a.Path == b.Path && a.RawQuery == b.RawQuery
+}
+
+func headerSlice(h http.Header) []string {
+	res := make([]string, 0, len(h))
+	for k, v := range h {
+		res = append(res, fmt.Sprintf("%s: %s", k, strings.Join(v, ",")))
+	}
+	return res
 }

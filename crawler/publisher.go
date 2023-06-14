@@ -8,6 +8,7 @@ import (
 	"github.com/harrybrwn/remora/event"
 	"github.com/harrybrwn/remora/frontier"
 	"github.com/harrybrwn/remora/internal/logging"
+	"github.com/harrybrwn/remora/storage"
 	"github.com/harrybrwn/remora/web"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
@@ -89,4 +90,31 @@ func (pp *PagePublisher) Publish(ctx context.Context, depth uint32, links []*url
 		}
 	}
 	return nil
+}
+
+type URLSetLinkFilter struct {
+	URLSet storage.URLSet
+}
+
+func (lf *URLSetLinkFilter) Filter(ctx context.Context, page *web.Page) ([]*url.URL, error) {
+	var (
+		results      = make([]*url.URL, 0, len(page.Links))
+		visited      = lf.URLSet.HasMulti(ctx, page.Links)
+		visitedNames = make([]attribute.KeyValue, 0, len(page.Links)/2)
+	)
+	for i, l := range page.Links {
+		if visited[i] {
+			visitedNames = append(visitedNames, attribute.Key("kind").String(l.String()))
+			continue
+		}
+		if !urlEq(page.URL, l) {
+			results = append(results, l)
+		}
+		// TODO if was redirected, filter out the redirected from URLs
+	}
+	span := trace.SpanFromContext(ctx)
+	if len(visitedNames) > 0 && span != nil {
+		span.AddEvent("already_visited", trace.WithAttributes(visitedNames...))
+	}
+	return results, nil
 }
