@@ -9,6 +9,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const MaxKeySize = 65000
+
 type Wrapper interface {
 	Wrap(ctx context.Context, name string, fn RegionFn)
 }
@@ -31,7 +33,7 @@ type RegionFn func(ctx context.Context) ([]attribute.KeyValue, error)
 
 func (s *Region) Wrap(ctx context.Context, name string, fn RegionFn) {
 	opts := []trace.SpanStartOption{
-		trace.WithAttributes(s.attrs...),
+		trace.WithAttributes(prepAttrs(s.attrs)...),
 	}
 	if s.parent != nil {
 		// Link to parent
@@ -49,7 +51,7 @@ func (s *Region) Wrap(ctx context.Context, name string, fn RegionFn) {
 		span.SetStatus(codes.Error, err.Error())
 	} else {
 		if len(attrs) > 0 {
-			span.SetAttributes(attrs...)
+			span.SetAttributes(prepAttrs(attrs)...)
 		}
 		span.SetStatus(codes.Ok, fmt.Sprintf("%q succeeded", name))
 	}
@@ -58,13 +60,13 @@ func (s *Region) Wrap(ctx context.Context, name string, fn RegionFn) {
 func (s *Region) WithParent(span trace.Span, attrs ...attribute.KeyValue) *Region {
 	cp := s.Copy()
 	cp.parent = span
-	cp.parentAttrs = attrs
+	cp.parentAttrs = prepAttrs(attrs)
 	return s
 }
 
 func (s *Region) Attr(attrs ...attribute.KeyValue) *Region {
 	cp := s.Copy()
-	cp.attrs = append(cp.attrs, attrs...)
+	cp.attrs = append(cp.attrs, prepAttrs(attrs)...)
 	return cp
 }
 
@@ -72,10 +74,23 @@ func (s *Region) Copy() *Region {
 	cp := Region{
 		tracer:      s.tracer,
 		parent:      s.parent,
-		attrs:       make([]attribute.KeyValue, len(s.attrs)),
-		parentAttrs: make([]attribute.KeyValue, len(s.parentAttrs)),
+		attrs:       prepAttrs(s.attrs),
+		parentAttrs: prepAttrs(s.parentAttrs),
 	}
-	copy(cp.attrs, s.attrs)
-	copy(cp.parentAttrs, s.parentAttrs)
 	return &cp
+}
+
+func prepAttrs(attrs []attribute.KeyValue) []attribute.KeyValue {
+	res := make([]attribute.KeyValue, 0, len(attrs))
+	for _, attr := range attrs {
+		switch attr.Value.Type() {
+		case attribute.STRING:
+			v := attr.Value.AsString()
+			if len(v) > MaxKeySize {
+				attr = attr.Key.String(v[:MaxKeySize-1])
+			}
+		}
+		res = append(res, attr)
+	}
+	return res
 }

@@ -64,7 +64,14 @@ func main() {
 			web.WithTransport(transport(tracing.Default())),
 		)
 	)
-	ctx, cancel := chromedp.NewContext(context.Background())
+	ctx, cancel := chromedp.NewExecAllocator(ctx, append(
+		chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Headless,
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.NoFirstRun,
+	)...)
+	defer cancel()
+	ctx, cancel = chromedp.NewContext(ctx)
 	defer cancel()
 	conf.DB.Logger = log
 	if err = conns.Connect(ctx, &conf.Config); err != nil {

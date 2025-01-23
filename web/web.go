@@ -87,10 +87,7 @@ func (pf *pageFetcher) Fetch(ctx context.Context, req *PageRequest) (*Page, erro
 	}
 	p := NewPage(u, req.Depth)
 	request := (&http.Request{
-		Method: "GET",
-		// Proto:      "HTTP/1.1",
-		// ProtoMajor: 1,
-		// ProtoMinor: 1,
+		Method:  "GET",
 		Host:    u.Host,
 		URL:     u,
 		Body:    http.NoBody,

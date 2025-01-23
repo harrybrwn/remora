@@ -7,6 +7,7 @@ GET {{base}}/status
 ###
 
 POST {{base}}/config
+Content-Type: application/json
 
 [
 	{
@@ -45,7 +46,7 @@ PATCH {{base}}/goodreads.com
 
 PATCH {{base}}/www.goodreads.com
 
-{"wait": "2s", "max_depth": 3}
+{"wait": "2s", "max_depth": 2}
 
 ###
 
@@ -53,7 +54,7 @@ PUT {{base}}/crawl?url=https://goodreads.com/book/show/1885.Pride_and_Prejudice
 
 ###
 
-PUT {{base}}/crawl?url=https://goodreads.com/book/show/325785.Capital
+PUT {{base}}/crawl?url=https://www.goodreads.com/book/show/325785.Capital
 
 ###
 

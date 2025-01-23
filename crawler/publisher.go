@@ -97,11 +97,12 @@ type URLSetLinkFilter struct {
 }
 
 func (lf *URLSetLinkFilter) Filter(ctx context.Context, page *web.Page) ([]*url.URL, error) {
-	var (
-		results      = make([]*url.URL, 0, len(page.Links))
-		visited      = lf.URLSet.HasMulti(ctx, page.Links)
-		visitedNames = make([]attribute.KeyValue, 0, len(page.Links)/2)
-	)
+	if len(page.Links) == 0 {
+		return []*url.URL{}, nil
+	}
+	results := make([]*url.URL, 0, len(page.Links))
+	visitedNames := make([]attribute.KeyValue, 0, len(page.Links)/2)
+	visited := lf.URLSet.HasMulti(ctx, page.Links)
 	for i, l := range page.Links {
 		if visited[i] {
 			visitedNames = append(visitedNames, attribute.Key("kind").String(l.String()))

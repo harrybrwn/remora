@@ -1,0 +1,29 @@
+@base = http://localhost:3010
+
+###
+
+GET {{base}}/status
+
+###
+
+POST {{base}}/config
+Content-Type: application/json
+
+[
+	{
+		"host": "en.wikipedia.org",
+		"max_depth": 2,
+		"wait": "3s",
+		"nop_visitor": false
+	}
+]
+
+###
+
+PUT {{base}}/crawl?url=https://en.wikipedia.org/wiki/Main_Page
+
+###
+
+PUT {{base}}/crawl?url=https://en.wikipedia.org/wiki/Merkle_tree
+
+###

@@ -170,8 +170,14 @@ type db struct {
 var _ DB = (*db)(nil)
 
 func (db *db) QueryContext(ctx context.Context, query string, v ...interface{}) (rs Rows, err error) {
+	var loggedQuery string
+	if len(query) > region.MaxKeySize {
+		loggedQuery = query[:region.MaxKeySize-1]
+	} else {
+		loggedQuery = query
+	}
 	db.region.
-		Attr(dbQuery.String(query)).
+		Attr(dbQuery.String(loggedQuery)).
 		Wrap(
 			ctx, "query",
 			func(ctx context.Context) ([]attribute.KeyValue, error) {
@@ -183,8 +189,14 @@ func (db *db) QueryContext(ctx context.Context, query string, v ...interface{}) 
 }
 
 func (db *db) ExecContext(ctx context.Context, query string, v ...interface{}) (res sql.Result, err error) {
+	var loggedQuery string
+	if len(query) > region.MaxKeySize {
+		loggedQuery = query[:region.MaxKeySize-1]
+	} else {
+		loggedQuery = query
+	}
 	db.region.
-		Attr(dbQuery.String(query)).
+		Attr(dbQuery.String(loggedQuery)).
 		Wrap(ctx, "exec", func(ctx context.Context) ([]attribute.KeyValue, error) {
 			res, err = db.DB.ExecContext(ctx, query, v...)
 			return nil, err
@@ -239,8 +251,14 @@ func (tx *tx) end(e error) error {
 }
 
 func (tx *tx) QueryContext(ctx context.Context, query string, v ...interface{}) (rs Rows, err error) {
+	var loggedQuery string
+	if len(query) > region.MaxKeySize {
+		loggedQuery = query[:region.MaxKeySize-1]
+	} else {
+		loggedQuery = query
+	}
 	tx.region.
-		Attr(dbQuery.String(query)).
+		Attr(dbQuery.String(loggedQuery)).
 		Wrap(ctx, "query", func(ctx context.Context) ([]attribute.KeyValue, error) {
 			rs, err = tx.tx.QueryContext(ctx, query, v...)
 			return nil, err
@@ -249,8 +267,14 @@ func (tx *tx) QueryContext(ctx context.Context, query string, v ...interface{}) 
 }
 
 func (tx *tx) ExecContext(ctx context.Context, query string, v ...interface{}) (res sql.Result, err error) {
+	var loggedQuery string
+	if len(query) > region.MaxKeySize {
+		loggedQuery = query[:region.MaxKeySize-1]
+	} else {
+		loggedQuery = query
+	}
 	tx.region.
-		Attr(dbQuery.String(query)).
+		Attr(dbQuery.String(loggedQuery)).
 		Wrap(ctx, "query", func(ctx context.Context) ([]attribute.KeyValue, error) {
 			res, err = tx.tx.ExecContext(ctx, query, v...)
 			return nil, err
