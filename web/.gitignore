@@ -1,0 +1,3 @@
+# Ignore generated code
+mockweb_test.go
+webpb/

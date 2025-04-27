@@ -26,6 +26,7 @@ import (
 	"github.com/harrybrwn/remora/internal/tracing"
 	"github.com/harrybrwn/remora/internal/visitor"
 	"github.com/harrybrwn/remora/web"
+	"github.com/harrybrwn/x/sqlite"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
@@ -67,7 +68,7 @@ func main() {
 	ctx, cancel := chromedp.NewExecAllocator(ctx, append(
 		chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Headless,
-		chromedp.NoDefaultBrowserCheck,
+		// chromedp.NoDefaultBrowserCheck,
 		chromedp.NoFirstRun,
 	)...)
 	defer cancel()
@@ -148,7 +149,14 @@ func (c *connections) Connect(ctx context.Context, conf *cmd.Config) error {
 		},
 		func() (string, error) {
 			var err error
-			c.db, err = db.NewWithTimeout(ctx, time.Second*30, &conf.DB)
+			if len(conf.DB.Path) > 0 {
+				c.db, err = sqlite.File(
+					conf.DB.Path,
+					sqlite.JournalMode("WAL"),
+				)
+			} else {
+				c.db, err = db.NewWithTimeout(ctx, time.Second*30, &conf.DB)
+			}
 			// c.db, err = db.New(&conf.DB)
 			return "database", err
 		},

@@ -2,10 +2,20 @@ package db
 
 import (
 	"bytes"
+	_ "embed"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+)
+
+var (
+	//go:embed postgres/init.sql
+	Schema string
+	//go:embed postgres/views.sql
+	Views string
+	//go:embed postgres/settings.sql
+	Settings string
 )
 
 func ServiceFileExists() {

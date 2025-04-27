@@ -71,7 +71,7 @@ func NewCLIRoot() *cobra.Command {
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			// Parse the loglevel before reading the config file
 			var (
-				lvl logrus.Level = logrus.DebugLevel
+				lvl = logrus.DebugLevel
 				err error
 			)
 			level := conf.LogLevel

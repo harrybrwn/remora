@@ -48,12 +48,13 @@ func (api *api) ApplyRoutes(r chi.Router) {
 	r.Patch("/{host}", api.update)
 	r.Patch("/{host}/stop", api.stop)
 	r.Delete("/{host}", api.delete)
+	r.Post("/{host}/step", api.step)
 }
 
 func (api *api) Error(ctx context.Context, rw http.ResponseWriter, status int, err error) {
 	StashError(ctx, err)
 	api.logger.WithError(err).Error("error")
-	b, err := json.Marshal(map[string]interface{}{
+	b, err := json.Marshal(map[string]any{
 		"error": err.Error(),
 	})
 	if err != nil {
@@ -252,6 +253,21 @@ func (api *api) delete(rw http.ResponseWriter, request *http.Request) {
 		api.Error(request.Context(), rw, 500, err)
 		return
 	}
+}
+
+func (api *api) step(rw http.ResponseWriter, req *http.Request) {
+	host := chi.URLParam(req, "host")
+	spider, ok := api.GetCrawler(host)
+	if !ok {
+		err := sendJSON(rw, http.StatusNotFound, map[string]string{})
+		if err != nil {
+			api.Error(req.Context(), rw, 500, err)
+			return
+		}
+		return
+	}
+	_ = spider
+	rw.WriteHeader(http.StatusNotImplemented)
 }
 
 func (api *api) config(rw http.ResponseWriter, request *http.Request) {

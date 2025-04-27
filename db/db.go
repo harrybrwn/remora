@@ -26,6 +26,7 @@ type Config struct {
 	Password string `yaml:"password" config:"password" env:"POSTGRES_PASSWORD"`
 	Name     string `yaml:"name" config:"name" env:"POSTGRES_DB"`
 	SSL      string `yaml:"ssl" config:"ssl" default:"disable"`
+	Path     string `yaml:"path" config:"path"`
 
 	Logger logrus.FieldLogger `yaml:"-" json:"-"`
 }

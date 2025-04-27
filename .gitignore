@@ -48,7 +48,7 @@ test.sh
 remora.sh
 upload.sh
 db/cron/*.sh
-
+db/*.sh
 
 # Database
 /db/data
