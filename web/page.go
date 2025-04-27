@@ -22,7 +22,7 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
-//go:generate protoc -I.. -I../protobuf --go_out=paths=source_relative:./webpb --go-grpc_out=paths=source_relative:./webpb page.proto
+//go:generate sh generate.sh
 
 func NewPage(u *url.URL, depth uint32) *Page {
 	return &Page{

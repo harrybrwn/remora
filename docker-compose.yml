@@ -1,9 +1,7 @@
-version: "3.8"
-
 services:
 
   db:
-    image: postgres:15
+    image: postgres:17
     shm_size: 2Gb
     command:
       - 'postgres'
@@ -29,7 +27,7 @@ services:
     volumes:
       - rabbitmq:/var/lib/rabbitmq/mnesia
 
-  visited:
+  redis:
     image: redis:6.2-alpine
     ports:
       - 6379:6379
@@ -66,12 +64,26 @@ services:
     build:
       context: .
       target: crawler-api
+      args:
+        GO_VERSION: '1.24.1'
+        ALPINE_VERSION: '3.20'
     command: ["-port", "3010"]
     volumes:
       - ./config/config.yml:/var/local/remora/config.yml:ro
     ports:
       - "3010:3010"
     restart: on-failure
+
+  remora:
+    image: remora:latest
+    build:
+      context: .
+      target: remora
+      args:
+        GO_VERSION: '1.24.1'
+        ALPINE_VERSION: '3.20'
+    volumes:
+      - ./config/config.yml:/var/local/remora/config.yml:ro
 
   # graph-api:
   #   image: remora-api:latest
@@ -88,17 +100,17 @@ services:
   #     - "8080:8080"
   #   restart: unless-stopped
 
-  #crawler:
-  #  image: remora:latest
-  #  build:
-  #    dockerfile: ./Dockerfile
-  #    context: .
-  #    target: remora
-  #  network_mode: host
-  #  command: ["spider", "en.wikipedia.org"]
-  #  # Volume is overridden in prod
-  #  volumes:
-  #    - ./config/config.yml:/var/local/remora/config.yml:ro
+  # crawler:
+  #   image: remora:latest
+  #   build:
+  #     dockerfile: ./Dockerfile
+  #     context: .
+  #     target: remora
+  #   network_mode: host
+  #   command: ["spider", "en.wikipedia.org"]
+  #   # Volume is overridden in prod
+  #   volumes:
+  #     - ./config/config.yml:/var/local/remora/config.yml:ro
 
 volumes:
   postgres:

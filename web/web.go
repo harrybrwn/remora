@@ -20,6 +20,8 @@ import (
 	"golang.org/x/net/http2"
 )
 
+//go:generate go tool mockgen -source=./web.go -destination=./mockweb_test.go -package=web
+
 var (
 	DefaultTransport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package web;
 
-option go_package = "github.com/harrybrwn/remora/web";
+//option go_package = "github.com/harrybrwn/remora/web/webpb";
 
 // PageRequest is a request for the crawler to crawl a webpage.
 message PageRequest {

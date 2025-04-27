@@ -16,8 +16,9 @@ SOURCES=$(shell scripts/sourcehash.sh -l -e '*_test.go') $(PROTOS)
 
 all: $(BINDIR)/remora $(BINDIR)/crawler-api $(TOOLS)
 
-install: $(BINDIR)/remora
+install: $(BINDIR)/remora $(BINDIR)/remoractl
 	install ./bin/remora ~/dev/go/bin/remora
+	install ./bin/remoractl ~/dev/go/bin/remoractl
 
 .PHONY: $(BINDIR)/remora
 $(BINDIR)/remora: gen
@@ -32,6 +33,10 @@ $(BINDIR)/deploy: $(SOURCES)
 $(BINDIR)/crawler-api: $(SOURCES)
 	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/crawler-api
 
+$(BINDIR)/remoractl: gen
+	CGO_ENABLED=0 go build $(GOFLAGS) -o $@ ./cmd/remoractl
+
+.PHONY: gen
 gen:
 	go generate ./web ./cmd/remora ./internal
 
@@ -58,4 +63,4 @@ clean:
 	$(RM) ./remora
 	$(RM) -r ./bin ./internal/mock docs/protobuf
 
-.PHONY: all gen test clean image install
+.PHONY: all test clean image install

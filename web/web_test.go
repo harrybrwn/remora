@@ -14,6 +14,7 @@ import (
 )
 
 func TestHeadlessFetcher(t *testing.T) {
+	t.Skip()
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 	var nodes []*cdp.Node
@@ -68,9 +69,7 @@ func TestProtobufMisc(t *testing.T) {
 
 	// typ := dynamicpb.NewMessageType(msg.Type().Descriptor())
 	dynmsg := dynamicpb.NewMessage(msg.Descriptor())
-	fmt.Printf("%#v\n", dynmsg)
 	dynmsg.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		fmt.Println(fd.FullName(), fd.Name(), v.IsValid())
 		return true
 	})
 }

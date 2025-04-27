@@ -18,6 +18,9 @@ node_modules/
 *.ps
 *.log
 *.txt
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Config
 /.vscode
@@ -40,7 +43,12 @@ notes.*
 /psql
 /test
 /db/*.sql
-*.sh
+run.sh
+test.sh
+remora.sh
+upload.sh
+db/cron/*.sh
+
 
 # Database
 /db/data

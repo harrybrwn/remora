@@ -3,12 +3,12 @@ package visitor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	sqldriver "database/sql/driver"
 	"encoding/hex"
 	"fmt"
 	"hash"
-	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -26,7 +26,7 @@ import (
 	"github.com/harrybrwn/remora/internal/region"
 	"github.com/harrybrwn/remora/storage"
 	"github.com/harrybrwn/remora/web"
-	"github.com/lib/pq" // database driver implementation
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -58,6 +58,8 @@ func New(sqlDB *sql.DB, redis storage.Redis) (*Visitor, error) {
 			r:      redis,
 			region: region.NewRegion(otel.Tracer("remora/visitor.redisHashset"))},
 		Hosts: make(map[string]struct{}),
+		// hash:  func() hash.Hash { return fnv.New128() },
+		hash: func() hash.Hash { return sha256.New() },
 	}, nil
 }
 
@@ -80,11 +82,14 @@ func AddHosts(v web.Visitor, hosts []string) {
 	}
 }
 
+type HashBuilder func() hash.Hash
+
 type Visitor struct {
 	db      db.DB
 	Hosts   map[string]struct{}
 	hashes  hashSet
 	Visited int64
+	hash    HashBuilder
 }
 
 func (v *Visitor) Close() error { return nil }
@@ -180,8 +185,8 @@ ON CONFLICT (id)
 
 func init() {
 	// Programatically making the SQL query smaller
-	insertPageSQL = strings.Replace(insertPageSQL, "\t", " ", -1)
-	insertPageSQL = strings.Replace(insertPageSQL, "\n", " ", -1)
+	insertPageSQL = strings.ReplaceAll(insertPageSQL, "\t", " ")
+	insertPageSQL = strings.ReplaceAll(insertPageSQL, "\n", " ")
 	pat, err := regexp.Compile("[ ]+")
 	if err != nil {
 		panic(err)
@@ -226,7 +231,7 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 		}
 	}()
 
-	h := fnv.New128()
+	h := v.hash()
 	io.WriteString(h, pageurl)
 	id := h.Sum(nil)
 
@@ -252,7 +257,7 @@ func (v *Visitor) record(ctx context.Context, page *web.Page) {
 }
 
 type execerCtx interface {
-	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 func insertPage(ctx context.Context, handle execerCtx, id []byte, page *web.Page) error {
@@ -356,9 +361,10 @@ func insertEdgesQuery(id []byte, pageurl string, links []string) (*bytes.Buffer,
 	var (
 		n      = 1
 		buf    bytes.Buffer
-		values = make([]interface{}, 0, len(links)*3)
+		values = make([]any, 0, len(links)*3)
 		nlinks = len(links) - 1
-		h      = fnv.New128()
+		// h      = fnv.New128()
+		h = sha256.New()
 	)
 	io.WriteString(&buf, "INSERT INTO edge(parent_id,child_id,child)VALUES ")
 	for i, l := range links {

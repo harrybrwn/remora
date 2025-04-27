@@ -1,0 +1,21 @@
+# https://golangci-lint.run/usage/configuration/
+version: "2"
+linters:
+  disable:
+    - errcheck # Warns too much about missing error checks
+    - wsl # whitespace
+  exclusions:
+    # generated: lax # relaxed for generated code (default 'strict')
+    warn-unused: true # warn about unused rules
+    rules:
+      # Exclude some linters from running on tests files.
+      - path: _test\.go
+        linters:
+          - errcheck
+      - path: \.pb\.go
+        linters:
+          - errcheck
+      # Ignore unused structs
+      #- source: '^type .* struct {'
+      #  linters:
+      #    - unused

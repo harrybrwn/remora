@@ -140,8 +140,8 @@ Install the [protocol buffer compiler](https://grpc.io/docs/protoc-installation/
 Then Install the two go extensions for protoc.
 
 ```sh
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 ```
 
 Install mockgen
